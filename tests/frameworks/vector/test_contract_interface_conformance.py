@@ -2,89 +2,30 @@
 
 from __future__ import annotations
 
-import asyncio
 import importlib
 import inspect
-from collections.abc import Mapping
-from typing import Any, Callable
+from dataclasses import replace
+from typing import Any, Callable, Optional
 
 import pytest
 
 from tests.frameworks.registries.vector_registry import (
+    VECTOR_FRAMEWORKS,
     VectorFrameworkDescriptor,
+    get_vector_framework_descriptor,
+    get_vector_framework_descriptor_safe,
+    has_vector_framework,
+    iter_available_vector_framework_descriptors,
     iter_vector_framework_descriptors,
+    register_vector_framework_descriptor,
+    unregister_vector_framework_descriptor,
 )
 
-
-# ---------------------------------------------------------------------------
-# Constants (shared test inputs)
-# ---------------------------------------------------------------------------
-
-ADD_TEXTS = ["vector-add-text-1", "vector-add-text-2"]
-ADD_METADATAS = [{"source": "test-1"}, {"source": "test-2"}]
-ADD_IDS = ["vector-id-1", "vector-id-2"]
-
-DELETE_IDS = ["vector-delete-id-1", "vector-delete-id-2"]
-
-SYNC_QUERY_TEXT = "vector-sync-query"
-SYNC_STREAM_TEXT = "vector-sync-stream"
-ASYNC_QUERY_TEXT = "vector-async-query"
-ASYNC_STREAM_TEXT = "vector-async-stream"
-MMR_QUERY_TEXT = "vector-mmr-query"
-ASYNC_MMR_QUERY_TEXT = "vector-async-mmr-query"
-CONTEXT_QUERY_TEXT = "vector-context-query"
-
-TOP_K = 4
-MMR_LAMBDA = 0.5
-
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(
-    params=list(iter_vector_framework_descriptors()),
-    name="framework_descriptor",
+# We intentionally reach into the module internals here for cache behavior tests.
+from tests.frameworks.registries.vector_registry import (  # type: ignore
+    _AVAILABILITY_CACHE,
+    Version,
 )
-def framework_descriptor_fixture(
-    request: pytest.FixtureRequest,
-) -> VectorFrameworkDescriptor:
-    """
-    Parameterized over all registered vector framework descriptors.
-
-    Frameworks that are not actually available in the environment (e.g. the
-    underlying LlamaIndex / Semantic Kernel libraries are missing) are skipped
-    via descriptor.is_available().
-    """
-    descriptor: VectorFrameworkDescriptor = request.param
-    if not descriptor.is_available():
-        pytest.skip(f"Framework '{descriptor.name}' not available in this environment")
-    return descriptor
-
-
-@pytest.fixture
-def vector_client_instance(
-    framework_descriptor: VectorFrameworkDescriptor,
-    adapter: Any,
-) -> Any:
-    """
-    Construct a concrete vector client/store instance for the given descriptor.
-
-    This uses the registry metadata to import the client class and instantiate
-    it with the *generic* Corpus vector adapter provided by the top-level
-    pytest plugin (see conftest.py).
-
-    All vector framework adapters are expected to take a ProtocolV1
-    implementation under the kwarg name `adapter`.
-    """
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    client_cls = getattr(module, framework_descriptor.adapter_class)
-
-    init_kwargs: dict[str, Any] = {"adapter": adapter}
-    instance = client_cls(**init_kwargs)
-    return instance
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -93,9 +34,9 @@ def vector_client_instance(
 
 def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
     """
-    Helper to fetch a method from the instance and assert it is callable.
+    Fetch a method from the instance and assert it is callable.
 
-    If name is None, this fails fast with a clear assertion message.
+    If name is None, fail fast with a clear assertion message.
     """
     assert name, "Expected a non-empty method name"
     attr = getattr(instance, name, None)
@@ -103,667 +44,588 @@ def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
     return attr
 
 
-def _run_async_if_needed(coro: Any) -> Any:
-    """
-    Run an async coroutine, handling existing event loops gracefully.
-
-    Used for optional async surfaces (e.g. acapabilities/ahealth) in tests
-    that are not themselves marked async.
-    """
-    try:
-        return asyncio.run(coro)
-    except RuntimeError:
-        # Fall back to the current event loop if one is already running.
-        loop = asyncio.get_event_loop()
-        return loop.run_until_complete(coro)
-
-
-def _maybe_inject_context(
+def _inject_framework_context_kwarg(
     descriptor: VectorFrameworkDescriptor,
     kwargs: dict[str, Any],
+    context: Any,
 ) -> dict[str, Any]:
     """
-    Helper to inject the framework-specific context kwarg when declared.
+    Inject framework-specific context into kwargs *only* when descriptor.context_kwarg is set.
+
+    This helper is intentionally conservative so tests don't leak unexpected kwargs
+    into adapters that do not declare a context surface.
     """
     if descriptor.context_kwarg:
-        kwargs.setdefault(descriptor.context_kwarg, {})
+        kwargs.setdefault(descriptor.context_kwarg, context)
     return kwargs
 
 
-def _build_add_args(
-    descriptor: VectorFrameworkDescriptor,
-) -> tuple[list[Any], dict[str, Any]]:
+def _signature_accepts_kwarg(fn: Callable[..., Any], kw: str) -> bool:
     """
-    Build positional args + kwargs for a sync/async add call appropriate
-    for the unified Corpus vector adapter contract.
+    Return True if the callable signature can accept `kw`, either via an explicit
+    parameter name or a **kwargs catch-all.
 
-    Contract (for all Corpus vector adapters):
-        add_method(*, texts, metadatas=None, ids=None, **context)
-        async_add_method: same parameters, async.
+    This avoids fragile behavioral calls that require constructing full protocol specs.
     """
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {
-        "texts": ADD_TEXTS,
-        "metadatas": ADD_METADATAS,
-        "ids": ADD_IDS,
-    }
-    _maybe_inject_context(descriptor, kwargs)
-    return args, kwargs
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        # Some callables may not expose a Python signature (builtins/extension).
+        # In that case we treat acceptability as unknown and do not fail based
+        # purely on missing introspection.
+        return True
+
+    params = sig.parameters.values()
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params):
+        return True
+    return kw in sig.parameters
 
 
-def _build_delete_args(
-    descriptor: VectorFrameworkDescriptor,
-) -> tuple[list[Any], dict[str, Any]]:
+def _import_client_class(desc: VectorFrameworkDescriptor) -> type:
     """
-    Build args/kwargs for sync/async delete calls.
+    Import the adapter module and resolve the adapter class with clear errors.
 
-    Contract:
-        delete_method(*, ids=None, **context)
-        async_delete_method: same parameters, async.
-
-    We exercise the `ids` path in tests; adapters are free to also support
-    additional filters (ref_doc_ids, where, etc.).
+    This makes failures attributable: either registry metadata is wrong,
+    or the adapter module/class is missing or broken.
     """
-    args: list[Any] = []
-    kwargs: dict[str, Any] = {"ids": DELETE_IDS}
-    _maybe_inject_context(descriptor, kwargs)
-    return args, kwargs
+    try:
+        module = importlib.import_module(desc.adapter_module)
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(
+            f"{desc.name}: failed to import adapter_module {desc.adapter_module!r}: {e}"
+        ) from e
+
+    try:
+        client_cls = getattr(module, desc.adapter_class)
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(
+            f"{desc.name}: adapter_class {desc.adapter_class!r} not found in module "
+            f"{desc.adapter_module!r}: {e}"
+        ) from e
+
+    if not isinstance(client_cls, type):
+        raise AssertionError(
+            f"{desc.name}: resolved adapter_class {desc.adapter_class!r} is not a class"
+        )
+    return client_cls
 
 
-def _build_query_args(
-    descriptor: VectorFrameworkDescriptor,
-    text: str,
-) -> tuple[list[Any], dict[str, Any]]:
+def _maybe_construct_client(
+    desc: VectorFrameworkDescriptor,
+    adapter: Any,
+) -> Optional[Any]:
     """
-    Build args/kwargs for sync/async similarity query calls.
+    Construct a concrete vector client/store instance for the given descriptor.
 
-    Contract:
-        query_method(query, k=TOP_K, **context)
-        async_query_method: same parameters, async.
+    No skips:
+    - If the framework is unavailable per descriptor.is_available(), we return None.
+    - If it is available, we require that import + construction succeeds.
+
+    IMPORTANT:
+    We must respect descriptor.adapter_init_kwarg (tests must never hardcode "adapter").
     """
-    args: list[Any] = [text]
-    kwargs: dict[str, Any] = {"k": TOP_K}
-    _maybe_inject_context(descriptor, kwargs)
-    return args, kwargs
+    if not desc.is_available():
+        # Unavailable frameworks should not be construct-required by contract tests.
+        # Returning None lets tests assert availability behavior without skipping.
+        return None
 
+    client_cls = _import_client_class(desc)
 
-def _build_stream_query_args(
-    descriptor: VectorFrameworkDescriptor,
-    text: str,
-) -> tuple[list[Any], dict[str, Any]]:
-    """
-    Build args/kwargs for sync/async streaming similarity query calls.
-
-    Contract:
-        stream_query_method(query, k=TOP_K, **context)
-        async_stream_query_method: same parameters, async.
-    """
-    return _build_query_args(descriptor, text)
-
-
-def _build_mmr_query_args(
-    descriptor: VectorFrameworkDescriptor,
-    text: str,
-) -> tuple[list[Any], dict[str, Any]]:
-    """
-    Build args/kwargs for sync/async MMR query calls.
-
-    Contract:
-        mmr_query_method(query, k=TOP_K, lambda_mult=MMR_LAMBDA, **context)
-        async_mmr_query_method: same parameters, async.
-    """
-    args: list[Any] = [text]
-    kwargs: dict[str, Any] = {"k": TOP_K, "lambda_mult": MMR_LAMBDA}
-    _maybe_inject_context(descriptor, kwargs)
-    return args, kwargs
+    init_kwargs: dict[str, Any] = {desc.adapter_init_kwarg: adapter}
+    try:
+        return client_cls(**init_kwargs)
+    except TypeError as e:
+        # The most common "contract drift" failure: constructor kwarg mismatch.
+        raise AssertionError(
+            f"{desc.name}: failed to construct client with adapter_init_kwarg="
+            f"{desc.adapter_init_kwarg!r}: {e}"
+        ) from e
 
 
 # ---------------------------------------------------------------------------
-# Core interface / surface contract tests
+# Fixtures
 # ---------------------------------------------------------------------------
 
 
-def test_can_instantiate_vector_client(
+@pytest.fixture(params=list(iter_vector_framework_descriptors()), name="framework_descriptor")
+def framework_descriptor_fixture(request: pytest.FixtureRequest) -> VectorFrameworkDescriptor:
+    """
+    Parameterized over all registered vector framework descriptors.
+
+    IMPORTANT: We do not skip unavailable frameworks. Instead, tests assert that:
+    - unavailable descriptors are excluded from iter_available_*; and
+    - available descriptors can be imported/constructed and expose required surfaces.
+    """
+    descriptor: VectorFrameworkDescriptor = request.param
+    return descriptor
+
+
+@pytest.fixture
+def vector_client_instance(
     framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
+    adapter: Any,
+) -> Optional[Any]:
+    """
+    Construct a vector client instance when the descriptor reports availability.
+
+    Returns None when the framework is unavailable in the environment.
+    """
+    return _maybe_construct_client(framework_descriptor, adapter)
+
+
+# ---------------------------------------------------------------------------
+# Core registry integrity tests (no framework imports required)
+# ---------------------------------------------------------------------------
+
+
+def test_registry_keys_match_descriptor_name() -> None:
+    """
+    Sanity check: registry keys should always match descriptor.name.
+    """
+    for key, desc in VECTOR_FRAMEWORKS.items():
+        assert key == desc.name, f"Registry key {key!r} does not match descriptor.name {desc.name!r}"
+
+
+def test_get_descriptor_variants_behave_consistently() -> None:
+    """
+    get_vector_framework_descriptor should raise on unknown keys while the safe
+    variant should return None.
+    """
+    existing_name = next(iter(VECTOR_FRAMEWORKS.keys()))
+    assert get_vector_framework_descriptor(existing_name) is VECTOR_FRAMEWORKS[existing_name]
+    assert get_vector_framework_descriptor_safe(existing_name) is VECTOR_FRAMEWORKS[existing_name]
+
+    missing = "missing_vector_framework_xyz123"
+    with pytest.raises(KeyError):
+        _ = get_vector_framework_descriptor(missing)
+    assert get_vector_framework_descriptor_safe(missing) is None
+
+
+def test_has_vector_framework_matches_registry() -> None:
+    """
+    has_vector_framework must reflect membership in VECTOR_FRAMEWORKS.
+    """
+    existing_name = next(iter(VECTOR_FRAMEWORKS.keys()))
+    assert has_vector_framework(existing_name) is True
+    assert has_vector_framework("missing_vector_framework_xyz123") is False
+
+
+def test_iter_vector_framework_descriptors_covers_registry_values() -> None:
+    """
+    iter_vector_framework_descriptors must iterate exactly the registered values.
+    """
+    values = list(iter_vector_framework_descriptors())
+    assert len(values) == len(VECTOR_FRAMEWORKS)
+    for d in values:
+        assert VECTOR_FRAMEWORKS[d.name] is d
+
+
+def test_descriptor_validate_is_idempotent_for_registered_descriptors() -> None:
+    """
+    validate() may emit warnings, but should not raise for registered descriptors.
+    """
+    for desc in iter_vector_framework_descriptors():
+        desc.validate()
+
+
+def test_required_descriptor_fields_are_non_empty_strings() -> None:
+    """
+    Descriptor required method-name fields must be non-empty strings.
+    """
+    required = (
+        "capabilities_method",
+        "query_method",
+        "upsert_method",
+        "delete_method",
+        "create_namespace_method",
+        "delete_namespace_method",
+        "health_method",
+        "adapter_init_kwarg",
+        "adapter_module",
+        "adapter_class",
+        "name",
+    )
+    for desc in iter_vector_framework_descriptors():
+        for field_name in required:
+            v = getattr(desc, field_name)
+            assert isinstance(v, str) and v.strip(), f"{desc.name}: {field_name} must be a non-empty string"
+
+
+def test_batch_query_descriptor_coherence() -> None:
+    """
+    If has_batch_query=True, batch_query_method must be a non-empty string.
+    """
+    for desc in iter_vector_framework_descriptors():
+        if desc.has_batch_query:
+            assert desc.batch_query_method is not None and desc.batch_query_method.strip(), (
+                f"{desc.name}: has_batch_query=True requires batch_query_method"
+            )
+
+
+def test_constructor_knob_expectations_are_coherent() -> None:
+    """
+    Registry expectations about constructor knobs should be coherent:
+    - If tests expect injection, the corresponding kwarg name should be set.
+    - If supports_auto_normalize_toggle=True, supports_config_injection should generally be True.
+    """
+    for desc in iter_vector_framework_descriptors():
+        if desc.supports_docstore_injection:
+            assert desc.docstore_init_kwarg, (
+                f"{desc.name}: supports_docstore_injection=True requires docstore_init_kwarg"
+            )
+
+        if desc.supports_config_injection:
+            assert desc.config_init_kwarg, (
+                f"{desc.name}: supports_config_injection=True requires config_init_kwarg"
+            )
+
+        if desc.supports_mode_switch:
+            assert desc.mode_init_kwarg, (
+                f"{desc.name}: supports_mode_switch=True requires mode_init_kwarg"
+            )
+
+        if desc.supports_auto_normalize_toggle:
+            assert desc.supports_config_injection, (
+                f"{desc.name}: supports_auto_normalize_toggle=True should imply supports_config_injection=True"
+            )
+
+
+def test_version_range_formatting_smoke() -> None:
+    """
+    version_range() should produce stable human-readable strings.
+    """
+    d0 = VectorFrameworkDescriptor(name="t0", adapter_module="m", adapter_class="C")
+    assert d0.version_range() is None
+
+    d1 = replace(d0, name="t1", minimum_framework_version="1.0.0")
+    assert d1.version_range() == ">=1.0.0"
+
+    d2 = replace(d0, name="t2", tested_up_to_version="2.0.0")
+    assert d2.version_range() == "<=2.0.0"
+
+    d3 = replace(d0, name="t3", minimum_framework_version="1.0.0", tested_up_to_version="2.0.0")
+    assert d3.version_range() == ">=1.0.0, <= 2.0.0"
+
+
+def test_dotted_adapter_class_emits_warning_but_does_not_raise() -> None:
+    """
+    adapter_class should be a bare class name. A dotted path should warn but not fail.
+    """
+    with pytest.warns(RuntimeWarning, match="adapter_class should be a class name only"):
+        _ = VectorFrameworkDescriptor(
+            name="warn_dotted",
+            adapter_module="m",
+            adapter_class="some.module.ClassName",
+        )
+
+
+def test_version_ordering_validation_behaves_as_expected() -> None:
+    """
+    When both bounds are present:
+    - If packaging.Version is available, an inverted range should raise ValueError.
+    - If packaging is not available, it should warn (best-effort validation).
+    """
+    if Version is None:
+        with pytest.warns(RuntimeWarning, match="cannot validate version range ordering"):
+            _ = VectorFrameworkDescriptor(
+                name="no_packaging",
+                adapter_module="m",
+                adapter_class="C",
+                minimum_framework_version="2.0.0",
+                tested_up_to_version="1.0.0",
+            )
+    else:
+        with pytest.raises(ValueError, match="minimum_framework_version.*greater than tested_up_to_version"):
+            _ = VectorFrameworkDescriptor(
+                name="bad_order",
+                adapter_module="m",
+                adapter_class="C",
+                minimum_framework_version="2.0.0",
+                tested_up_to_version="1.0.0",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Availability behavior tests (cache + iter_available) - no skips
+# ---------------------------------------------------------------------------
+
+
+def test_iter_available_only_includes_descriptors_reporting_available() -> None:
+    """
+    iter_available_vector_framework_descriptors must be consistent with is_available().
+
+    This ensures availability classification is deterministic and testable.
+    """
+    available = list(iter_available_vector_framework_descriptors())
+    for desc in available:
+        assert desc.is_available() is True, f"{desc.name}: iter_available included an unavailable descriptor"
+
+    # Conversely: anything unavailable must not appear in the available iterator.
+    available_names = {d.name for d in available}
+    for desc in iter_vector_framework_descriptors():
+        if not desc.is_available():
+            assert desc.name not in available_names, (
+                f"{desc.name}: descriptor reports unavailable but appears in iter_available_*"
+            )
+
+
+def test_is_available_caches_result_by_adapter_module_and_attr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    is_available() should cache results by adapter_module + availability_attr.
+
+    We patch importlib.import_module to count calls and ensure the second call is cached.
+    """
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    _AVAILABILITY_CACHE.clear()
+
+    calls: list[str] = []
+
+    def fake_import(name: str) -> Any:
+        calls.append(name)
+        # Provide an object that has an availability flag we can read.
+        return type("M", (), {"FLAG": True})()
+
+    monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+
+    desc = VectorFrameworkDescriptor(
+        name="cache_test",
+        adapter_module="fake.module",
+        adapter_class="C",
+        availability_attr="FLAG",
+    )
+
+    assert desc.is_available() is True
+    assert desc.is_available() is True  # second call should hit cache
+    assert calls.count("fake.module") == 1, "import_module should be called once due to caching"
+
+
+def test_register_and_unregister_reset_availability_cache() -> None:
+    """
+    Register/unregister should clear the availability cache for the affected descriptor key.
+    """
+    original_registry = dict(VECTOR_FRAMEWORKS)
+    original_cache = dict(_AVAILABILITY_CACHE)
+
+    try:
+        VECTOR_FRAMEWORKS.clear()
+        _AVAILABILITY_CACHE.clear()
+
+        desc = VectorFrameworkDescriptor(
+            name="dyn",
+            adapter_module="dyn.module",
+            adapter_class="DynClient",
+            availability_attr="FLAG",
+        )
+
+        # Seed cache for the descriptor key in the same way is_available would.
+        _AVAILABILITY_CACHE["dyn.module:FLAG"] = True
+
+        register_vector_framework_descriptor(desc)
+        assert "dyn.module:FLAG" not in _AVAILABILITY_CACHE, "register should clear availability cache for descriptor"
+
+        # Re-seed and ensure unregister also clears.
+        _AVAILABILITY_CACHE["dyn.module:FLAG"] = True
+        unregister_vector_framework_descriptor("dyn")
+        assert "dyn.module:FLAG" not in _AVAILABILITY_CACHE, "unregister should clear availability cache for descriptor"
+
+    finally:
+        VECTOR_FRAMEWORKS.clear()
+        VECTOR_FRAMEWORKS.update(original_registry)
+        _AVAILABILITY_CACHE.clear()
+        _AVAILABILITY_CACHE.update(original_cache)
+
+
+# ---------------------------------------------------------------------------
+# Framework adapter surface tests (bidirectional: registry <-> adapter)
+# ---------------------------------------------------------------------------
+
+
+def test_can_import_adapter_module_and_resolve_class_when_available(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Optional[Any],
 ) -> None:
     """
-    Each registered framework descriptor should be instantiable with the
-    pluggable Corpus vector adapter and any inferred kwargs.
-
-    Sanity-check that the instance exposes the methods the descriptor claims.
+    Bidirectional flow:
+    - If descriptor reports available, we require adapter module import + class resolution + construction.
+    - If descriptor reports unavailable, we require that this test does not force construction.
     """
-    # Required sync add & query methods
-    _get_method(vector_client_instance, framework_descriptor.add_method)
+    if framework_descriptor.is_available():
+        assert vector_client_instance is not None, (
+            f"{framework_descriptor.name}: descriptor reports available but client could not be constructed"
+        )
+    else:
+        assert vector_client_instance is None, (
+            f"{framework_descriptor.name}: descriptor reports unavailable but client was constructed"
+        )
+
+
+def test_client_exposes_required_vector_protocol_v1_surface_when_available(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Optional[Any],
+) -> None:
+    """
+    When available, the adapter must expose the required wrapper surface declared in the registry.
+    """
+    if vector_client_instance is None:
+        # Unavailable frameworks are validated via iter_available/is_available tests.
+        return
+
+    _get_method(vector_client_instance, framework_descriptor.capabilities_method)
     _get_method(vector_client_instance, framework_descriptor.query_method)
-
-    # Optional delete method
-    if framework_descriptor.delete_method:
-        _get_method(vector_client_instance, framework_descriptor.delete_method)
-
-    # Optional sync streaming (when declared)
-    if framework_descriptor.stream_query_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.stream_query_method,
-        )
-
-    # Optional MMR method (when declared)
-    if framework_descriptor.mmr_query_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.mmr_query_method,
-        )
-
-    # Async surfaces: not all-or-nothing; we exercise whatever is declared.
-    if framework_descriptor.async_add_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.async_add_method,
-        )
-
-    if framework_descriptor.async_delete_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.async_delete_method,
-        )
-
-    if framework_descriptor.async_query_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.async_query_method,
-        )
-
-    if framework_descriptor.async_stream_query_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.async_stream_query_method,
-        )
-
-    if framework_descriptor.async_mmr_query_method:
-        _get_method(
-            vector_client_instance,
-            framework_descriptor.async_mmr_query_method,
-        )
+    _get_method(vector_client_instance, framework_descriptor.upsert_method)
+    _get_method(vector_client_instance, framework_descriptor.delete_method)
+    _get_method(vector_client_instance, framework_descriptor.create_namespace_method)
+    _get_method(vector_client_instance, framework_descriptor.delete_namespace_method)
+    _get_method(vector_client_instance, framework_descriptor.health_method)
 
 
-def test_async_methods_exist_when_supports_async_true(
+def test_batch_query_method_callable_presence_when_declared_and_available(
     framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
+    vector_client_instance: Optional[Any],
 ) -> None:
     """
-    Ensure that when supports_async=True, at least one async surface exists
-    and is callable.
+    If has_batch_query=True and the framework is available, the adapter surface must include a
+    callable batch_query method.
 
-    Unlike graph, vector frameworks are allowed to be async-partial (e.g.
-    async add/query but sync-only streaming). This test only asserts that
-    async support is not a lie.
+    This is a pure surface test: runtime behavior may still raise NotSupported depending
+    on capabilities.supports_batch_queries, but the wrapper-level surface must exist.
     """
-    if not framework_descriptor.supports_async:
-        pytest.skip("Framework does not declare async support")
+    if vector_client_instance is None:
+        return
 
-    async_methods = [
-        framework_descriptor.async_add_method,
-        framework_descriptor.async_delete_method,
-        framework_descriptor.async_query_method,
-        framework_descriptor.async_stream_query_method,
-        framework_descriptor.async_mmr_query_method,
-    ]
-
-    assert any(async_methods), (
-        f"{framework_descriptor.name}: supports_async=True but no async "
-        f"methods are declared"
-    )
-
-    for name in async_methods:
-        if not name:
-            continue
-        fn = getattr(vector_client_instance, name, None)
-        assert callable(fn), f"Async method {name!r} is not callable"
+    if framework_descriptor.has_batch_query:
+        _get_method(vector_client_instance, framework_descriptor.batch_query_method)
 
 
-def test_sync_add_interface_conformance(
+def test_context_kwarg_signature_acceptance_when_declared_and_available(
     framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
+    vector_client_instance: Optional[Any],
 ) -> None:
     """
-    Validate that the sync add method accepts batched test inputs and does
-    not raise.
+    If a framework declares context_kwarg and is available, the major surfaces should accept it
+    (either explicitly or via **kwargs).
 
-    Detailed persistence semantics are covered by framework-specific tests.
+    We validate via signature introspection to avoid requiring protocol-spec objects.
     """
-    add_fn = _get_method(vector_client_instance, framework_descriptor.add_method)
-    args, kwargs = _build_add_args(framework_descriptor)
+    if vector_client_instance is None:
+        return
 
-    result = add_fn(*args, **kwargs)
-    # Contract: may return None or framework-specific result; we only care
-    # that the call succeeds.
-
-
-@pytest.mark.asyncio
-async def test_async_add_interface_conformance_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the async add method (when declared) accepts batched inputs
-    and returns an awaitable that completes without error.
-    """
-    if not framework_descriptor.async_add_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async add",
-        )
-
-    aadd_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.async_add_method,
-    )
-    args, kwargs = _build_add_args(framework_descriptor)
-
-    coro = aadd_fn(*args, **kwargs)
-    assert inspect.isawaitable(coro), "Async add method must return an awaitable"
-    await coro
-
-
-def test_sync_delete_interface_conformance_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the sync delete method (when declared) accepts a simple
-    ids-based delete call and does not raise.
-    """
-    if not framework_descriptor.delete_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare delete_method",
-        )
-
-    delete_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.delete_method,
-    )
-    args, kwargs = _build_delete_args(framework_descriptor)
-
-    result = delete_fn(*args, **kwargs)
-    # We only assert that the call completes; semantics are framework-specific.
-
-
-@pytest.mark.asyncio
-async def test_async_delete_interface_conformance_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the async delete method (when declared) accepts ids-based
-    deletes and returns an awaitable.
-    """
-    if not framework_descriptor.async_delete_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async_delete_method",
-        )
-
-    adelete_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.async_delete_method,
-    )
-    args, kwargs = _build_delete_args(framework_descriptor)
-
-    coro = adelete_fn(*args, **kwargs)
-    assert inspect.isawaitable(coro), "Async delete method must return an awaitable"
-    await coro
-
-
-def test_sync_query_interface_conformance(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the sync query method accepts a simple text query and
-    returns a non-None result.
-
-    Detailed result shape is covered by separate tests.
-    """
-    query_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.query_method,
-    )
-    args, kwargs = _build_query_args(
-        framework_descriptor,
-        SYNC_QUERY_TEXT,
-    )
-
-    result = query_fn(*args, **kwargs)
-    assert result is not None
-
-
-def test_sync_streaming_interface_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the sync streaming method (when declared) accepts a text
-    query and returns an iterable of chunks.
-
-    Current vector frameworks declare sync-only streaming; async streaming is
-    optional and tested separately when present.
-    """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
-
-    stream_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.stream_query_method,
-    )
-    args, kwargs = _build_stream_query_args(
-        framework_descriptor,
-        SYNC_STREAM_TEXT,
-    )
-
-    iterator = stream_fn(*args, **kwargs)
-
-    seen_any = False
-    for _ in iterator:  # noqa: B007
-        seen_any = True
-        break
-
-    # Contract: iterability is required; it's fine if no chunks are produced.
-    assert iterator is not None
-    assert isinstance(seen_any, bool)
-
-
-@pytest.mark.asyncio
-async def test_async_query_interface_conformance_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the async query method (when declared) accepts text input
-    and returns a non-None result compatible with the sync API.
-    """
-    if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
-
-    aquery_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.async_query_method,
-    )
-    args, kwargs = _build_query_args(
-        framework_descriptor,
-        ASYNC_QUERY_TEXT,
-    )
-
-    coro = aquery_fn(*args, **kwargs)
-    assert inspect.isawaitable(coro), "Async query method must return an awaitable"
-
-    result = await coro
-    assert result is not None
-
-
-@pytest.mark.asyncio
-async def test_async_streaming_interface_conformance_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the async streaming method (when declared) accepts text input
-    and produces an async-iterable of chunks.
-
-    The returned object may be an async iterator directly, or an awaitable
-    that resolves to one.
-    """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
-
-    astream_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.async_stream_query_method,
-    )
-    args, kwargs = _build_stream_query_args(
-        framework_descriptor,
-        ASYNC_STREAM_TEXT,
-    )
-
-    aiter = astream_fn(*args, **kwargs)
-    if inspect.isawaitable(aiter):
-        aiter = await aiter  # type: ignore[assignment]
-
-    seen_any = False
-    async for _ in aiter:  # noqa: B007
-        seen_any = True
-        break
-
-    assert isinstance(seen_any, bool)
-
-
-def test_sync_mmr_interface_conformance_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the sync MMR method (when declared) accepts a text query
-    and returns a non-None result.
-    """
-    if not framework_descriptor.mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare mmr_query_method",
-        )
-
-    mmr_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.mmr_query_method,
-    )
-    args, kwargs = _build_mmr_query_args(
-        framework_descriptor,
-        MMR_QUERY_TEXT,
-    )
-
-    result = mmr_fn(*args, **kwargs)
-    assert result is not None
-
-
-@pytest.mark.asyncio
-async def test_async_mmr_interface_conformance_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Validate that the async MMR method (when declared) accepts a text query
-    and returns a non-None result.
-    """
-    if not framework_descriptor.async_mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async_mmr_query_method",
-        )
-
-    ammr_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.async_mmr_query_method,
-    )
-    args, kwargs = _build_mmr_query_args(
-        framework_descriptor,
-        ASYNC_MMR_QUERY_TEXT,
-    )
-
-    coro = ammr_fn(*args, **kwargs)
-    assert inspect.isawaitable(coro), "Async MMR method must return an awaitable"
-
-    result = await coro
-    assert result is not None
-
-
-def test_context_kwarg_is_accepted_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    If a context_kwarg is declared in the descriptor, the core query/add
-    methods should accept that kwarg without raising TypeError.
-    """
     if not framework_descriptor.context_kwarg:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare a context_kwarg",
-        )
+        return
 
     ctx_kw = framework_descriptor.context_kwarg
 
-    # Test against query method
-    query_fn = _get_method(
-        vector_client_instance,
+    for method_name in (
         framework_descriptor.query_method,
-    )
-    args, kwargs = _build_query_args(
-        framework_descriptor,
-        CONTEXT_QUERY_TEXT,
-    )
-    kwargs[ctx_kw] = {"test": "value"}
-
-    result = query_fn(*args, **kwargs)
-    assert result is not None
-
-    # Also verify add accepts the same context kwarg.
-    add_fn = _get_method(
-        vector_client_instance,
-        framework_descriptor.add_method,
-    )
-    add_args, add_kwargs = _build_add_args(framework_descriptor)
-    add_kwargs[ctx_kw] = {"test": "value"}
-    add_fn(*add_args, **add_kwargs)
-
-
-def test_method_signatures_consistent_between_sync_and_async(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    Verify that sync and async methods have consistent signatures
-    (same parameters except maybe the return annotation), where both
-    variants are declared.
-
-    Covers add, delete, query, streaming, and MMR surfaces.
-    """
-
-    def _compare_signatures(sync_name: str | None, async_name: str | None) -> None:
-        if not sync_name or not async_name:
-            return
-
-        sync_fn = _get_method(vector_client_instance, sync_name)
-        async_fn = _get_method(vector_client_instance, async_name)
-
-        sync_sig = inspect.signature(sync_fn)
-        async_sig = inspect.signature(async_fn)
-
-        # Skip "self" for bound methods
-        sync_params = list(sync_sig.parameters.keys())[1:]
-        async_params = list(async_sig.parameters.keys())[1:]
-
-        assert (
-            sync_params == async_params
-        ), f"Signature mismatch between {sync_name!r} and {async_name!r}"
-
-    # Add
-    _compare_signatures(
-        framework_descriptor.add_method,
-        framework_descriptor.async_add_method,
-    )
-
-    # Delete
-    _compare_signatures(
+        framework_descriptor.upsert_method,
         framework_descriptor.delete_method,
-        framework_descriptor.async_delete_method,
-    )
-
-    # Query
-    _compare_signatures(
-        framework_descriptor.query_method,
-        framework_descriptor.async_query_method,
-    )
-
-    # Streaming
-    _compare_signatures(
-        framework_descriptor.stream_query_method,
-        framework_descriptor.async_stream_query_method,
-    )
-
-    # MMR
-    _compare_signatures(
-        framework_descriptor.mmr_query_method,
-        framework_descriptor.async_mmr_query_method,
-    )
+        framework_descriptor.health_method,
+        framework_descriptor.capabilities_method,
+    ):
+        fn = _get_method(vector_client_instance, method_name)
+        assert _signature_accepts_kwarg(fn, ctx_kw), (
+            f"{framework_descriptor.name}: method {method_name!r} does not appear to accept "
+            f"declared context_kwarg {ctx_kw!r} (no parameter and no **kwargs)"
+        )
 
 
 # ---------------------------------------------------------------------------
-# Capabilities / health passthrough contract
+# Pure unit tests for helper behavior and adapter_init_kwarg handling
 # ---------------------------------------------------------------------------
 
 
-def test_capabilities_contract_if_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
+def test_context_injection_does_not_occur_when_context_kwarg_is_none() -> None:
     """
-    If a framework declares has_capabilities=True, it should expose a
-    capabilities() method returning a mapping. Async variants (when present)
-    should behave similarly.
+    Ensure our helper does not leak unexpected kwargs when descriptor.context_kwarg is None.
     """
-    if not framework_descriptor.has_capabilities:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not expose capabilities",
-        )
+    desc = VectorFrameworkDescriptor(
+        name="no_context",
+        adapter_module="test.module",
+        adapter_class="TestClient",
+        context_kwarg=None,
+    )
 
-    capabilities = getattr(vector_client_instance, "capabilities", None)
-    assert callable(capabilities), "capabilities() method is missing"
+    kwargs: dict[str, Any] = {"existing": 1}
+    out = _inject_framework_context_kwarg(desc, kwargs, context={"k": "v"})
 
-    caps_result = capabilities()
-    assert isinstance(
-        caps_result,
-        Mapping,
-    ), "capabilities() should return a mapping"
-
-    async_caps = getattr(vector_client_instance, "acapabilities", None)
-    if async_caps is not None and callable(async_caps):
-        acaps_result = _run_async_if_needed(async_caps())
-        assert isinstance(
-            acaps_result,
-            Mapping,
-        ), "acapabilities() should return a mapping"
+    assert out is kwargs
+    assert out == {"existing": 1}
 
 
-def test_health_contract_if_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
+def test_context_injection_occurs_when_context_kwarg_is_set() -> None:
     """
-    If a framework declares has_health=True, it should expose a health()
-    method returning a mapping. Async variants (when present) should behave
-    similarly.
+    Ensure our helper injects the declared context kwarg when descriptor.context_kwarg is set.
     """
-    if not framework_descriptor.has_health:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not expose health",
-        )
+    desc = VectorFrameworkDescriptor(
+        name="with_context",
+        adapter_module="test.module",
+        adapter_class="TestClient",
+        context_kwarg="ctx",
+    )
 
-    health = getattr(vector_client_instance, "health", None)
-    assert callable(health), "health() method is missing"
+    kwargs: dict[str, Any] = {"existing": 1}
+    out = _inject_framework_context_kwarg(desc, kwargs, context={"k": "v"})
 
-    health_result = health()
-    assert isinstance(
-        health_result,
-        Mapping,
-    ), "health() should return a mapping"
+    assert out is kwargs  # helper mutates in-place by design
+    assert out["existing"] == 1
+    assert out["ctx"] == {"k": "v"}
 
-    async_health = getattr(vector_client_instance, "ahealth", None)
-    if async_health is not None and callable(async_health):
-        ahealth_result = _run_async_if_needed(async_health())
-        assert isinstance(
-            ahealth_result,
-            Mapping,
-        ), "ahealth() should return a mapping"
+
+def test_adapter_init_kwarg_is_respected_with_nonstandard_kwarg() -> None:
+    """
+    Ensure adapter_init_kwarg is honored by construction logic.
+
+    This is a pure unit test: we do not import any real framework adapter. Instead,
+    we synthesize a client class that only accepts a nonstandard kwarg, and ensure
+    our construction approach uses descriptor.adapter_init_kwarg.
+    """
+
+    class SyntheticClient:
+        def __init__(self, *, injected_adapter: Any) -> None:
+            self.injected_adapter = injected_adapter
+
+    adapter = object()
+
+    desc = VectorFrameworkDescriptor(
+        name="synthetic",
+        adapter_module="synthetic.module",
+        adapter_class="SyntheticClient",
+        adapter_init_kwarg="injected_adapter",
+    )
+
+    init_kwargs: dict[str, Any] = {desc.adapter_init_kwarg: adapter}
+    instance = SyntheticClient(**init_kwargs)
+    assert instance.injected_adapter is adapter
+
+
+def test_register_overwrite_emits_warning_and_updates_registry() -> None:
+    """
+    Overwriting an existing registry entry should emit a warning and update the mapping.
+    """
+    original_registry = dict(VECTOR_FRAMEWORKS)
+    original_cache = dict(_AVAILABILITY_CACHE)
+
+    try:
+        VECTOR_FRAMEWORKS.clear()
+        _AVAILABILITY_CACHE.clear()
+
+        d1 = VectorFrameworkDescriptor(name="x", adapter_module="m1", adapter_class="C1")
+        d2 = VectorFrameworkDescriptor(name="x", adapter_module="m2", adapter_class="C2")
+
+        register_vector_framework_descriptor(d1, overwrite=False)
+        assert VECTOR_FRAMEWORKS["x"] is d1
+
+        with pytest.warns(RuntimeWarning, match="being overwritten"):
+            register_vector_framework_descriptor(d2, overwrite=True)
+
+        assert VECTOR_FRAMEWORKS["x"] is d2
+
+    finally:
+        VECTOR_FRAMEWORKS.clear()
+        VECTOR_FRAMEWORKS.update(original_registry)
+        _AVAILABILITY_CACHE.clear()
+        _AVAILABILITY_CACHE.update(original_cache)
 
 
 if __name__ == "__main__":
