@@ -1255,11 +1255,12 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         Alias for get_streaming_chat_message_content that satisfies the
         Semantic Kernel multi-message streaming interface.
         """
-        async for msg in self.get_streaming_chat_message_content(
+        stream_iter = await self.get_streaming_chat_message_content(
             chat_history,
             settings,
             **kwargs,
-        ):
+        )
+        async for msg in stream_iter:
             yield msg
 
     # ------------------------------------------------------------------ #
@@ -1345,7 +1346,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                 if isinstance(value, int):
                     return value
         raise TypeError(
-            f"{ERROR_CODES.BAD_USAGE_RESULT}: count_tokens returned unsupported type "
+            f"{ERROR_CODES.invalid_result}: count_tokens returned unsupported type "
             f"{type(tokens_any).__name__}"
         )
 
