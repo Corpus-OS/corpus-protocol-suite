@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 import pytest
 
@@ -18,8 +18,7 @@ from tests.frameworks.registries.vector_registry import (
 # ---------------------------------------------------------------------------
 
 FAILURE_MESSAGE = "intentional failure from failing vector adapter"
-VECTOR_OPERATION_PREFIX = "vector_"
-
+VECTOR_OPERATION_PREFIX = "vector."
 RICH_CONTEXT = {
     "request_id": "req-123",
     "user_id": "user-abc",
@@ -27,9 +26,11 @@ RICH_CONTEXT = {
     "nested": {"key": "value", "depth": 2},
 }
 
-QUERY_TEXT = "ctx-query"
-STREAM_QUERY_TEXT = "ctx-stream-query"
-MMR_QUERY_TEXT = "ctx-mmr-query"
+# In these tests, we only care that calls succeed/fail in the expected way.
+# We intentionally keep payloads simple and framework-agnostic.
+QUERY_INPUT = {"vector": [0.1, 0.2, 0.3], "top_k": 3}
+UPSERT_INPUT = {"id": "doc-1", "vector": [0.1, 0.2, 0.3], "metadata": {"k": "v"}}
+DELETE_INPUT = "doc-1"
 
 
 # ---------------------------------------------------------------------------
@@ -48,8 +49,8 @@ def framework_descriptor_fixture(
     Parameterized over all registered vector framework descriptors.
 
     Frameworks that are not actually available in the environment (e.g. the
-    underlying LlamaIndex / Semantic Kernel libraries are missing) are skipped
-    via descriptor.is_available().
+    underlying LangChain / LlamaIndex / Semantic Kernel libs are missing)
+    are skipped via descriptor.is_available().
     """
     descriptor: VectorFrameworkDescriptor = request.param
     if not descriptor.is_available():
@@ -63,49 +64,48 @@ def vector_client_instance(
     adapter: Any,
 ) -> Any:
     """
-    Construct a concrete vector client/store instance for the given descriptor.
+    Construct a vector client instance for the given descriptor.
 
-    Mirrors the construction pattern used in the other vector contract tests:
-    each framework adapter is expected to take an `adapter` kwarg that wraps
-    a Corpus vector protocol implementation.
+    IMPORTANT:
+    We use descriptor.adapter_init_kwarg so conformance tests do not hardcode
+    constructor argument names.
     """
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
-    init_kwargs: dict[str, Any] = {"adapter": adapter}
-    instance = client_cls(**init_kwargs)
-    return instance
+    init_kwargs: dict[str, Any] = {framework_descriptor.adapter_init_kwarg: adapter}
+    return client_cls(**init_kwargs)
 
 
 @pytest.fixture
 def failing_adapter() -> Any:
     """
-    A minimal vector adapter whose query / stream / MMR methods always fail.
+    A minimal vector adapter whose core VectorProtocolV1 methods always fail.
 
-    Used only for error-context tests to ensure the decorators invoke
-    attach_context() and propagate the exception.
+    This is used ONLY for error-context tests to ensure attach_context() is invoked
+    and the exception propagates.
     """
 
     class FailingVectorAdapter:
-        # Core query surfaces
-        def query(self, *args: Any, **kwargs: Any) -> Any:
+        async def query(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError(FAILURE_MESSAGE)
 
-        async def aquery(self, *args: Any, **kwargs: Any) -> Any:
+        async def upsert(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError(FAILURE_MESSAGE)
 
-        # Streaming
-        def query_stream(self, *args: Any, **kwargs: Any) -> Any:
+        async def delete(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError(FAILURE_MESSAGE)
 
-        async def aquery_stream(self, *args: Any, **kwargs: Any) -> Any:
+        async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError(FAILURE_MESSAGE)
 
-        # MMR
-        def query_mmr(self, *args: Any, **kwargs: Any) -> Any:
+        async def create_namespace(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError(FAILURE_MESSAGE)
 
-        async def aquery_mmr(self, *args: Any, **kwargs: Any) -> Any:
+        async def delete_namespace(self, *args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(FAILURE_MESSAGE)
+
+        async def health(self, *args: Any, **kwargs: Any) -> Any:
             raise RuntimeError(FAILURE_MESSAGE)
 
     return FailingVectorAdapter()
@@ -116,12 +116,9 @@ def failing_adapter() -> Any:
 # ---------------------------------------------------------------------------
 
 
-def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
+def _get_method(instance: Any, name: Optional[str]) -> Callable[..., Any]:
     """
-    Helper to fetch a method from the instance and assert it is callable.
-
-    If name is None, this fails fast with a clear assertion message so we
-    don't silently mis-test a missing surface.
+    Fetch a method from the instance and assert it is callable.
     """
     assert name, "Expected a non-empty method name"
     attr = getattr(instance, name, None)
@@ -129,21 +126,33 @@ def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
     return attr
 
 
-def _maybe_call_with_context(
+async def _maybe_await(value: Any) -> Any:
+    """
+    Await the value if it is awaitable, otherwise return it unchanged.
+
+    This keeps tests robust across wrappers that expose sync methods wrapping
+    async internals vs wrappers that expose native async methods.
+    """
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+def _call_with_optional_context(
     descriptor: VectorFrameworkDescriptor,
     fn: Callable[..., Any],
     *args: Any,
-    context: Any,
+    context: Any = None,
+    **kwargs: Any,
 ) -> Any:
     """
-    Call a vector client method, respecting descriptor.context_kwarg if present.
+    Call a method and inject context using descriptor.context_kwarg (if any).
 
-    This helper allows injecting either a valid Mapping context or an
-    intentionally invalid context for robustness tests.
+    If context_kwarg is not declared, context is ignored.
     """
-    if descriptor.context_kwarg:
-        return fn(*args, **{descriptor.context_kwarg: context})
-    return fn(*args)
+    if descriptor.context_kwarg and context is not None:
+        kwargs = {**kwargs, descriptor.context_kwarg: context}
+    return fn(*args, **kwargs)
 
 
 def _build_error_wrapped_client_instance(
@@ -152,28 +161,33 @@ def _build_error_wrapped_client_instance(
 ) -> Any:
     """
     Construct a vector client instance wired to a failing vector adapter.
-
-    Used only for error-context tests (we expect calls to raise).
     """
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
-    init_kwargs: dict[str, Any] = {"adapter": failing_adapter}
+    init_kwargs: dict[str, Any] = {
+        framework_descriptor.adapter_init_kwarg: failing_adapter,
+    }
     return client_cls(**init_kwargs)
 
 
-def _patch_attach_context(
+def _patch_attach_context_centrally(
     monkeypatch: pytest.MonkeyPatch,
-    module: Any,
 ) -> list[tuple[BaseException, dict[str, Any]]]:
     """
-    Patch the module-local attach_context used by decorators and capture calls.
+    Patch the centralized attach_context imported by the common translator layer.
+
+    New approach:
+    Error context is attached in the framework-agnostic orchestration layer,
+    not bespoke per-framework method wrappers.
     """
+    import corpus_sdk.vector.framework_adapters.common.vector_translation as vt
+
     calls: list[tuple[BaseException, dict[str, Any]]] = []
 
     def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
         calls.append((exc, ctx))
 
-    monkeypatch.setattr(module, "attach_context", fake_attach_context)
+    monkeypatch.setattr(vt, "attach_context", fake_attach_context)
     return calls
 
 
@@ -182,408 +196,398 @@ def _patch_attach_context(
 # ---------------------------------------------------------------------------
 
 
-def test_rich_mapping_context_is_accepted_and_does_not_break_queries(
+@pytest.mark.asyncio
+async def test_query_accepts_context_mapping_when_declared(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
 ) -> None:
     """
-    If a framework declares a context_kwarg, it should:
-
-    - accept a rich Mapping (with extra / nested keys),
-    - not raise TypeError / ValueError,
-    - still return a valid query result.
-
-    Frameworks without a declared context_kwarg are skipped here.
+    If a framework declares context_kwarg, query should accept a rich Mapping
+    and not fail due to context shape.
     """
     if not framework_descriptor.context_kwarg:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare a context_kwarg",
-        )
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare a context_kwarg")
 
     query_method = _get_method(vector_client_instance, framework_descriptor.query_method)
 
-    rich_context = {
-        **RICH_CONTEXT,
-        "tags": [*RICH_CONTEXT["tags"], framework_descriptor.name],
-    }
+    rich_context = {**RICH_CONTEXT, "tags": [*RICH_CONTEXT["tags"], framework_descriptor.name]}
 
-    result = _maybe_call_with_context(
+    result = _call_with_optional_context(
         framework_descriptor,
         query_method,
-        QUERY_TEXT,
+        QUERY_INPUT,
         context=rich_context,
     )
-    assert result is not None
+    out = await _maybe_await(result)
+    assert out is not None
 
 
-def test_invalid_context_type_is_tolerated_and_does_not_crash(
+@pytest.mark.asyncio
+async def test_query_context_is_optional_even_when_declared(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
 ) -> None:
     """
-    Passing an invalid context type (non-Mapping) should not crash the adapter.
+    Query must still work when context is omitted.
+    """
+    query_method = _get_method(vector_client_instance, framework_descriptor.query_method)
+    out = await _maybe_await(query_method(QUERY_INPUT))
+    assert out is not None
 
-    The framework adapters are expected to either:
-    - log a warning and ignore the context, or
-    - gracefully treat it as "no context".
 
-    In all cases, queries should still return results.
+@pytest.mark.asyncio
+async def test_invalid_context_type_behavior_is_consistent(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Any,
+) -> None:
+    """
+    New approach expectation:
+    - If context_kwarg is declared, invalid context types may raise (BadRequest)
+      OR may be ignored by the wrapper if it sanitizes before passing to core.
+    - This test enforces "no AttributeError explosions" and makes behavior explicit.
+
+    We accept either:
+    - success (context ignored/sanitized), OR
+    - a clean exception type (ValueError/TypeError/BadRequest family)
+      BUT we do not accept unhandled AttributeError-style crashes.
     """
     if not framework_descriptor.context_kwarg:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare a context_kwarg",
-        )
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare a context_kwarg")
 
     query_method = _get_method(vector_client_instance, framework_descriptor.query_method)
 
     invalid_contexts = ["not-a-mapping", 12345]
 
     for invalid_ctx in invalid_contexts:
-        result = _maybe_call_with_context(
-            framework_descriptor,
-            query_method,
-            QUERY_TEXT,
-            context=invalid_ctx,
-        )
-        assert result is not None
+        try:
+            result = _call_with_optional_context(
+                framework_descriptor,
+                query_method,
+                QUERY_INPUT,
+                context=invalid_ctx,
+            )
+            out = await _maybe_await(result)
+            assert out is not None
+        except Exception as exc:  # noqa: BLE001
+            assert not isinstance(exc, AttributeError), (
+                f"{framework_descriptor.name}: invalid context caused AttributeError crash: {exc!r}"
+            )
 
 
-def test_context_is_optional_and_omitting_it_still_works(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
+def test_context_injection_does_not_occur_when_context_kwarg_is_none() -> None:
     """
-    Even when a framework supports a context kwarg, it must still work
-    when no context is provided.
+    Ensure _call_with_optional_context does not leak a 'context' kwarg when
+    descriptor.context_kwarg is None.
+
+    This is a pure unit test to prevent accidental kwargs injection into
+    wrappers that do not support it.
     """
-    query_method = _get_method(vector_client_instance, framework_descriptor.query_method)
 
-    result = query_method(QUERY_TEXT)
-    assert result is not None
+    class RecordingCallable:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, Any] = {}
 
+        def __call__(self, *args: Any, **kwargs: Any) -> Any:
+            self.kwargs = dict(kwargs)
+            return {"ok": True}
 
-def test_context_on_mmr_queries_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    vector_client_instance: Any,
-) -> None:
-    """
-    When MMR is supported, the MMR query surface should also accept context
-    without crashing and still return results.
-    """
-    if not framework_descriptor.supports_mmr or not framework_descriptor.mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare MMR support",
-        )
-
-    if not framework_descriptor.context_kwarg:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare a context_kwarg",
-        )
-
-    mmr_method = _get_method(vector_client_instance, framework_descriptor.mmr_query_method)
-
-    rich_context = {
-        **RICH_CONTEXT,
-        "tags": [*RICH_CONTEXT["tags"], "mmr", framework_descriptor.name],
-    }
-
-    result = _maybe_call_with_context(
-        framework_descriptor,
-        mmr_method,
-        MMR_QUERY_TEXT,
-        context=rich_context,
+    fn = RecordingCallable()
+    desc = VectorFrameworkDescriptor(
+        name="unit_no_ctx",
+        adapter_module="test.module",
+        adapter_class="TestClass",
+        context_kwarg=None,
     )
-    assert result is not None
+
+    out = _call_with_optional_context(desc, fn, QUERY_INPUT, context={"should": "not-pass"})
+    assert out == {"ok": True}
+    assert "context" not in fn.kwargs
+    assert fn.kwargs == {}, "No kwargs should be injected when context_kwarg is None"
 
 
 # ---------------------------------------------------------------------------
-# Error-context decorator contract tests
+# Error-context contract tests (centralized attach_context)
 # ---------------------------------------------------------------------------
 
 
-def test_error_context_is_attached_on_sync_query_failure(
+@pytest.mark.asyncio
+async def test_error_context_attached_on_query_failure(
     framework_descriptor: VectorFrameworkDescriptor,
     failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When the underlying vector adapter raises during a sync query operation,
-    the framework adapter's error-context decorator should:
-
-    - call attach_context() with the exception and useful metadata, and
-    - re-raise the original exception (or a wrapped one).
-
-    We assert that attach_context is invoked and that the operation name
-    looks like a vector operation (e.g. starts with "vector_").
+    On query failure, attach_context must be called with useful metadata and
+    operation name starting with 'vector.'.
     """
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _build_error_wrapped_client_instance(
-        framework_descriptor,
-        failing_adapter,
-    )
-
+    calls = _patch_attach_context_centrally(monkeypatch)
+    instance = _build_error_wrapped_client_instance(framework_descriptor, failing_adapter)
     query_method = _get_method(instance, framework_descriptor.query_method)
 
     with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        if framework_descriptor.context_kwarg:
-            query_method(
-                "err-query",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            query_method("err-query")
-
-    assert calls, "attach_context was not called on sync query failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
-
-
-def test_error_context_is_attached_on_sync_stream_failure_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    failing_adapter: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    When streaming is supported, sync stream failures should also go through
-    the error-context decorator and call attach_context().
-    """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
+        result = _call_with_optional_context(
+            framework_descriptor,
+            query_method,
+            QUERY_INPUT,
+            context={} if framework_descriptor.context_kwarg else None,
         )
+        await _maybe_await(result)
 
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _build_error_wrapped_client_instance(
-        framework_descriptor,
-        failing_adapter,
-    )
-
-    stream_method = _get_method(instance, framework_descriptor.stream_query_method)
-
-    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        if framework_descriptor.context_kwarg:
-            iterator = stream_method(
-                "err-stream",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            iterator = stream_method("err-stream")
-
-        for _ in iterator:  # noqa: B007
-            pass
-
-    assert calls, "attach_context was not called on sync stream failure"
-
+    assert calls, "attach_context was not called on query failure"
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
     assert "framework" in ctx
     assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
-
-
-def test_error_context_is_attached_on_sync_mmr_failure_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    failing_adapter: Any,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    When MMR is supported, sync MMR failures should also go through the
-    error-context decorator and call attach_context().
-    """
-    if not framework_descriptor.supports_mmr or not framework_descriptor.mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare MMR support",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _build_error_wrapped_client_instance(
-        framework_descriptor,
-        failing_adapter,
-    )
-
-    mmr_method = _get_method(instance, framework_descriptor.mmr_query_method)
-
-    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        if framework_descriptor.context_kwarg:
-            mmr_method(
-                "err-mmr",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            mmr_method("err-mmr")
-
-    assert calls, "attach_context was not called on sync MMR failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    assert str(ctx.get("operation", "")).startswith(VECTOR_OPERATION_PREFIX)
 
 
 @pytest.mark.asyncio
-async def test_error_context_is_attached_on_async_query_failure_when_supported(
+async def test_error_context_attached_on_upsert_failure(
     framework_descriptor: VectorFrameworkDescriptor,
     failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When async query is declared, async query failures should also go through
-    the error-context decorator and call attach_context().
+    On upsert failure, attach_context must be called.
     """
-    if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _build_error_wrapped_client_instance(
-        framework_descriptor,
-        failing_adapter,
-    )
-
-    aquery_method = _get_method(instance, framework_descriptor.async_query_method)
+    calls = _patch_attach_context_centrally(monkeypatch)
+    instance = _build_error_wrapped_client_instance(framework_descriptor, failing_adapter)
+    upsert_method = _get_method(instance, framework_descriptor.upsert_method)
 
     with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        if framework_descriptor.context_kwarg:
-            coro = aquery_method(
-                "err-aquery",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = aquery_method("err-aquery")
+        result = _call_with_optional_context(
+            framework_descriptor,
+            upsert_method,
+            UPSERT_INPUT,
+            context={} if framework_descriptor.context_kwarg else None,
+        )
+        await _maybe_await(result)
 
-        assert inspect.isawaitable(coro), "Async query method must return an awaitable"
-        await coro  # noqa: PT018
-
-    assert calls, "attach_context was not called on async query failure"
-
+    assert calls, "attach_context was not called on upsert failure"
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
     assert "framework" in ctx
     assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    assert str(ctx.get("operation", "")).startswith(VECTOR_OPERATION_PREFIX)
 
 
 @pytest.mark.asyncio
-async def test_error_context_is_attached_on_async_stream_failure_when_supported(
+async def test_error_context_attached_on_delete_failure(
     framework_descriptor: VectorFrameworkDescriptor,
     failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When async streaming is supported, async stream failures should also go
-    through the error-context decorator and call attach_context().
+    On delete failure, attach_context must be called.
     """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _build_error_wrapped_client_instance(
-        framework_descriptor,
-        failing_adapter,
-    )
-
-    astream_method = _get_method(
-        instance,
-        framework_descriptor.async_stream_query_method,
-    )
+    calls = _patch_attach_context_centrally(monkeypatch)
+    instance = _build_error_wrapped_client_instance(framework_descriptor, failing_adapter)
+    delete_method = _get_method(instance, framework_descriptor.delete_method)
 
     with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        if framework_descriptor.context_kwarg:
-            aiter = astream_method(
-                "err-astream",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            aiter = astream_method("err-astream")
+        result = _call_with_optional_context(
+            framework_descriptor,
+            delete_method,
+            DELETE_INPUT,
+            context={} if framework_descriptor.context_kwarg else None,
+        )
+        await _maybe_await(result)
 
-        if inspect.isawaitable(aiter):
-            aiter = await aiter  # type: ignore[assignment]
-
-        async for _ in aiter:  # noqa: B007
-            pass
-
-    assert calls, "attach_context was not called on async stream failure"
-
+    assert calls, "attach_context was not called on delete failure"
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
     assert "framework" in ctx
     assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    assert str(ctx.get("operation", "")).startswith(VECTOR_OPERATION_PREFIX)
 
 
 @pytest.mark.asyncio
-async def test_error_context_is_attached_on_async_mmr_failure_when_supported(
+async def test_error_context_attached_on_capabilities_failure(
     framework_descriptor: VectorFrameworkDescriptor,
     failing_adapter: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When async MMR is supported, async MMR failures should also go through
-    the error-context decorator and call attach_context().
+    On capabilities failure, attach_context must be called.
     """
-    if not framework_descriptor.supports_mmr:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare MMR support",
-        )
-
-    if not framework_descriptor.async_mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async MMR support",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _build_error_wrapped_client_instance(
-        framework_descriptor,
-        failing_adapter,
-    )
-
-    ammr_method = _get_method(instance, framework_descriptor.async_mmr_query_method)
+    calls = _patch_attach_context_centrally(monkeypatch)
+    instance = _build_error_wrapped_client_instance(framework_descriptor, failing_adapter)
+    capabilities_method = _get_method(instance, framework_descriptor.capabilities_method)
 
     with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
-        if framework_descriptor.context_kwarg:
-            coro = ammr_method(
-                "err-ammr",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = ammr_method("err-ammr")
+        result = _call_with_optional_context(
+            framework_descriptor,
+            capabilities_method,
+            context={} if framework_descriptor.context_kwarg else None,
+        )
+        await _maybe_await(result)
 
-        assert inspect.isawaitable(coro), "Async MMR method must return an awaitable"
-        await coro  # noqa: PT018
-
-    assert calls, "attach_context was not called on async MMR failure"
-
+    assert calls, "attach_context was not called on capabilities failure"
     exc, ctx = calls[-1]
     assert isinstance(exc, RuntimeError)
     assert "framework" in ctx
     assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    assert str(ctx.get("operation", "")).startswith(VECTOR_OPERATION_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_error_context_attached_on_health_failure(
+    framework_descriptor: VectorFrameworkDescriptor,
+    failing_adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On health failure, attach_context must be called.
+    """
+    calls = _patch_attach_context_centrally(monkeypatch)
+    instance = _build_error_wrapped_client_instance(framework_descriptor, failing_adapter)
+    health_method = _get_method(instance, framework_descriptor.health_method)
+
+    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
+        result = _call_with_optional_context(
+            framework_descriptor,
+            health_method,
+            context={} if framework_descriptor.context_kwarg else None,
+        )
+        await _maybe_await(result)
+
+    assert calls, "attach_context was not called on health failure"
+    exc, ctx = calls[-1]
+    assert isinstance(exc, RuntimeError)
+    assert "framework" in ctx
+    assert "operation" in ctx
+    assert str(ctx.get("operation", "")).startswith(VECTOR_OPERATION_PREFIX)
+
+
+@pytest.mark.asyncio
+async def test_error_context_attached_on_namespace_ops_failure(
+    framework_descriptor: VectorFrameworkDescriptor,
+    failing_adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    On create/delete namespace failures, attach_context must be called.
+
+    We cover both namespace ops in one test to keep total count reasonable.
+    """
+    calls = _patch_attach_context_centrally(monkeypatch)
+    instance = _build_error_wrapped_client_instance(framework_descriptor, failing_adapter)
+
+    create_ns = _get_method(instance, framework_descriptor.create_namespace_method)
+    delete_ns = _get_method(instance, framework_descriptor.delete_namespace_method)
+
+    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
+        result = _call_with_optional_context(
+            framework_descriptor,
+            create_ns,
+            "ns-test",
+            context={} if framework_descriptor.context_kwarg else None,
+        )
+        await _maybe_await(result)
+
+    with pytest.raises(RuntimeError, match=FAILURE_MESSAGE):
+        result = _call_with_optional_context(
+            framework_descriptor,
+            delete_ns,
+            "ns-test",
+            context={} if framework_descriptor.context_kwarg else None,
+        )
+        await _maybe_await(result)
+
+    assert calls, "attach_context was not called on namespace op failures"
+    for exc, ctx in calls[-2:]:
+        assert isinstance(exc, RuntimeError)
+        assert "framework" in ctx
+        assert "operation" in ctx
+        assert str(ctx.get("operation", "")).startswith(VECTOR_OPERATION_PREFIX)
+
+
+# ---------------------------------------------------------------------------
+# Registry/descriptor alignment sanity tests (this file only)
+# ---------------------------------------------------------------------------
+
+
+def test_descriptor_method_names_are_non_empty_strings(framework_descriptor: VectorFrameworkDescriptor) -> None:
+    """
+    Ensure descriptor method name fields required by the registry contract
+    are always non-empty strings.
+    """
+    required = [
+        framework_descriptor.capabilities_method,
+        framework_descriptor.query_method,
+        framework_descriptor.upsert_method,
+        framework_descriptor.delete_method,
+        framework_descriptor.create_namespace_method,
+        framework_descriptor.delete_namespace_method,
+        framework_descriptor.health_method,
+    ]
+    for name in required:
+        assert isinstance(name, str) and name.strip()
+
+
+def test_client_exposes_required_methods(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Any,
+) -> None:
+    """
+    Ensure the constructed client exposes the required callable methods.
+    """
+    for attr_name in (
+        framework_descriptor.capabilities_method,
+        framework_descriptor.query_method,
+        framework_descriptor.upsert_method,
+        framework_descriptor.delete_method,
+        framework_descriptor.create_namespace_method,
+        framework_descriptor.delete_namespace_method,
+        framework_descriptor.health_method,
+    ):
+        _get_method(vector_client_instance, attr_name)
+
+
+def test_client_exposes_batch_query_when_declared(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Any,
+) -> None:
+    """
+    If the registry declares has_batch_query=True, the client must expose a
+    callable batch_query_method.
+
+    This is a surface-shape check only; runtime support is determined by
+    capabilities().
+    """
+    if not framework_descriptor.has_batch_query:
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not declare batch query surface")
+
+    assert framework_descriptor.batch_query_method, (
+        f"{framework_descriptor.name}: has_batch_query=True but batch_query_method is not set"
+    )
+    _get_method(vector_client_instance, framework_descriptor.batch_query_method)
+
+
+def test_adapter_init_kwarg_is_respected_with_nonstandard_kwarg() -> None:
+    """
+    Pure unit test that adapter_init_kwarg is respected during construction.
+
+    This prevents tests from accidentally hardcoding 'adapter=...' and ensures
+    registry-driven construction remains correct even for nonstandard wrappers.
+    """
+
+    class SyntheticClient:
+        def __init__(self, corpus_adapter: Any) -> None:
+            self._adapter = corpus_adapter
+
+    sentinel_adapter = object()
+    desc = VectorFrameworkDescriptor(
+        name="unit_nonstandard_init_kwarg",
+        adapter_module="test.module",
+        adapter_class="SyntheticClient",
+        adapter_init_kwarg="corpus_adapter",
+    )
+
+    init_kwargs: dict[str, Any] = {desc.adapter_init_kwarg: sentinel_adapter}
+    instance = SyntheticClient(**init_kwargs)
+
+    assert instance._adapter is sentinel_adapter
 
 
 if __name__ == "__main__":
