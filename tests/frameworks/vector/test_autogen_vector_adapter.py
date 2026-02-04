@@ -3450,5 +3450,173 @@ def test_autogen_streaming_with_real_conversation(
     assert isinstance(docs, list)
 
 
+# ---------------------------------------------------------------------------
+# REAL AutoGen integration tests (pass/fail; no skips)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_retriever_function_tool_executes_or_raises_install_error(adapter: Any) -> None:
+    """True AutoGen integration: use autogen_core FunctionTool + run_json."""
+    create_tool = getattr(autogen_adapter_module, "create_autogen_retriever_function_tool", None)
+    assert callable(create_tool)
+
+    # Use a minimal async adapter here because the AutoGen async search path
+    # exercises VectorTranslator.arun_query/acapabilities.
+    from corpus_sdk.vector.vector_base import QueryResult
+
+    class AsyncVectorAdapter:
+        async def capabilities(self) -> VectorCapabilities:
+            return _make_caps()
+
+        async def query(self, *_a: Any, **_k: Any) -> QueryResult:
+            return QueryResult(matches=[], query_vector=[0.0], namespace="default", total_matches=0)
+
+        async def health(self) -> Mapping[str, Any]:
+            return {"status": "ok"}
+
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=AsyncVectorAdapter(),
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2, 0.3, 0.4]]),
+        async_embedding_function=_make_async_embedding_function,
+        default_top_k=2,
+    )
+
+    try:
+        from autogen_core import CancellationToken  # type: ignore[import-not-found]
+        from autogen_core.tools import FunctionTool  # type: ignore[import-not-found]
+    except Exception:
+        with pytest.raises(RuntimeError, match="AutoGen tool dependencies are not installed"):
+            create_tool(store)
+        return
+
+    tool = create_tool(store, name="corpus_vector_search_test")
+    assert isinstance(tool, FunctionTool)
+
+    token = CancellationToken()
+    out = await tool.run_json({"query": "hello", "k": 2}, token)
+    assert isinstance(out, list)
+    assert all(isinstance(x, Mapping) for x in out)
+    if out:
+        assert "page_content" in out[0]
+        assert "metadata" in out[0]
+
+
+def _require_autogen_core_for_vector_integration() -> Any:
+    """Fail-fast if autogen-core isn't importable for real FunctionTool integration."""
+    try:
+        from autogen_core import CancellationToken  # type: ignore[import-not-found]
+        from autogen_core.tools import FunctionTool  # type: ignore[import-not-found]
+    except Exception as exc:
+        pytest.fail(
+            "AutoGen integration tests require autogen-core. Install with:\n"
+            '  pip install -U "autogen-core" "autogen-agentchat"\n'
+            f"Import error: {exc!r}",
+            pytrace=False,
+        )
+    return CancellationToken, FunctionTool
+
+
+def _make_async_vector_adapter_for_autogen_integration() -> Any:
+    """Async VectorProtocol stub that returns predictable matches sized by top_k."""
+    from corpus_sdk.vector.vector_base import QueryResult, Vector, VectorMatch
+
+    class AsyncVectorAdapter:
+        async def capabilities(self) -> VectorCapabilities:
+            return _make_caps()
+
+        async def query(self, spec: Any, ctx: Any = None) -> QueryResult:  # noqa: ARG002
+            top_k = int(getattr(spec, "top_k", 2) or 2)
+            matches = []
+            for i in range(top_k):
+                matches.append(
+                    VectorMatch(
+                        vector=Vector(
+                            id=f"doc-{i}",
+                            vector=[0.0, 0.0, 0.0, 0.0],
+                            metadata={"page_content": f"text {i}", "id": f"doc-{i}"},
+                        ),
+                        score=1.0 - (i * 0.01),
+                        distance=float(i) * 0.01,
+                    )
+                )
+            return QueryResult(matches=matches, query_vector=[0.0, 0.0, 0.0, 0.0], namespace="default", total_matches=len(matches))
+
+        async def health(self) -> Mapping[str, Any]:
+            return {"status": "ok"}
+
+    return AsyncVectorAdapter()
+
+
+@pytest.mark.integration
+def test_real_autogen_function_tool_creation_and_metadata() -> None:
+    """Create a real autogen_core FunctionTool and ensure name/description are preserved."""
+    CancellationToken, FunctionTool = _require_autogen_core_for_vector_integration()
+    del CancellationToken
+
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=_make_async_vector_adapter_for_autogen_integration(),
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2, 0.3, 0.4]]),
+        async_embedding_function=_make_async_embedding_function,
+        default_top_k=2,
+    )
+
+    tool = autogen_adapter_module.create_autogen_retriever_function_tool(
+        store,
+        name="corpus_vector_search_meta",
+        description="test description",
+        default_k=3,
+    )
+    assert isinstance(tool, FunctionTool)
+    assert getattr(tool, "name", None) == "corpus_vector_search_meta"
+    assert "test description" in str(getattr(tool, "description", ""))
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_autogen_function_tool_respects_k_override() -> None:
+    """run_json k parameter should control the number of returned docs (end-to-end)."""
+    CancellationToken, FunctionTool = _require_autogen_core_for_vector_integration()
+
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=_make_async_vector_adapter_for_autogen_integration(),
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2, 0.3, 0.4]]),
+        async_embedding_function=_make_async_embedding_function,
+        default_top_k=2,
+    )
+    tool = autogen_adapter_module.create_autogen_retriever_function_tool(
+        store,
+        name="corpus_vector_search_k",
+        default_k=2,
+    )
+    assert isinstance(tool, FunctionTool)
+
+    token = CancellationToken()
+    out2 = await tool.run_json({"query": "hello", "k": 2}, token)
+    out5 = await tool.run_json({"query": "hello", "k": 5}, token)
+    assert isinstance(out2, list) and len(out2) == 2
+    assert isinstance(out5, list) and len(out5) == 5
+
+
+@pytest.mark.integration
+def test_real_autogen_retriever_tool_callable_with_real_store() -> None:
+    """CorpusAutoGenRetrieverTool should work without translator patching."""
+    _require_autogen_core_for_vector_integration()
+
+    store = CorpusAutoGenVectorStore(
+        corpus_adapter=_make_async_vector_adapter_for_autogen_integration(),
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2, 0.3, 0.4]]),
+        async_embedding_function=_make_async_embedding_function,
+        default_top_k=3,
+    )
+    tool = CorpusAutoGenRetrieverTool(vector_store=store)
+
+    out = tool("hello", k=3)
+    assert isinstance(out, list)
+    assert len(out) == 3
+    assert all(isinstance(x, Mapping) for x in out)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
