@@ -165,8 +165,45 @@ from corpus_sdk.core.error_context import attach_context
 
 logger = logging.getLogger(__name__)
 
+
+def _coerce_to_vector_operation_context(ctx: Any) -> OperationContext:
+    """Coerce a context-like object into the vector protocol's OperationContext.
+
+    `corpus_sdk.core.context_translation` returns the core OperationContext.
+    Vector adapters use the vector protocol OperationContext.
+    """
+    if isinstance(ctx, OperationContext):
+        return ctx
+
+    return OperationContext(
+        request_id=getattr(ctx, "request_id", None),
+        idempotency_key=getattr(ctx, "idempotency_key", None),
+        deadline_ms=getattr(ctx, "deadline_ms", None),
+        traceparent=getattr(ctx, "traceparent", None),
+        tenant=getattr(ctx, "tenant", None),
+        attrs=getattr(ctx, "attrs", None) or {},
+    )
+
 Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
+
+
+class LangChainVectorFrameworkTranslator(DefaultVectorFrameworkTranslator):
+    """LangChain VectorStore expects protocol-native result objects.
+
+    The generic DefaultVectorFrameworkTranslator translates QueryResult into
+    framework-neutral dict shapes. For LangChain's VectorStore integration,
+    we keep QueryResult intact and let the adapter map it into Documents.
+    """
+
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        return result
 
 
 # --------------------------------------------------------------------------- #
@@ -496,10 +533,26 @@ class CorpusLangChainVectorStore(VectorStore):
     _vector_dim_hint: Optional[int] = None
     _dim_lock: RLock = RLock()
 
-    # Pydantic v2-style config
-    model_config = {"arbitrary_types_allowed": True}
-
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        corpus_adapter: VectorProtocolV1,
+        namespace: Optional[str] = "default",
+        id_field: str = "id",
+        text_field: str = "page_content",
+        metadata_field: Optional[str] = None,
+        score_threshold: Optional[float] = None,
+        batch_size: int = 100,
+        max_query_batch_size: Optional[int] = None,
+        default_top_k: int = 4,
+        embedding_function: Optional[Callable[[List[str]], Embeddings]] = None,
+        async_embedding_function: Optional[
+            Callable[[List[str]], Awaitable[Embeddings]]
+        ] = None,
+        mmr_similarity_fn: Optional[
+            Callable[[Sequence[float], Sequence[float]], float]
+        ] = None,
+    ) -> None:
         """
         Initialize the VectorStore.
 
@@ -522,7 +575,33 @@ class CorpusLangChainVectorStore(VectorStore):
                 langchain_available=False,
             )
             raise err
-        super().__init__(*args, **kwargs)
+
+        if corpus_adapter is None:
+            raise TypeError("corpus_adapter must be provided")
+
+        if score_threshold is not None and not (0.0 <= float(score_threshold) <= 1.0):
+            raise ValueError("score_threshold must be between 0.0 and 1.0")
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        if int(default_top_k) <= 0:
+            raise ValueError("default_top_k must be positive")
+        if max_query_batch_size is not None and int(max_query_batch_size) <= 0:
+            raise ValueError("max_query_batch_size must be positive")
+
+        self.corpus_adapter = corpus_adapter
+        self.namespace = namespace
+        self.id_field = id_field
+        self.text_field = text_field
+        self.metadata_field = metadata_field
+        self.score_threshold = score_threshold
+        self.batch_size = int(batch_size)
+        self.max_query_batch_size = (
+            int(max_query_batch_size) if max_query_batch_size is not None else None
+        )
+        self.default_top_k = int(default_top_k)
+        self.embedding_function = embedding_function
+        self.async_embedding_function = async_embedding_function
+        self.mmr_similarity_fn = mmr_similarity_fn
 
     # ------------------------------------------------------------------ #
     # Translator + VectorStore-required properties / metadata
@@ -533,7 +612,7 @@ class CorpusLangChainVectorStore(VectorStore):
         """
         Lazily construct and cache the `VectorTranslator`.
         """
-        framework_translator = DefaultVectorFrameworkTranslator()
+        framework_translator = LangChainVectorFrameworkTranslator()
         return VectorTranslator(
             adapter=self.corpus_adapter,
             framework="langchain",
@@ -663,7 +742,9 @@ class CorpusLangChainVectorStore(VectorStore):
                     error_codes=VECTOR_ERROR_CODES,
                 )
                 raise
-            if not isinstance(ctx, OperationContext):
+            try:
+                return _coerce_to_vector_operation_context(ctx)
+            except Exception as exc:  # noqa: BLE001
                 err = BadRequest(
                     f"from_dict produced unsupported context type: {type(ctx).__name__}",
                     code=ErrorCodes.BAD_OPERATION_CONTEXT,
@@ -674,8 +755,7 @@ class CorpusLangChainVectorStore(VectorStore):
                     operation="vector_context_from_dict",
                     error_codes=VECTOR_ERROR_CODES,
                 )
-                raise err
-            return ctx
+                raise err from exc
 
         try:
             ctx = ctx_from_langchain(config)
@@ -687,7 +767,9 @@ class CorpusLangChainVectorStore(VectorStore):
                 error_codes=VECTOR_ERROR_CODES,
             )
             raise
-        if not isinstance(ctx, OperationContext):
+        try:
+            return _coerce_to_vector_operation_context(ctx)
+        except Exception as exc:  # noqa: BLE001
             err = BadRequest(
                 f"from_langchain produced unsupported context type: {type(ctx).__name__}",
                 code=ErrorCodes.BAD_OPERATION_CONTEXT,
@@ -698,8 +780,7 @@ class CorpusLangChainVectorStore(VectorStore):
                 operation="vector_context_from_langchain",
                 error_codes=VECTOR_ERROR_CODES,
             )
-            raise err
-        return ctx
+            raise err from exc
 
     def _build_ctx(self, **kwargs: Any) -> OperationContext:
         """
@@ -844,6 +925,9 @@ class CorpusLangChainVectorStore(VectorStore):
             * Fill empty/whitespace texts with deterministic zero vectors.
             * If all texts are empty and dimension is unknown, raise.
         """
+        if not texts:
+            return []
+
         if embeddings is not None:
             if len(embeddings) != len(texts):
                 err = BadRequest(
@@ -867,21 +951,6 @@ class CorpusLangChainVectorStore(VectorStore):
             except Exception:
                 pass
             return embeddings
-
-        if self.embedding_function is None:
-            err = NotSupported(
-                "No embedding_function configured; caller must supply embeddings",
-                code=ErrorCodes.NO_EMBEDDING_FUNCTION,
-                details={"texts": len(texts)},
-            )
-            attach_context(
-                err,
-                framework="langchain",
-                operation="ensure_embeddings",
-                texts_count=len(texts),
-                error_codes=VECTOR_ERROR_CODES,
-            )
-            raise err
 
         empty_idx: List[int] = []
         non_empty_texts: List[str] = []
@@ -913,6 +982,23 @@ class CorpusLangChainVectorStore(VectorStore):
                 )
                 raise err
             return [self._zero_vector(dim) for _ in texts]
+
+        if self.embedding_function is None:
+            err = NotSupported(
+                "No embedding_function configured; caller must supply embeddings",
+                code=ErrorCodes.NO_EMBEDDING_FUNCTION,
+                details={"texts": len(texts)},
+            )
+            attach_context(
+                err,
+                framework="langchain",
+                operation="ensure_embeddings",
+                texts_count=len(texts),
+                non_empty_texts_count=len(non_empty_texts),
+                empty_texts_count=len(empty_idx),
+                error_codes=VECTOR_ERROR_CODES,
+            )
+            raise err
 
         try:
             computed_non_empty = self.embedding_function(non_empty_texts)
