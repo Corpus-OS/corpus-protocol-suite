@@ -115,7 +115,6 @@ from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
     Vector,
     VectorMatch,
-    QueryChunk,
     QueryResult,
     DeleteResult,
     UpsertResult,
@@ -147,6 +146,49 @@ from corpus_sdk.core.context_translation import (
 from corpus_sdk.core.error_context import attach_context
 
 logger = logging.getLogger(__name__)
+
+# This module hard-depends on llama_index; if import succeeds, framework is available.
+LLAMAINDEX_AVAILABLE = True
+
+
+# --------------------------------------------------------------------------- #
+# Conformance / protocol client wrapper
+# --------------------------------------------------------------------------- #
+
+
+class CorpusLlamaIndexVectorClient:
+    """VectorProtocolV1-shaped wrapper used by the conformance test suite."""
+
+    def __init__(self, *, adapter: VectorProtocolV1) -> None:
+        self._translator = VectorTranslator(
+            adapter=adapter,
+            framework="llamaindex",
+            translator=DefaultVectorFrameworkTranslator(),
+        )
+
+    def capabilities(self, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.capabilities(framework_ctx=callback_manager)
+
+    def health(self, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.health(framework_ctx=callback_manager)
+
+    def query(self, raw_query: Any, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.query(raw_query, framework_ctx=callback_manager)
+
+    def batch_query(self, raw_queries: Any, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.batch_query(raw_queries, framework_ctx=callback_manager)
+
+    def upsert(self, raw_documents: Any, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.upsert(raw_documents, framework_ctx=callback_manager)
+
+    def delete(self, raw_filter_or_ids: Any, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.delete(raw_filter_or_ids, framework_ctx=callback_manager)
+
+    def create_namespace(self, name: str, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.create_namespace(name, framework_ctx=callback_manager)
+
+    def delete_namespace(self, name: str, *, callback_manager: Optional[Any] = None) -> Any:
+        return self._translator.delete_namespace(name, framework_ctx=callback_manager)
 
 Metadata = Dict[str, Any]
 
@@ -2020,7 +2062,10 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         ):
-            if not isinstance(chunk, QueryChunk):
+            raw_matches_obj = getattr(chunk, "matches", None)
+            if raw_matches_obj is None and isinstance(chunk, Mapping):
+                raw_matches_obj = chunk.get("matches")
+            if raw_matches_obj is None:
                 err = VectorAdapterError(
                     f"translator.query_stream returned unexpected type: {type(chunk).__name__}",
                     code="BAD_STREAM_CHUNK",
@@ -2035,7 +2080,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
                 )
                 raise err
 
-            raw_matches = list(chunk.matches or [])
+            raw_matches = list(raw_matches_obj or [])
             filtered_matches = self._apply_score_threshold(raw_matches)
 
             for match in filtered_matches:
