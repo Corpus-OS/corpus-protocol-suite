@@ -493,7 +493,7 @@ async def test_error_context_attached_on_namespace_ops_failure(
             framework_descriptor,
             create_ns,
             "ns-test",
-            context={} if framework_descriptor.context_kwarg else None,
+            context={"dimensions": 2} if framework_descriptor.context_kwarg else None,
         )
         await _maybe_await(result)
 
