@@ -104,6 +104,30 @@ Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
 
 
+def _coerce_to_vector_operation_context(ctx: Any) -> OperationContext:
+    """Coerce a context-like object into the vector protocol's OperationContext.
+
+    The framework context translation utilities in `corpus_sdk.core.context_translation`
+    return the core `OperationContext`, which is protocol-agnostic. Vector adapters
+    (and `VectorTranslator`) use the vector protocol `OperationContext` defined in
+    `corpus_sdk.vector.vector_base`.
+
+    This helper accepts either type (or any object with a compatible attribute
+    surface) and reconstructs the vector OperationContext.
+    """
+    if isinstance(ctx, OperationContext):
+        return ctx
+
+    return OperationContext(
+        request_id=getattr(ctx, "request_id", None),
+        idempotency_key=getattr(ctx, "idempotency_key", None),
+        deadline_ms=getattr(ctx, "deadline_ms", None),
+        traceparent=getattr(ctx, "traceparent", None),
+        tenant=getattr(ctx, "tenant", None),
+        attrs=getattr(ctx, "attrs", None) or {},
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Protocol client wrapper
 # --------------------------------------------------------------------------- #
@@ -334,10 +358,21 @@ def _build_dynamic_error_context(
         if "use_mmr" in kwargs or "use_mmr" in input_payload:
             extra.setdefault("use_mmr", kwargs.get("use_mmr") if "use_mmr" in kwargs else input_payload.get("use_mmr"))
         if "mmr_lambda" in kwargs or "mmr_lambda" in input_payload:
-            extra.setdefault(
-                "mmr_lambda",
-                kwargs.get("mmr_lambda") if "mmr_lambda" in kwargs else input_payload.get("mmr_lambda"),
-            )
+            mmr_lambda_val = kwargs.get("mmr_lambda") if "mmr_lambda" in kwargs else input_payload.get("mmr_lambda")
+            extra.setdefault("mmr_lambda", mmr_lambda_val)
+
+            # Convenience: attach the internal parameter name used by MMR selection.
+            # This is the clamped value that downstream logic uses.
+            try:
+                self_obj = args[0] if args else None
+                default_mmr_lambda = getattr(self_obj, "mmr_lambda", None) if self_obj is not None else None
+                raw_lambda = mmr_lambda_val if mmr_lambda_val is not None else default_mmr_lambda
+                if raw_lambda is not None:
+                    lambda_mult = float(raw_lambda)
+                    lambda_mult = max(0.0, min(1.0, lambda_mult))
+                    extra.setdefault("lambda_mult", lambda_mult)
+            except Exception:
+                pass
     except Exception:
         # Error-context enrichment must never be fatal.
         pass
@@ -653,7 +688,9 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             return call_context
 
         if call_context is None:
-            return self.static_operation_context if isinstance(self.static_operation_context, OperationContext) else None
+            if self.static_operation_context is None:
+                return None
+            return _coerce_to_vector_operation_context(self.static_operation_context)
 
         # Prefer explicit mapping translation when a dict-like is supplied.
         if isinstance(call_context, Mapping):
@@ -667,7 +704,9 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                     error_codes=VECTOR_ERROR_CODES,
                 )
                 raise
-            if not isinstance(ctx, OperationContext):
+            try:
+                return _coerce_to_vector_operation_context(ctx)
+            except Exception as exc:  # noqa: BLE001
                 err = BadRequest(
                     f"from_dict produced unsupported context type: {type(ctx).__name__}",
                     code=ErrorCodes.BAD_OPERATION_CONTEXT,
@@ -678,8 +717,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                     operation="context_translation_from_dict",
                     error_codes=VECTOR_ERROR_CODES,
                 )
-                raise err
-            return ctx
+                raise err from exc
 
         # Otherwise attempt CrewAI-specific translation for Task-like objects.
         try:
@@ -693,7 +731,9 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
             )
             raise
 
-        if not isinstance(ctx, OperationContext):
+        try:
+            return _coerce_to_vector_operation_context(ctx)
+        except Exception as exc:  # noqa: BLE001
             err = BadRequest(
                 f"from_crewai produced unsupported context type: {type(ctx).__name__}",
                 code=ErrorCodes.BAD_OPERATION_CONTEXT,
@@ -704,9 +744,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
                 operation="context_translation_from_crewai",
                 error_codes=VECTOR_ERROR_CODES,
             )
-            raise err
-
-        return ctx
+            raise err from exc
 
     def _effective_namespace(self, namespace: Optional[str]) -> Optional[str]:
         """Resolve namespace using explicit override or tool default."""
