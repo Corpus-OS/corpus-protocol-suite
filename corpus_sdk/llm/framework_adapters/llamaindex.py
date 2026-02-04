@@ -1314,44 +1314,6 @@ class CorpusLlamaIndexLLM(LLM):
         """Async token counting wrapper for conformance parity."""
         return self.count_tokens(messages, **kwargs)
 
-    def _combine_messages_for_counting(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> str:
-        """Combine messages into a single string for token counting."""
-        parts: List[str] = []
-        for msg in messages:
-            role = getattr(msg, "type", getattr(msg, "role", "user"))
-            content = str(getattr(msg, "content", ""))
-            parts.append(f"{role}: {content}")
-        return "\n".join(parts)
-
-    def _estimate_tokens_from_messages(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> int:
-        """Improved token estimation with better heuristics."""
-        combined_text = self._combine_messages_for_counting(messages)
-
-        if not combined_text:
-            return 0
-
-        char_count = len(combined_text)
-        message_count = len(messages)
-
-        char_based = max(1, char_count // 4)
-        message_based = max(1, message_count)
-
-        return max(char_based, message_based)
-
-    def _simple_token_estimate(
-        self,
-        messages: Sequence[ChatMessage],
-    ) -> int:
-        """Simple fallback token estimation."""
-        combined_text = self._combine_messages_for_counting(messages)
-        return max(1, len(combined_text) // 4)
-
     # ------------------------------------------------------------------ #
     # Health / capabilities via translator only (no adapter fallback)
     # ------------------------------------------------------------------ #
