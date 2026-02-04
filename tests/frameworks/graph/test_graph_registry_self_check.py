@@ -25,6 +25,9 @@ from tests.frameworks.registries.graph_registry import (
     iter_available_graph_framework_descriptors,
 )
 
+# We intentionally reach into module internals here for cache behavior tests.
+from tests.frameworks.registries.graph_registry import _AVAILABILITY_CACHE  # type: ignore
+
 
 def _normalize_version_range(s: Optional[str]) -> Optional[str]:
     """
@@ -137,6 +140,36 @@ def test_descriptor_is_available_does_not_raise(all_descriptors) -> None:
     for descriptor in all_descriptors:
         result = descriptor.is_available()
         assert isinstance(result, bool)
+
+
+def test_availability_cache_key_not_by_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Regression test: availability cache must not be keyed only by descriptor.name."""
+    from tests.frameworks.registries import graph_registry as reg_module
+
+    _AVAILABILITY_CACHE.clear()
+
+    def fake_import(module_name: str):
+        if module_name == "m1":
+            return type("M1", (), {"AVAILABLE": True})()
+        if module_name == "m2":
+            return type("M2", (), {"AVAILABLE": False})()
+        raise ImportError(module_name)
+
+    monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+
+    base = dict(
+        adapter_class="TestGraphClient",
+        query_method="query",
+        stream_query_method="stream_query",
+        availability_attr="AVAILABLE",
+    )
+
+    d1 = GraphFrameworkDescriptor(name="same", adapter_module="m1", **base)
+    assert d1.is_available() is True
+
+    # Same name, different module -> should re-evaluate and return False.
+    d2 = GraphFrameworkDescriptor(name="same", adapter_module="m2", **base)
+    assert d2.is_available() is False
 
 
 def test_version_range_formatting() -> None:
