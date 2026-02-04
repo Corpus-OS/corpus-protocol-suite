@@ -923,13 +923,19 @@ class CorpusLangChainLLM(BaseChatModel):
     # ------------------------------------------------------------------ #
 
     @with_llm_error_context("capabilities")
-    def capabilities(self) -> Mapping[str, Any]:
+    def capabilities(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
         """
         Expose capabilities, via the LLMTranslator.
 
         Translator is the single source of truth; the underlying adapter is
         not called directly to avoid divergent behavior.
         """
+        _ = config
         result = self._translator.capabilities()
 
         if not isinstance(result, Mapping):
@@ -940,7 +946,12 @@ class CorpusLangChainLLM(BaseChatModel):
         return result
 
     @with_async_llm_error_context("acapabilities")
-    async def acapabilities(self) -> Mapping[str, Any]:
+    async def acapabilities(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
         """
         Async capabilities wrapper, translator-only.
 
@@ -948,6 +959,7 @@ class CorpusLangChainLLM(BaseChatModel):
         1. self._translator.acapabilities()
         2. self._translator.capabilities() via asyncio.to_thread
         """
+        _ = config
         async_caps = getattr(self._translator, "acapabilities", None)
         if callable(async_caps):
             result = await async_caps()
@@ -963,13 +975,19 @@ class CorpusLangChainLLM(BaseChatModel):
         return result
 
     @with_llm_error_context("health")
-    def health(self) -> Mapping[str, Any]:
+    def health(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
         """
         Expose health, via the LLMTranslator.
 
         Translator is the single source of truth; the underlying adapter is
         not called directly to avoid divergent behavior.
         """
+        _ = config
         result = self._translator.health()
 
         if not isinstance(result, Mapping):
@@ -980,7 +998,12 @@ class CorpusLangChainLLM(BaseChatModel):
         return result
 
     @with_async_llm_error_context("ahealth")
-    async def ahealth(self) -> Mapping[str, Any]:
+    async def ahealth(
+        self,
+        *,
+        config: Optional[Mapping[str, Any]] = None,
+        **_: Any,
+    ) -> Mapping[str, Any]:
         """
         Async health wrapper, translator-only.
 
@@ -988,6 +1011,7 @@ class CorpusLangChainLLM(BaseChatModel):
         1. self._translator.ahealth()
         2. self._translator.health() via asyncio.to_thread
         """
+        _ = config
         async_health = getattr(self._translator, "ahealth", None)
         if callable(async_health):
             result = await async_health()
