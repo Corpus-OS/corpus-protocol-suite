@@ -2,24 +2,27 @@
 
 import dataclasses
 import types
+from typing import Optional
+
 import pytest
 
 from tests.frameworks.registries.vector_registry import (
     VECTOR_FRAMEWORKS,
     VectorFrameworkDescriptor,
-    iter_vector_framework_descriptors,
-    iter_available_vector_framework_descriptors,
-    register_vector_framework_descriptor,
-    unregister_vector_framework_descriptor,
-    has_vector_framework,
     get_vector_framework_descriptor,
     get_vector_framework_descriptor_safe,
+    has_vector_framework,
+    iter_available_vector_framework_descriptors,
+    iter_vector_framework_descriptors,
+    register_vector_framework_descriptor,
+    unregister_vector_framework_descriptor,
 )
 
 # We intentionally reach into the module internals here for cache behavior tests.
 from tests.frameworks.registries.vector_registry import (  # type: ignore
-    _AVAILABILITY_CACHE,
     Version,
+    _AVAILABILITY_CACHE,
+    _availability_cache_key,
 )
 
 
@@ -27,6 +30,11 @@ from tests.frameworks.registries.vector_registry import (  # type: ignore
 def all_descriptors():
     """Fixture providing all registered vector framework descriptors."""
     return list(iter_vector_framework_descriptors())
+
+
+# =============================================================================
+# Core registry invariants
+# =============================================================================
 
 
 def test_vector_registry_keys_match_descriptor_name(all_descriptors) -> None:
@@ -41,238 +49,18 @@ def test_vector_registry_keys_match_descriptor_name(all_descriptors) -> None:
         assert VECTOR_FRAMEWORKS[descriptor.name] is descriptor
 
 
-def test_registered_descriptors_validate_cleanly(all_descriptors) -> None:
+def test_iter_vector_framework_descriptors_returns_all() -> None:
     """
-    Smoke test: all descriptors currently registered in VECTOR_FRAMEWORKS
-    should validate without raising.
+    iter_vector_framework_descriptors should return all registered descriptors.
 
-    This is about the *current registry contents* being internally consistent,
-    not about edge-case behavior of VectorFrameworkDescriptor.validate itself.
+    We validate both length and membership identity (not just equality) to ensure
+    the iterator yields the concrete objects stored in the registry.
     """
-    for descriptor in all_descriptors:
-        # validate() may emit warnings but should not raise
-        descriptor.validate()
+    all_descs = list(iter_vector_framework_descriptors())
+    assert len(all_descs) == len(VECTOR_FRAMEWORKS)
 
-
-@pytest.mark.parametrize(
-    "name, minimum, tested_up_to, expected",
-    [
-        ("test1", None, None, None),
-        ("test2", "1.0.0", None, ">=1.0.0"),
-        ("test3", None, "2.5.0", "<=2.5.0"),
-        ("test4", "1.2.0", "3.0.0", ">=1.2.0, <= 3.0.0"),
-    ],
-)
-def test_version_range_formatting(name, minimum, tested_up_to, expected) -> None:
-    """
-    Test version_range() returns expected format for various version combinations.
-
-    Uses parametrization for concise coverage of the common cases.
-    """
-    desc = VectorFrameworkDescriptor(
-        name=name,
-        adapter_module="test.module",
-        adapter_class="TestVectorStore",
-        add_method="add",
-        query_method="query",
-        minimum_framework_version=minimum,
-        tested_up_to_version=tested_up_to,
-    )
-    assert desc.version_range() == expected
-
-
-def test_descriptor_is_available_does_not_raise(all_descriptors) -> None:
-    """
-    Ensure is_available() doesn't crash for any registered descriptor.
-
-    This is a smoke test that verifies the availability check doesn't raise
-    unexpected exceptions (ImportError, AttributeError) when called.
-    """
-    for descriptor in all_descriptors:
-        result = descriptor.is_available()
-        assert isinstance(result, bool)
-
-
-def test_async_method_consistency(all_descriptors) -> None:
-    """
-    Check that async core vector support is properly declared.
-
-    Policy: if any async surface exists, we expect at least async_add_method
-    and async_query_method to be present for API consistency.
-    """
-    for descriptor in all_descriptors:
-        if descriptor.supports_async:
-            assert descriptor.async_add_method is not None, (
-                f"{descriptor.name}: has async support but async_add_method is None"
-            )
-            assert descriptor.async_query_method is not None, (
-                f"{descriptor.name}: has async support but async_query_method is None"
-            )
-
-
-def test_streaming_support_property(all_descriptors) -> None:
-    """
-    Test the supports_streaming property/flag logic.
-
-    Ensures the flag correctly reflects whether ANY streaming method
-    is declared (sync or async) for the registered descriptors.
-    """
-    for descriptor in all_descriptors:
-        has_streaming = (
-            descriptor.stream_query_method is not None
-            or descriptor.async_stream_query_method is not None
-        )
-        assert descriptor.supports_streaming == has_streaming, (
-            f"{descriptor.name}: supports_streaming property mismatch"
-        )
-
-
-def test_mmr_support_property(all_descriptors) -> None:
-    """
-    Test the supports_mmr property/flag logic.
-
-    Ensures the flag correctly reflects whether ANY MMR method
-    is declared (sync or async) for the registered descriptors.
-    """
-    for descriptor in all_descriptors:
-        has_mmr = (
-            descriptor.mmr_query_method is not None
-            or descriptor.async_mmr_query_method is not None
-        )
-        assert descriptor.supports_mmr == has_mmr, (
-            f"{descriptor.name}: supports_mmr property mismatch"
-        )
-
-
-def test_supports_async_property(all_descriptors) -> None:
-    """
-    Test the supports_async property logic.
-
-    Ensures the property correctly reflects whether ANY async method
-    is declared.
-    """
-    for descriptor in all_descriptors:
-        has_async = any(
-            [
-                descriptor.async_add_method is not None,
-                descriptor.async_delete_method is not None,
-                descriptor.async_query_method is not None,
-                descriptor.async_stream_query_method is not None,
-                descriptor.async_mmr_query_method is not None,
-            ]
-        )
-        assert descriptor.supports_async == has_async, (
-            f"{descriptor.name}: supports_async property mismatch"
-        )
-
-
-def test_register_and_unregister_vector_framework_descriptor() -> None:
-    """
-    Test dynamic registration and unregistration functionality for vector frameworks.
-
-    This covers add, overwrite, and removal, as well as availability cache reset.
-    """
-    original_registry = dict(VECTOR_FRAMEWORKS)
-    original_cache = dict(_AVAILABILITY_CACHE)
-    try:
-        # Create a test descriptor with full async surfaces for consistency.
-        test_desc = VectorFrameworkDescriptor(
-            name="test_framework",
-            adapter_module="test.module",
-            adapter_class="TestVectorStore",
-            add_method="add",
-            async_add_method="aadd",
-            delete_method="delete",
-            async_delete_method="adelete",
-            query_method="query",
-            async_query_method="aquery",
-            stream_query_method="stream_query",
-            async_stream_query_method="astream_query",
-            mmr_query_method="mmr_query",
-            async_mmr_query_method="ammr_query",
-        )
-
-        # Should not exist initially
-        assert not has_vector_framework("test_framework")
-        assert get_vector_framework_descriptor_safe("test_framework") is None
-
-        # Register without overwrite
-        register_vector_framework_descriptor(test_desc)
-        assert has_vector_framework("test_framework")
-        assert get_vector_framework_descriptor_safe("test_framework") is test_desc
-        assert get_vector_framework_descriptor("test_framework") is test_desc
-
-        # Register duplicate without overwrite should fail
-        duplicate_desc = VectorFrameworkDescriptor(
-            name="test_framework",
-            adapter_module="other.module",
-            adapter_class="OtherVectorStore",
-            add_method="add2",
-            query_method="query2",
-        )
-        with pytest.raises(KeyError, match="already registered"):
-            register_vector_framework_descriptor(duplicate_desc, overwrite=False)
-
-        # Overwrite should succeed
-        register_vector_framework_descriptor(duplicate_desc, overwrite=True)
-        assert get_vector_framework_descriptor("test_framework") is duplicate_desc
-
-        # Unregister should remove the descriptor and clear availability cache
-        unregister_vector_framework_descriptor("test_framework")
-        assert not has_vector_framework("test_framework")
-        assert get_vector_framework_descriptor_safe("test_framework") is None
-
-        # Unregistering missing with ignore_missing=False should raise
-        with pytest.raises(KeyError, match="not registered"):
-            unregister_vector_framework_descriptor("test_framework", ignore_missing=False)
-
-    finally:
-        VECTOR_FRAMEWORKS.clear()
-        VECTOR_FRAMEWORKS.update(original_registry)
-        _AVAILABILITY_CACHE.clear()
-        _AVAILABILITY_CACHE.update(original_cache)
-
-
-def test_iter_available_vector_framework_descriptors_empty(monkeypatch) -> None:
-    """
-    Test iter_available_vector_framework_descriptors behavior when no frameworks
-    are available (all report is_available() == False).
-    """
-    from tests.frameworks.registries import vector_registry as reg_module
-
-    original_registry = dict(VECTOR_FRAMEWORKS)
-    original_cache = dict(_AVAILABILITY_CACHE)
-    try:
-        VECTOR_FRAMEWORKS.clear()
-        _AVAILABILITY_CACHE.clear()
-
-        # Register a descriptor that depends on an availability_attr, and mock
-        # importlib.import_module to make it appear unavailable.
-        test_desc = VectorFrameworkDescriptor(
-            name="unavailable_framework",
-            adapter_module="fake.module",
-            adapter_class="FakeVectorStore",
-            add_method="add",
-            query_method="query",
-            availability_attr="AVAILABLE",
-        )
-        register_vector_framework_descriptor(test_desc)
-
-        fake_mod = types.SimpleNamespace(AVAILABLE=False)
-
-        def fake_import(name):
-            assert name == "fake.module"
-            return fake_mod
-
-        monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
-
-        available = list(iter_available_vector_framework_descriptors())
-        assert available == []
-    finally:
-        VECTOR_FRAMEWORKS.clear()
-        VECTOR_FRAMEWORKS.update(original_registry)
-        _AVAILABILITY_CACHE.clear()
-        _AVAILABILITY_CACHE.update(original_cache)
+    for desc in all_descs:
+        assert VECTOR_FRAMEWORKS[desc.name] is desc
 
 
 def test_get_descriptor_variants() -> None:
@@ -285,8 +73,8 @@ def test_get_descriptor_variants() -> None:
     existing_name = list(VECTOR_FRAMEWORKS.keys())[0]
 
     # Existing
-    assert get_vector_framework_descriptor(existing_name) is not None
-    assert get_vector_framework_descriptor_safe(existing_name) is not None
+    assert get_vector_framework_descriptor(existing_name) is VECTOR_FRAMEWORKS[existing_name]
+    assert get_vector_framework_descriptor_safe(existing_name) is VECTOR_FRAMEWORKS[existing_name]
 
     # Non-existent
     non_existent = "non_existent_vector_framework_xyz123"
@@ -297,140 +85,494 @@ def test_get_descriptor_variants() -> None:
     assert get_vector_framework_descriptor_safe(non_existent) is None
 
 
-def test_descriptor_immutability() -> None:
+def test_has_vector_framework_basic() -> None:
     """
-    Test that vector descriptors are immutable (frozen dataclass).
+    Sanity check for has_vector_framework.
+
+    Ensures it returns True for all registered keys and False for an unknown key.
+    """
+    for key in VECTOR_FRAMEWORKS.keys():
+        assert has_vector_framework(key)
+
+    assert not has_vector_framework("definitely_not_a_framework_xyz123")
+
+
+# =============================================================================
+# Descriptor validation + immutability
+# =============================================================================
+
+
+def test_registered_descriptors_validate_cleanly(all_descriptors) -> None:
+    """
+    Smoke test: all descriptors currently registered in VECTOR_FRAMEWORKS
+    should validate without raising.
+
+    validate() may emit warnings, but the registered descriptors should be
+    internally consistent as stored.
+    """
+    for descriptor in all_descriptors:
+        descriptor.validate()
+
+
+def test_descriptor_immutability_frozen_dataclass() -> None:
+    """
+    VectorFrameworkDescriptor is a frozen dataclass.
+
+    This guarantees conformance tests can't accidentally mutate registry metadata
+    in-place, which would produce order-dependent flakiness.
     """
     descriptor = VectorFrameworkDescriptor(
         name="test",
         adapter_module="test.module",
-        adapter_class="TestVectorStore",
-        add_method="add",
-        query_method="query",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
     )
 
     with pytest.raises(dataclasses.FrozenInstanceError):
         descriptor.name = "modified"
 
     with pytest.raises(dataclasses.FrozenInstanceError):
-        descriptor.add_method = "modified_add"
+        descriptor.adapter_init_kwarg = "modified_adapter_kwarg"
 
 
-def test_iterator_functions() -> None:
+@pytest.mark.parametrize("bad_kwarg", ["", "   ", "\n"])
+def test_validate_requires_nonempty_adapter_init_kwarg(bad_kwarg: str) -> None:
     """
-    Test that iterator functions return expected results.
+    adapter_init_kwarg must always be a non-empty string.
+
+    Tests rely on this field to inject the underlying Corpus vector adapter
+    without hardcoding a constructor signature.
     """
-    # iter_vector_framework_descriptors
-    all_descs = list(iter_vector_framework_descriptors())
-    assert len(all_descs) == len(VECTOR_FRAMEWORKS)
-
-    for desc in all_descs:
-        assert desc.name in VECTOR_FRAMEWORKS
-
-    # iter_available_vector_framework_descriptors
-    available_descs = list(iter_available_vector_framework_descriptors())
-    assert len(available_descs) <= len(all_descs)
-
-    for desc in available_descs:
-        assert desc.is_available()
+    with pytest.raises(ValueError, match="adapter_init_kwarg must be a non-empty string"):
+        VectorFrameworkDescriptor(
+            name="bad_adapter_kwarg",
+            adapter_module="test.module",
+            adapter_class="TestVectorClient",
+            adapter_init_kwarg=bad_kwarg,
+        )
 
 
-def test_vector_descriptor_validate_edge_cases() -> None:
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "capabilities_method",
+        "query_method",
+        "upsert_method",
+        "delete_method",
+        "health_method",
+        "create_namespace_method",
+        "delete_namespace_method",
+    ],
+)
+def test_validate_requires_core_protocol_method_names(field_name: str) -> None:
     """
-    Unit tests for VectorFrameworkDescriptor.validate edge cases.
-
-    This focuses on descriptor *behavior* (warnings/errors for bad inputs),
-    independent of the concrete registry contents.
+    The wrapper API surface must provide non-empty method names for required protocol
+    operations so conformance tests can dynamically call into those methods.
     """
-    # Missing required methods
-    with pytest.raises(
-        ValueError, match="add_method and query_method must both be set"
-    ):
+    kwargs = dict(
+        name="bad_methods",
+        adapter_module="test.module",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
+    )
+    kwargs[field_name] = ""  # type: ignore[index]
+    with pytest.raises(ValueError, match=f"{field_name} must be a non-empty string"):
+        VectorFrameworkDescriptor(**kwargs)  # type: ignore[arg-type]
+
+
+def test_validate_batch_query_expectation_requires_method_name() -> None:
+    """
+    If has_batch_query=True, batch_query_method must be a non-empty string.
+
+    This is an API-shape expectation (not a runtime capability guarantee).
+    """
+    with pytest.raises(ValueError, match="has_batch_query=True requires batch_query_method to be set"):
         VectorFrameworkDescriptor(
-            name="bad1",
+            name="bad_batch_query",
             adapter_module="test.module",
-            adapter_class="TestVectorStore",
-            add_method="",
-            query_method="query",
+            adapter_class="TestVectorClient",
+            adapter_init_kwarg="adapter",
+            has_batch_query=True,
+            batch_query_method=None,
         )
 
-    with pytest.raises(
-        ValueError, match="add_method and query_method must both be set"
-    ):
+
+# =============================================================================
+# Soft warning checks (API-shape expectations)
+# =============================================================================
+
+
+def test_validate_warns_on_dotted_adapter_class() -> None:
+    """
+    adapter_class should be a bare class name (not dotted).
+
+    We only warn (not fail) to avoid breaking tests if someone passes a dotted path,
+    but the warning helps catch mistakes early.
+    """
+    with pytest.warns(RuntimeWarning, match="adapter_class should be a class name only"):
         VectorFrameworkDescriptor(
-            name="bad2",
+            name="warn_dotted_class",
             adapter_module="test.module",
-            adapter_class="TestVectorStore",
-            add_method="add",
-            query_method="",
+            adapter_class="some.module.TestVectorClient",
+            adapter_init_kwarg="adapter",
         )
 
-    # Dotted adapter_class (should warn but not fail)
-    with pytest.warns(
-        RuntimeWarning, match="adapter_class should be a class name only"
-    ):
+
+@pytest.mark.parametrize(
+    "kwarg_overrides, warning_match",
+    [
+        (
+            {"supports_docstore_injection": True, "docstore_init_kwarg": None},
+            "supports_docstore_injection=True but docstore_init_kwarg is None",
+        ),
+        (
+            {"supports_config_injection": True, "config_init_kwarg": None},
+            "supports_config_injection=True but config_init_kwarg is None",
+        ),
+        (
+            {"supports_mode_switch": True, "mode_init_kwarg": None},
+            "supports_mode_switch=True but mode_init_kwarg is None",
+        ),
+        (
+            {"supports_auto_normalize_toggle": True, "supports_config_injection": False},
+            "supports_auto_normalize_toggle=True but supports_config_injection=False",
+        ),
+    ],
+)
+def test_validate_warns_on_constructor_knob_expectation_mismatches(
+    kwarg_overrides: dict, warning_match: str
+) -> None:
+    """
+    Constructor knob expectations are intentionally warnings, not hard errors.
+
+    These warnings protect the conformance suite from silently losing its ability
+    to configure wrapper clients, while still allowing incremental adapter work.
+    """
+    base = dict(
+        name="warn_knobs",
+        adapter_module="test.module",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
+    )
+    base.update(kwarg_overrides)
+
+    with pytest.warns(RuntimeWarning, match=warning_match):
+        VectorFrameworkDescriptor(**base)  # type: ignore[arg-type]
+
+
+# =============================================================================
+# Versioning behavior
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    "name, minimum, tested_up_to, expected",
+    [
+        ("test1", None, None, None),
+        ("test2", "1.0.0", None, ">=1.0.0"),
+        ("test3", None, "2.5.0", "<=2.5.0"),
+        ("test4", "1.2.0", "3.0.0", ">=1.2.0, <= 3.0.0"),
+    ],
+)
+def test_version_range_formatting(name: str, minimum: Optional[str], tested_up_to: Optional[str], expected: Optional[str]) -> None:
+    """
+    version_range() returns the expected human-readable string.
+
+    This is informational today, but is useful for reporting and future conditional
+    skipping or expectation adjustment.
+    """
+    desc = VectorFrameworkDescriptor(
+        name=name,
+        adapter_module="test.module",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
+        minimum_framework_version=minimum,
+        tested_up_to_version=tested_up_to,
+    )
+    # Accept either spacing style ("<=2.5.0" vs "<= 2.5.0") for consistency
+    # across registries and to avoid brittle formatting-only failures.
+    actual = desc.version_range()
+    if expected is None:
+        assert actual is None
+    else:
+        assert actual is not None
+        assert actual.replace(" ", "") == expected.replace(" ", "")
+
+
+def test_version_ordering_validation_if_packaging_available() -> None:
+    """
+    Version ordering is validated only when packaging.Version is available.
+
+    If available, minimum > tested_up_to should raise ValueError.
+    """
+    if Version is None:
+        pytest.skip("packaging is not installed; Version ordering validation is skipped")
+
+    with pytest.raises(ValueError, match="minimum_framework_version.*is greater than tested_up_to_version"):
         VectorFrameworkDescriptor(
-            name="warn1",
+            name="bad_version_range",
             adapter_module="test.module",
-            adapter_class="some.module.ClassName",
-            add_method="add",
-            query_method="query",
+            adapter_class="TestVectorClient",
+            adapter_init_kwarg="adapter",
+            minimum_framework_version="2.0.0",
+            tested_up_to_version="1.0.0",
         )
 
-    # Async streaming without sync streaming counterpart (should warn)
-    with pytest.warns(
-        RuntimeWarning,
-        match="async_stream_query_method is set but stream_query_method is None",
-    ):
-        VectorFrameworkDescriptor(
-            name="warn2",
-            adapter_module="test.module",
-            adapter_class="TestVectorStore",
-            add_method="add",
-            query_method="query",
-            async_stream_query_method="astream_query",
-        )
 
-    # supports_streaming flag without methods (should warn)
-    with pytest.warns(
-        RuntimeWarning,
-        match="supports_streaming is True but neither stream_query_method nor async_stream_query_method is set",
-    ):
-        VectorFrameworkDescriptor(
-            name="warn3",
-            adapter_module="test.module",
-            adapter_class="TestVectorStore",
-            add_method="add",
-            query_method="query",
-            supports_streaming=True,
-        )
+# =============================================================================
+# Availability checks + caching correctness
+# =============================================================================
 
-    # supports_mmr flag without methods (should warn)
-    with pytest.warns(
-        RuntimeWarning,
-        match="supports_mmr is True but neither mmr_query_method nor async_mmr_query_method is set",
-    ):
-        VectorFrameworkDescriptor(
-            name="warn4",
-            adapter_module="test.module",
-            adapter_class="TestVectorStore",
-            add_method="add",
-            query_method="query",
-            supports_mmr=True,
-        )
 
-    # Version ordering error only if packaging.Version is available
-    if Version is not None:
-        with pytest.raises(
-            ValueError,
-            match="minimum_framework_version '2.0.0' is greater than tested_up_to_version '1.0.0'",
-        ):
-            VectorFrameworkDescriptor(
-                name="bad_version_range",
-                adapter_module="test.module",
-                adapter_class="TestVectorStore",
-                add_method="add",
-                query_method="query",
-                minimum_framework_version="2.0.0",
-                tested_up_to_version="1.0.0",
-            )
+def test_descriptor_is_available_returns_bool_for_all_registered(all_descriptors) -> None:
+    """
+    Ensure is_available() doesn't crash for any registered descriptor.
+
+    This is a smoke test that verifies the availability check doesn't raise
+    unexpected exceptions when called.
+    """
+    for descriptor in all_descriptors:
+        result = descriptor.is_available()
+        assert isinstance(result, bool)
+
+
+def test_is_available_no_availability_attr_defaults_true_and_does_not_import(monkeypatch) -> None:
+    """
+    If availability_attr is not set, availability is assumed True and no import occurs.
+
+    This ensures "always-on" adapters don't accidentally incur import-time side effects.
+    """
+    desc = VectorFrameworkDescriptor(
+        name="no_attr",
+        adapter_module="some.module",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
+        availability_attr=None,
+    )
+
+    def boom_import(_: str):
+        raise AssertionError("import_module should not be called when availability_attr is None")
+
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    monkeypatch.setattr(reg_module.importlib, "import_module", boom_import)
+    assert desc.is_available() is True
+
+
+def test_is_available_import_error_returns_false_when_availability_attr_set(monkeypatch) -> None:
+    """
+    If availability_attr is set but importing the module fails, the framework is unavailable.
+    """
+    desc = VectorFrameworkDescriptor(
+        name="import_error",
+        adapter_module="fake.import_error",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
+        availability_attr="AVAILABLE",
+    )
+
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    def fake_import(_: str):
+        raise ImportError("nope")
+
+    monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+    assert desc.is_available() is False
+
+
+def test_is_available_missing_attr_warns_and_returns_false(monkeypatch) -> None:
+    """
+    If the module imports but the availability_attr is missing, we warn and treat unavailable.
+
+    This prevents silent false positives when adapter modules forget to define the flag.
+    """
+    desc = VectorFrameworkDescriptor(
+        name="missing_attr",
+        adapter_module="fake.missing_attr",
+        adapter_class="TestVectorClient",
+        adapter_init_kwarg="adapter",
+        availability_attr="AVAILABLE",
+    )
+
+    fake_mod = types.SimpleNamespace()  # no AVAILABLE attr present
+
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    def fake_import(_: str):
+        return fake_mod
+
+    monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+
+    with pytest.warns(RuntimeWarning, match="availability_attr.*not found"):
+        assert desc.is_available() is False
+
+
+def test_availability_cache_keyed_by_adapter_module_and_attr_not_name(monkeypatch) -> None:
+    """
+    Availability caching must not be keyed only by name.
+
+    Two descriptors with the same name but different adapter_module / availability_attr
+    must not share cached availability results.
+    """
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    # Ensure a clean cache for this test.
+    _AVAILABILITY_CACHE.clear()
+
+    mod_a = types.SimpleNamespace(AVAILABLE=True)
+    mod_b = types.SimpleNamespace(AVAILABLE=False)
+
+    def fake_import(name: str):
+        if name == "fake.a":
+            return mod_a
+        if name == "fake.b":
+            return mod_b
+        raise AssertionError(f"unexpected import: {name}")
+
+    monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+
+    desc_a = VectorFrameworkDescriptor(
+        name="same_name",
+        adapter_module="fake.a",
+        adapter_class="A",
+        adapter_init_kwarg="adapter",
+        availability_attr="AVAILABLE",
+    )
+    desc_b = VectorFrameworkDescriptor(
+        name="same_name",
+        adapter_module="fake.b",
+        adapter_class="B",
+        adapter_init_kwarg="adapter",
+        availability_attr="AVAILABLE",
+    )
+
+    assert desc_a.is_available() is True
+    assert desc_b.is_available() is False
+
+    # Confirm distinct cache entries exist.
+    assert _availability_cache_key("fake.a", "AVAILABLE") in _AVAILABILITY_CACHE
+    assert _availability_cache_key("fake.b", "AVAILABLE") in _AVAILABILITY_CACHE
+
+
+def test_register_overwrite_and_unregister_invalidate_availability_cache(monkeypatch) -> None:
+    """
+    Dynamic overwrite must not leak stale cached availability results.
+
+    This test validates:
+      - register caches availability
+      - overwrite replaces descriptor and future availability reflects the new identity
+      - unregister clears the cache entry for the removed descriptor
+    """
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    original_registry = dict(VECTOR_FRAMEWORKS)
+    original_cache = dict(_AVAILABILITY_CACHE)
+
+    try:
+        VECTOR_FRAMEWORKS.clear()
+        _AVAILABILITY_CACHE.clear()
+
+        mod_true = types.SimpleNamespace(AVAILABLE=True)
+        mod_false = types.SimpleNamespace(AVAILABLE=False)
+
+        def fake_import(name: str):
+            if name == "fake.true":
+                return mod_true
+            if name == "fake.false":
+                return mod_false
+            raise AssertionError(f"unexpected import: {name}")
+
+        monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+
+        # Register A -> available True (cached).
+        desc_a = VectorFrameworkDescriptor(
+            name="test_framework",
+            adapter_module="fake.true",
+            adapter_class="ClientA",
+            adapter_init_kwarg="adapter",
+            availability_attr="AVAILABLE",
+        )
+        register_vector_framework_descriptor(desc_a)
+        assert VECTOR_FRAMEWORKS["test_framework"] is desc_a
+        assert desc_a.is_available() is True
+        assert _availability_cache_key("fake.true", "AVAILABLE") in _AVAILABILITY_CACHE
+
+        # Overwrite with B -> available False (must not reuse A's cache).
+        desc_b = VectorFrameworkDescriptor(
+            name="test_framework",
+            adapter_module="fake.false",
+            adapter_class="ClientB",
+            adapter_init_kwarg="adapter",
+            availability_attr="AVAILABLE",
+        )
+        with pytest.warns(RuntimeWarning, match="being overwritten"):
+            register_vector_framework_descriptor(desc_b, overwrite=True)
+        assert VECTOR_FRAMEWORKS["test_framework"] is desc_b
+        assert desc_b.is_available() is False
+        assert _availability_cache_key("fake.false", "AVAILABLE") in _AVAILABILITY_CACHE
+
+        # Unregister -> descriptor removed + cache key for the removed descriptor cleared.
+        unregister_vector_framework_descriptor("test_framework")
+        assert "test_framework" not in VECTOR_FRAMEWORKS
+        assert _availability_cache_key("fake.false", "AVAILABLE") not in _AVAILABILITY_CACHE
+
+    finally:
+        VECTOR_FRAMEWORKS.clear()
+        VECTOR_FRAMEWORKS.update(original_registry)
+        _AVAILABILITY_CACHE.clear()
+        _AVAILABILITY_CACHE.update(original_cache)
+
+
+def test_iter_available_vector_framework_descriptors_filters_unavailable(monkeypatch) -> None:
+    """
+    iter_available_vector_framework_descriptors should yield only descriptors whose
+    is_available() returns True.
+
+    We patch importlib.import_module to control availability_attr evaluation.
+    """
+    from tests.frameworks.registries import vector_registry as reg_module
+
+    original_registry = dict(VECTOR_FRAMEWORKS)
+    original_cache = dict(_AVAILABILITY_CACHE)
+
+    try:
+        VECTOR_FRAMEWORKS.clear()
+        _AVAILABILITY_CACHE.clear()
+
+        desc_true = VectorFrameworkDescriptor(
+            name="available_framework",
+            adapter_module="fake.true",
+            adapter_class="ClientTrue",
+            adapter_init_kwarg="adapter",
+            availability_attr="AVAILABLE",
+        )
+        desc_false = VectorFrameworkDescriptor(
+            name="unavailable_framework",
+            adapter_module="fake.false",
+            adapter_class="ClientFalse",
+            adapter_init_kwarg="adapter",
+            availability_attr="AVAILABLE",
+        )
+        register_vector_framework_descriptor(desc_true)
+        register_vector_framework_descriptor(desc_false)
+
+        mod_true = types.SimpleNamespace(AVAILABLE=True)
+        mod_false = types.SimpleNamespace(AVAILABLE=False)
+
+        def fake_import(name: str):
+            if name == "fake.true":
+                return mod_true
+            if name == "fake.false":
+                return mod_false
+            raise AssertionError(f"unexpected import: {name}")
+
+        monkeypatch.setattr(reg_module.importlib, "import_module", fake_import)
+
+        available = list(iter_available_vector_framework_descriptors())
+        assert available == [desc_true]
+
+    finally:
+        VECTOR_FRAMEWORKS.clear()
+        VECTOR_FRAMEWORKS.update(original_registry)
+        _AVAILABILITY_CACHE.clear()
+        _AVAILABILITY_CACHE.update(original_cache)
