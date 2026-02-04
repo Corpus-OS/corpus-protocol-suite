@@ -92,6 +92,7 @@ Typical usage
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import math
 import uuid
@@ -119,7 +120,6 @@ from corpus_sdk.vector.vector_base import (
     Vector,
     VectorMatch,
     QueryResult,
-    QueryChunk,
     UpsertResult,
     DeleteResult,
     OperationContext,
@@ -144,12 +144,18 @@ from corpus_sdk.vector.framework_adapters.common.framework_utils import (
 )
 from corpus_sdk.core.error_context import attach_context
 
+# Framework availability for conformance registry checks.
+# We consider Semantic Kernel available if the `semantic_kernel` package can be imported.
+# Specific APIs (decorators/exceptions) may drift across versions; this module has fallbacks.
+SEMANTIC_KERNEL_AVAILABLE = importlib.util.find_spec("semantic_kernel") is not None
+
 # Semantic Kernel imports are optional; if SK is not installed, we fall back
 # to a no-op decorator so the rest of the SDK remains usable.
 try:  # pragma: no cover - import guard
     from semantic_kernel.functions import kernel_function
     from semantic_kernel.exceptions import KernelFunctionException
 except Exception:  # pragma: no cover - SK not installed
+
 
     def kernel_function(func: Any = None, **_: Any):  # type: ignore[override]
         """
@@ -177,6 +183,46 @@ logger = logging.getLogger(__name__)
 
 Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# Conformance / protocol client wrapper
+# --------------------------------------------------------------------------- #
+
+
+class CorpusSemanticKernelVectorClient:
+    """VectorProtocolV1-shaped wrapper used by the conformance test suite."""
+
+    def __init__(self, *, adapter: VectorProtocolV1) -> None:
+        self._translator = VectorTranslator(
+            adapter=adapter,
+            framework="semantic_kernel",
+            translator=DefaultVectorFrameworkTranslator(),
+        )
+
+    def capabilities(self, *, context: Optional[Any] = None) -> Any:
+        return self._translator.capabilities(framework_ctx=context)
+
+    def health(self, *, context: Optional[Any] = None) -> Any:
+        return self._translator.health(framework_ctx=context)
+
+    def query(self, raw_query: Any, *, context: Optional[Any] = None) -> Any:
+        return self._translator.query(raw_query, framework_ctx=context)
+
+    def batch_query(self, raw_queries: Any, *, context: Optional[Any] = None) -> Any:
+        return self._translator.batch_query(raw_queries, framework_ctx=context)
+
+    def upsert(self, raw_documents: Any, *, context: Optional[Any] = None) -> Any:
+        return self._translator.upsert(raw_documents, framework_ctx=context)
+
+    def delete(self, raw_filter_or_ids: Any, *, context: Optional[Any] = None) -> Any:
+        return self._translator.delete(raw_filter_or_ids, framework_ctx=context)
+
+    def create_namespace(self, name: str, *, context: Optional[Any] = None) -> Any:
+        return self._translator.create_namespace(name, framework_ctx=context)
+
+    def delete_namespace(self, name: str, *, context: Optional[Any] = None) -> Any:
+        return self._translator.delete_namespace(name, framework_ctx=context)
 
 
 # --------------------------------------------------------------------------- #
@@ -1539,7 +1585,10 @@ class CorpusSemanticKernelVectorStore:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             ):
-                if not isinstance(chunk, QueryChunk):
+                raw_matches_obj = getattr(chunk, "matches", None)
+                if raw_matches_obj is None and isinstance(chunk, Mapping):
+                    raw_matches_obj = chunk.get("matches")
+                if raw_matches_obj is None:
                     err = VectorAdapterError(
                         f"VectorTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
                         code="BAD_STREAM_CHUNK",
@@ -1553,7 +1602,7 @@ class CorpusSemanticKernelVectorStore:
                     )
                     raise err
 
-                raw_matches = list(chunk.matches or [])
+                raw_matches = list(raw_matches_obj or [])
                 filtered_matches = self._apply_score_threshold(raw_matches)
 
                 for match in filtered_matches:
