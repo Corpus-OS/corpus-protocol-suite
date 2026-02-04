@@ -1162,10 +1162,12 @@ class LLMTranslator:
         ctx = _ensure_llm_operation_context(op_ctx)
 
         async def _async_gen() -> AsyncIterator[R]:
+            inner: Optional[AsyncIterator[R]] = None
             try:
                 # FIX: Calling factory(ctx) returns the async generator immediately.
                 # Do NOT await factory(ctx).
-                async for chunk in factory(ctx):
+                inner = factory(ctx)
+                async for chunk in inner:
                     yield chunk
             except Exception as exc:
                 attach_context(
@@ -1177,6 +1179,18 @@ class LLMTranslator:
                     tenant=ctx.tenant,
                 )
                 raise
+            finally:
+                # Best-effort cleanup: if a consumer cancels early (breaks out of the
+                # stream and closes the outer generator), ensure we close the inner
+                # iterator so adapter streams can run their own cleanup.
+                if inner is not None:
+                    aclose = getattr(inner, "aclose", None)
+                    if callable(aclose):
+                        try:
+                            await aclose()
+                        except Exception:
+                            # Stream may already be closed; ignore cleanup errors.
+                            pass
 
         if sync:
             return SyncStreamBridge(
@@ -1221,11 +1235,27 @@ class LLMTranslator:
                 tool_choice=tool_choice_corpus,
                 ctx=ctx,
             )
-            
-            async for chunk in agen:
-                if not isinstance(chunk, LLMChunk):
-                     raise BadRequest(f"adapter.stream yielded invalid type: {type(chunk)}", code="BAD_ADAPTER_RESULT")
-                yield self._translator.from_chunk(chunk, op_ctx=ctx, framework_ctx=kwargs.get('framework_ctx'))
+
+            try:
+                async for chunk in agen:
+                    if not isinstance(chunk, LLMChunk):
+                        raise BadRequest(
+                            f"adapter.stream yielded invalid type: {type(chunk)}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
+                    yield self._translator.from_chunk(
+                        chunk,
+                        op_ctx=ctx,
+                        framework_ctx=kwargs.get('framework_ctx'),
+                    )
+            finally:
+                aclose = getattr(agen, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except Exception:
+                        # Best-effort cleanup; the stream may already be closed.
+                        pass
         
         return _factory
 
