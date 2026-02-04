@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import os
 from typing import Any, Callable, Optional
 
 import pytest
@@ -28,14 +29,25 @@ RICH_CONTEXT = {
 
 # In these tests, we only care that calls succeed/fail in the expected way.
 # We intentionally keep payloads simple and framework-agnostic.
-QUERY_INPUT = {"vector": [0.1, 0.2, 0.3], "top_k": 3}
-UPSERT_INPUT = {"id": "doc-1", "vector": [0.1, 0.2, 0.3], "metadata": {"k": "v"}}
+QUERY_INPUT = {"vector": [0.1, 0.2], "top_k": 3}
+UPSERT_INPUT = {"id": "doc-1", "vector": [0.1, 0.2], "metadata": {"k": "v"}}
 DELETE_INPUT = "doc-1"
 
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _seed_default_namespace_for_mock_adapter() -> None:
+    """Ensure the mock vector adapter has a usable default namespace.
+
+    The contract tests in this module are about context handling and centralized
+    error-context attachment; they should not fail due to an intentionally
+    unseeded in-memory mock namespace.
+    """
+    os.environ.setdefault("VECTOR_SEED_DEFAULT", "1")
 
 
 @pytest.fixture(
