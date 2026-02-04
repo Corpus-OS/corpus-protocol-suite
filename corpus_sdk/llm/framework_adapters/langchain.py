@@ -38,6 +38,18 @@ Design goals
 5. Context + observability:
    - `OperationContext` built from LangChain config via `ContextTranslator`
    - Rich error context attached via core `attach_context`
+
+IMPORTANT IMPLEMENTATION NOTE
+-----------------------------
+This adapter **never calls the underlying llm_adapter directly** for any
+operation that has an equivalent `LLMTranslator` API. This includes health
+and capabilities.
+
+Concretely:
+- `CorpusLangChainLLM.health()/ahealth()` call `self._translator.health()/ahealth()`
+- `CorpusLangChainLLM.capabilities()/acapabilities()` call `self._translator.capabilities()/acapabilities()`
+
+This keeps framework adapters consistent across LangChain/LlamaIndex/SK/etc.
 """
 
 from __future__ import annotations
@@ -113,7 +125,11 @@ except ImportError:  # pragma: no cover - environments without LangChain
         pass
 
     class ChatGeneration:  # type: ignore[no-redef]
-        def __init__(self, message: AIMessage, generation_info: Optional[Dict[str, Any]] = None) -> None:
+        def __init__(
+            self,
+            message: AIMessage,
+            generation_info: Optional[Dict[str, Any]] = None,
+        ) -> None:
             self.message = message
             self.generation_info = generation_info or {}
 
@@ -200,6 +216,7 @@ SYNC_WRAPPER_CALLED_IN_EVENT_LOOP = "LANGCHAIN_LLM_SYNC_WRAPPER_CALLED_IN_EVENT_
 # Event-loop safety helper
 # ---------------------------------------------------------------------------
 
+
 def _ensure_not_in_event_loop(sync_api_name: str) -> None:
     """
     Prevent use of sync LangChain APIs from inside an active asyncio event loop.
@@ -222,9 +239,11 @@ def _ensure_not_in_event_loop(sync_api_name: str) -> None:
         f"[{SYNC_WRAPPER_CALLED_IN_EVENT_LOOP}]"
     )
 
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class LangChainLLMConfig:
@@ -260,9 +279,11 @@ class LangChainLLMConfig:
                 f"max_tokens must be positive, got {self.max_tokens}"
             )
 
+
 # ---------------------------------------------------------------------------
 # Error context helpers (lazy, decorator-based, aligned)
 # ---------------------------------------------------------------------------
+
 
 def _extract_dynamic_context(
     instance: Any,
@@ -321,6 +342,7 @@ def _extract_dynamic_context(
 
     return dynamic_ctx
 
+
 def _create_error_context_decorator(
     operation: str,
     is_async: bool = False,
@@ -332,9 +354,7 @@ def _create_error_context_decorator(
     attach them via `attach_context` with a consistent LLM-oriented operation.
     """
 
-    def decorator_factory(
-        **static_context: Any,
-    ) -> Callable[[Callable[..., T]], Callable[..., T]]:
+    def decorator_factory(**static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
 
@@ -343,21 +363,13 @@ def _create_error_context_decorator(
                     try:
                         result = func(self, *args, **kwargs)
                         # If the function returns an async iterator (async generator),
-                        # do not await it.
+                        # do not await it. This preserves "true streaming" semantics.
                         if hasattr(result, "__aiter__"):
                             return result
                         return await result
                     except Exception as exc:  # noqa: BLE001
-                        dynamic_ctx = _extract_dynamic_context(
-                            self,
-                            args,
-                            kwargs,
-                            operation,
-                        )
-                        full_ctx = {
-                            **static_context,
-                            **dynamic_ctx,
-                        }
+                        dynamic_ctx = _extract_dynamic_context(self, args, kwargs, operation)
+                        full_ctx = {**static_context, **dynamic_ctx}
                         full_ctx.pop("operation", None)
                         attach_context(
                             exc,
@@ -375,16 +387,8 @@ def _create_error_context_decorator(
                     try:
                         return func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
-                        dynamic_ctx = _extract_dynamic_context(
-                            self,
-                            args,
-                            kwargs,
-                            operation,
-                        )
-                        full_ctx = {
-                            **static_context,
-                            **dynamic_ctx,
-                        }
+                        dynamic_ctx = _extract_dynamic_context(self, args, kwargs, operation)
+                        full_ctx = {**static_context, **dynamic_ctx}
                         full_ctx.pop("operation", None)
                         attach_context(
                             exc,
@@ -400,23 +404,21 @@ def _create_error_context_decorator(
 
     return decorator_factory
 
-def with_llm_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+
+def with_llm_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for sync LLM methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=False)(**static_context)
 
-def with_async_llm_error_context(
-    operation: str,
-    **static_context: Any,
-) -> Callable[[Callable[..., T]], Callable[..., T]]:
+
+def with_async_llm_error_context(operation: str, **static_context: Any) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async LLM methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
 
 # ---------------------------------------------------------------------------
 # Context construction helper (defensive, ContextTranslator-based)
 # ---------------------------------------------------------------------------
+
 
 def _build_operation_context_from_config(
     config: Any,
@@ -460,9 +462,11 @@ def _build_operation_context_from_config(
         )
         raise
 
+
 # ---------------------------------------------------------------------------
 # Structural protocol for type-checking (unchanged externally)
 # ---------------------------------------------------------------------------
+
 
 class LangChainLLMProtocol(Protocol):
     """
@@ -505,9 +509,11 @@ class LangChainLLMProtocol(Protocol):
     ) -> Iterator[ChatGenerationChunk]:
         ...
 
+
 # ---------------------------------------------------------------------------
 # Main adapter
 # ---------------------------------------------------------------------------
+
 
 class CorpusLangChainLLM(BaseChatModel):
     """
@@ -522,7 +528,7 @@ class CorpusLangChainLLM(BaseChatModel):
         * Builds sampling params + lightweight `framework_ctx`
         * Wires LangChain callbacks
         * Uses translator for generation, streaming, and token counting
-        * Exposes health / capabilities via the translator
+        * Exposes health / capabilities via the translator (never the adapter)
     """
 
     # Pydantic v2-style config
@@ -570,9 +576,7 @@ class CorpusLangChainLLM(BaseChatModel):
         if config is not None:
             effective_config = config
             effective_framework_version = config.framework_version or framework_version
-            effective_post_processing = (
-                post_processing_config or config.post_processing_config
-            )
+            effective_post_processing = post_processing_config or config.post_processing_config
             effective_safety_filter = safety_filter or config.safety_filter
             effective_json_repair = json_repair or config.json_repair
         else:
@@ -607,6 +611,8 @@ class CorpusLangChainLLM(BaseChatModel):
         object.__setattr__(self, "_framework_version", effective_framework_version)
 
         # Build the shared LLMTranslator for the "langchain" framework.
+        # This is the only pathway through which the framework adapter interacts
+        # with the underlying protocol adapter (including health/capabilities).
         self._translator = create_llm_translator(
             adapter=llm_adapter,
             framework=_FRAMEWORK_NAME,
@@ -637,6 +643,13 @@ class CorpusLangChainLLM(BaseChatModel):
 
         Configuration values (temperature, max_tokens) have already been
         validated by LangChainLLMConfig.
+
+        NOTE:
+        While this LangChain adapter *does not call the llm_adapter directly*
+        (it always uses the LLMTranslator), the translator itself will call
+        `health()` / `capabilities()` on the underlying protocol adapter.
+        Requiring these methods here ensures conformance and prevents late,
+        hard-to-debug runtime failures.
         """
         required_methods = (
             "complete",
@@ -645,11 +658,7 @@ class CorpusLangChainLLM(BaseChatModel):
             "health",
             "capabilities",
         )
-        missing = [
-            m
-            for m in required_methods
-            if not callable(getattr(llm_adapter, m, None))
-        ]
+        missing = [m for m in required_methods if not callable(getattr(llm_adapter, m, None))]
         if missing:
             raise TypeError(
                 f"{INIT_CONFIG_ERROR}: "
@@ -713,10 +722,7 @@ class CorpusLangChainLLM(BaseChatModel):
 
         return normalized
 
-    def _to_translator_messages(
-        self,
-        messages: Sequence[BaseMessage],
-    ) -> List[Dict[str, Any]]:
+    def _to_translator_messages(self, messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
         """Convert LangChain messages into generic dicts for the shared translator."""
         role_map = {
             "human": "user",
@@ -727,10 +733,7 @@ class CorpusLangChainLLM(BaseChatModel):
         for msg in messages:
             msg_type = getattr(msg, "type", "user")
             role = role_map.get(str(msg_type).lower(), str(msg_type))
-            out.append({
-                "role": role,
-                "content": getattr(msg, "content", ""),
-            })
+            out.append({"role": role, "content": getattr(msg, "content", "")})
         return out
 
     def _validate_messages(self, messages: Sequence[BaseMessage]) -> None:
@@ -820,6 +823,7 @@ class CorpusLangChainLLM(BaseChatModel):
             "stop_sequences": stop,
         }
 
+        # Remove None values to keep invocation_params clean (and reduce noise in logs/metrics).
         clean_params = {k: v for k, v in params.items() if v is not None}
 
         model_for_context = str(clean_params.get("model", self.model))
@@ -895,8 +899,7 @@ class CorpusLangChainLLM(BaseChatModel):
         if not isinstance(result, Mapping):
             raise TypeError(
                 f"{INIT_CONFIG_ERROR}: "
-                f"translator capabilities() returned unsupported type: "
-                f"{type(result).__name__}"
+                f"translator capabilities() returned unsupported type: {type(result).__name__}"
             )
         return result
 
@@ -913,13 +916,13 @@ class CorpusLangChainLLM(BaseChatModel):
         if callable(async_caps):
             result = await async_caps()
         else:
+            # Offload sync translator call if the translator lacks an async variant.
             result = await asyncio.to_thread(self._translator.capabilities)
 
         if not isinstance(result, Mapping):
             raise TypeError(
                 f"{INIT_CONFIG_ERROR}: "
-                f"translator capabilities() returned unsupported type: "
-                f"{type(result).__name__}"
+                f"translator capabilities() returned unsupported type: {type(result).__name__}"
             )
         return result
 
@@ -936,8 +939,7 @@ class CorpusLangChainLLM(BaseChatModel):
         if not isinstance(result, Mapping):
             raise TypeError(
                 f"{INIT_CONFIG_ERROR}: "
-                f"translator health() returned unsupported type: "
-                f"{type(result).__name__}"
+                f"translator health() returned unsupported type: {type(result).__name__}"
             )
         return result
 
@@ -954,13 +956,13 @@ class CorpusLangChainLLM(BaseChatModel):
         if callable(async_health):
             result = await async_health()
         else:
+            # Offload sync translator call if the translator lacks an async variant.
             result = await asyncio.to_thread(self._translator.health)
 
         if not isinstance(result, Mapping):
             raise TypeError(
                 f"{INIT_CONFIG_ERROR}: "
-                f"translator health() returned unsupported type: "
-                f"{type(result).__name__}"
+                f"translator health() returned unsupported type: {type(result).__name__}"
             )
         return result
 
@@ -1087,10 +1089,8 @@ class CorpusLangChainLLM(BaseChatModel):
                     try:
                         await run_manager.on_llm_new_token(text, chunk=gen_chunk)
                     except Exception as callback_error:  # noqa: BLE001
-                        logger.warning(
-                            "LLM new token callback failed: %s",
-                            callback_error,
-                        )
+                        # Callback failures should not crash the stream; mark canceled and unwind.
+                        logger.warning("LLM new token callback failed: %s", callback_error)
                         stream_canceled = True
                         break
 
@@ -1111,14 +1111,13 @@ class CorpusLangChainLLM(BaseChatModel):
                 await run_manager.on_llm_error(exc)
             raise
         finally:
+            # Ensure async generator cleanup when supported. This improves resource hygiene
+            # without changing streaming semantics.
             if agen is not None and hasattr(agen, "aclose"):
                 try:
                     await agen.aclose()  # type: ignore[func-returns-value]
                 except Exception as cleanup_error:  # noqa: BLE001
-                    logger.warning(
-                        "Async stream cleanup failed in LangChain adapter: %s",
-                        cleanup_error,
-                    )
+                    logger.warning("Async stream cleanup failed in LangChain adapter: %s", cleanup_error)
 
             if run_manager is not None and not stream_canceled:
                 completion_result = ChatResult(
@@ -1269,10 +1268,7 @@ class CorpusLangChainLLM(BaseChatModel):
                     try:
                         run_manager.on_llm_new_token(text, chunk=gen_chunk)
                     except Exception as callback_error:  # noqa: BLE001
-                        logger.warning(
-                            "LLM new token callback failed: %s",
-                            callback_error,
-                        )
+                        logger.warning("LLM new token callback failed: %s", callback_error)
                         stream_canceled = True
                         break
 
@@ -1335,6 +1331,11 @@ class CorpusLangChainLLM(BaseChatModel):
 
         Fallback:
             Character-based heuristic estimation.
+
+        NOTE:
+            For protocol conformance, token-count failures must surface as
+            errors (and be wrapped by the error-context decorator), rather
+            than being silently swallowed by heuristics.
         """
         if not messages:
             return 0
@@ -1355,9 +1356,9 @@ class CorpusLangChainLLM(BaseChatModel):
             "model": self.model,
         }
 
-        # NOTE: For protocol conformance, token-count failures must surface
-        # as errors (and be wrapped by the error-context decorator), rather
-        # than being silently swallowed by heuristics.
+        # IMPORTANT:
+        # The translator method name is `count_tokens_for_messages` (sync),
+        # not `count_tokens_for_messages_for_messages` or other variants.
         result = self._translator.count_tokens_for_messages(
             raw_messages=raw_messages,
             model=self.model,
@@ -1373,9 +1374,7 @@ class CorpusLangChainLLM(BaseChatModel):
                 if isinstance(value, int):
                     return value
 
-        raise TypeError(
-            f"Unexpected token count result type: {type(result).__name__}"
-        )
+        raise TypeError(f"Unexpected token count result type: {type(result).__name__}")
 
     async def aget_num_tokens_from_messages(
         self,
@@ -1404,6 +1403,7 @@ class CorpusLangChainLLM(BaseChatModel):
         """
         return self.get_num_tokens_from_messages([HumanMessage(content=text)])
 
+
 __all__ = [
     "LangChainLLMProtocol",
     "LangChainLLMConfig",
@@ -1414,5 +1414,5 @@ __all__ = [
     "LANGCHAIN_AVAILABLE",
     "LANGCHAIN_LLM_AVAILABLE",
     "INIT_CONFIG_ERROR",
-    "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP"
+    "SYNC_WRAPPER_CALLED_IN_EVENT_LOOP",
 ]
