@@ -227,49 +227,63 @@ def _usage_to_dict(usage: Any) -> Dict[str, Optional[int]]:
     """
     Normalize usage objects into a simple dict.
 
-    Uses shared `coerce_token_usage` from framework_utils for consistency
-    across framework adapters, with a simple fallback for direct attribute access.
+    Primary path:
+    - Use shared `coerce_token_usage` from framework_utils for consistency
+      across framework adapters.
+
+    Fallback:
+    - Objects with .prompt_tokens / .completion_tokens / .total_tokens
+    - Mappings with those keys
     """
     if usage is None:
         return {}
 
-    # Primary path: shared coercion utility
+    # Preferred: shared coercion utility (aligned with other adapters)
     try:
-        # Wrap usage in expected format for coerce_token_usage
-        payload = {"usage": usage} if isinstance(usage, Mapping) else usage
-        
+        # `coerce_token_usage` expects either a result with `.usage` or a
+        # mapping containing a `usage` field; wrap if needed.
+        payload: Any
+        if isinstance(usage, Mapping):
+            payload = {"usage": usage}
+        else:
+            payload = usage
+
         token_usage = coerce_token_usage(
             payload,
             framework="llamaindex",
             error_codes=ERROR_CODES,
             logger=logger,
         )
-        return {
-            k: v for k, v in {
-                "prompt_tokens": token_usage.prompt_tokens,
-                "completion_tokens": token_usage.completion_tokens,
-                "total_tokens": token_usage.total_tokens,
-            }.items() if v is not None
+        result = {
+            "prompt_tokens": token_usage.prompt_tokens,
+            "completion_tokens": token_usage.completion_tokens,
+            "total_tokens": token_usage.total_tokens,
         }
-    except Exception:  # noqa: BLE001
-        # Fallback: direct attribute/mapping access
-        if isinstance(usage, Mapping):
-            return {
-                k: int(v) for k, v in {
-                    "prompt_tokens": usage.get("prompt_tokens"),
-                    "completion_tokens": usage.get("completion_tokens"),
-                    "total_tokens": usage.get("total_tokens"),
-                }.items() if isinstance(v, int)
-            }
-        
-        # Object with attributes
-        return {
-            k: int(v) for k, v in {
-                "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                "completion_tokens": getattr(usage, "completion_tokens", None),
-                "total_tokens": getattr(usage, "total_tokens", None),
-            }.items() if isinstance(v, int)
-        }
+        # Strip Nones just in case
+        return {k: v for k, v in result.items() if v is not None}
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "LlamaIndex: failed to coerce token usage via framework_utils: %s",
+            exc,
+        )
+
+    # Fallback: manual mapping/attribute extraction
+    if isinstance(usage, Mapping):
+        prompt_tokens = usage.get("prompt_tokens")
+        completion_tokens = usage.get("completion_tokens")
+        total_tokens = usage.get("total_tokens")
+    else:
+        prompt_tokens = getattr(usage, "prompt_tokens", None)
+        completion_tokens = getattr(usage, "completion_tokens", None)
+        total_tokens = getattr(usage, "total_tokens", None)
+
+    result_fallback: Dict[str, Optional[int]] = {
+        "prompt_tokens": int(prompt_tokens) if isinstance(prompt_tokens, int) else None,
+        "completion_tokens": int(completion_tokens) if isinstance(completion_tokens, int) else None,
+        "total_tokens": int(total_tokens) if isinstance(total_tokens, int) else None,
+    }
+    # Strip all-None payloads
+    return {k: v for k, v in result_fallback.items() if v is not None}
 
 
 def _build_chat_response(
@@ -540,7 +554,7 @@ class CorpusLlamaIndexLLM(LLM):
     - All LLM calls go through `LLMTranslator` (no direct message_translation
       or protocol calls in this file).
     - Message normalization, system message handling, tools, safety, and
-      post-processing are handled centrally by the translator.
+    post-processing are handled centrally by the translator.
     - This file focuses on:
         * LlamaIndex-specific context building
         * Error-context attachment
@@ -603,36 +617,6 @@ class CorpusLlamaIndexLLM(LLM):
             self.temperature,
             self.max_tokens or "default",
         )
-
-    # ------------------------------------------------------------------ #
-    # Resource management (context managers) – aligned with other adapters
-    # ------------------------------------------------------------------ #
-
-    def __enter__(self) -> "CorpusLlamaIndexLLM":
-        """Support sync context manager protocol for resource cleanup."""
-        return self
-
-    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting sync context."""
-        close = getattr(self.llm_adapter, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
-
-    async def __aenter__(self) -> "CorpusLlamaIndexLLM":
-        """Support async context manager protocol."""
-        return self
-
-    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
-        """Clean up resources when exiting async context."""
-        aclose = getattr(self.llm_adapter, "aclose", None)
-        if callable(aclose):
-            try:
-                await aclose()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Error while async-closing LLM adapter in __aexit__: %s", exc)
 
     # ------------------------------------------------------------------ #
     # LlamaIndex-required metadata
@@ -1318,7 +1302,7 @@ class CorpusLlamaIndexLLM(LLM):
                 if isinstance(value, int):
                     return value
         raise TypeError(
-            f"{ERROR_CODES.BAD_USAGE_RESULT}: count_tokens returned unsupported type "
+            f"{ERROR_CODES.invalid_result}: count_tokens returned unsupported type "
             f"{type(tokens_any).__name__}"
         )
 
@@ -1329,6 +1313,44 @@ class CorpusLlamaIndexLLM(LLM):
     ) -> int:
         """Async token counting wrapper for conformance parity."""
         return self.count_tokens(messages, **kwargs)
+
+    def _combine_messages_for_counting(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> str:
+        """Combine messages into a single string for token counting."""
+        parts: List[str] = []
+        for msg in messages:
+            role = getattr(msg, "type", getattr(msg, "role", "user"))
+            content = str(getattr(msg, "content", ""))
+            parts.append(f"{role}: {content}")
+        return "\n".join(parts)
+
+    def _estimate_tokens_from_messages(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> int:
+        """Improved token estimation with better heuristics."""
+        combined_text = self._combine_messages_for_counting(messages)
+
+        if not combined_text:
+            return 0
+
+        char_count = len(combined_text)
+        message_count = len(messages)
+
+        char_based = max(1, char_count // 4)
+        message_based = max(1, message_count)
+
+        return max(char_based, message_based)
+
+    def _simple_token_estimate(
+        self,
+        messages: Sequence[ChatMessage],
+    ) -> int:
+        """Simple fallback token estimation."""
+        combined_text = self._combine_messages_for_counting(messages)
+        return max(1, len(combined_text) // 4)
 
     # ------------------------------------------------------------------ #
     # Health / capabilities via translator only (no adapter fallback)
@@ -1500,7 +1522,7 @@ class CorpusLlamaIndexLLM(LLM):
                         model=self.model,
                         error_codes=ERROR_CODES,
                         source="translator_sync_thread",
-                )
+                    )
                 raise
 
         raise AttributeError(
