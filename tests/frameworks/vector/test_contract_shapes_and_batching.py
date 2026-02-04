@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import uuid
 from dataclasses import dataclass
-from typing import Any, Callable, Iterable, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import pytest
 
@@ -30,12 +31,73 @@ UPSERT_MULTI_IDS = [f"vec-id-{i}" for i in range(5)]
 DELETE_SINGLE_IDS = ["vec-del-single"]
 DELETE_MULTI_IDS = [f"vec-del-{i}" for i in range(5)]
 
-QUERY_TEXT_1 = "vec-query-type-test"
-QUERY_TEXT_2 = "vec-query-type-test-again"
-BATCH_QUERY_TEXTS_1 = ["vec-bq-0", "vec-bq-1", "vec-bq-2"]
-BATCH_QUERY_TEXTS_2 = ["vec-bq-3", "vec-bq-4", "vec-bq-5"]
+# Keep dimensionality intentionally small: fast, deterministic, and valid.
+TEST_DIMENSIONS = 3
 
-TEST_NAMESPACE = "test-namespace-contract"
+# Query inputs must be protocol-valid across all wrappers: either a vector (list[float])
+# or a QuerySpec-like mapping. Strings are intentionally NOT supported by the SDK.
+QUERY_1 = [0.1, 0.2, 0.3]
+QUERY_2 = [0.2, 0.3, 0.4]
+
+# Batch query inputs: list of query objects (same shape as query()).
+BATCH_QUERIES_1 = [[0.1, 0.2, 0.3], [0.3, 0.2, 0.1], [0.4, 0.4, 0.4]]
+BATCH_QUERIES_2 = [[0.2, 0.3, 0.4], [0.5, 0.5, 0.5], [0.9, 0.1, 0.2]]
+
+
+def _base_framework_context(namespace: str) -> dict[str, Any]:
+    """
+    Base framework context used by all wrappers.
+
+    IMPORTANT:
+    - Provide both "namespace" and "collection" so DefaultVectorFrameworkTranslator.preferred_namespace
+      works regardless of which alias wrappers prefer.
+    - Include dimensions for create_namespace (strict requirement in the SDK).
+    - Keep distance_metric stable and widely-supported.
+    """
+    return {
+        "namespace": namespace,
+        "collection": namespace,
+        "dimensions": TEST_DIMENSIONS,
+        "distance_metric": "cosine",
+    }
+
+
+def _vector_for_id(idx: int) -> list[float]:
+    """
+    Deterministic vectors with correct dimensionality.
+    """
+    base = float(idx + 1)
+    return [base / 10.0, (base + 1.0) / 10.0, (base + 2.0) / 10.0]
+
+
+def _make_documents(
+    *,
+    namespace: str,
+    ids: Sequence[str],
+    texts: Sequence[str],
+    metadatas: Sequence[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Create protocol-compatible document mappings for upsert.
+
+    IMPORTANT:
+    - We intentionally do NOT include "text" here.
+      Some adapters correctly advertise that text storage is unsupported and will raise
+      NotSupported if text is set. Bulk tests must remain compatible with vector+metadata-only adapters.
+    - We include namespace per-document to avoid accidental default-namespace usage when wrappers
+      prefer per-item namespace semantics.
+    """
+    out: list[dict[str, Any]] = []
+    for idx, (doc_id, _text, metadata) in enumerate(zip(ids, texts, metadatas)):
+        out.append(
+            {
+                "id": doc_id,
+                "vector": _vector_for_id(idx),
+                "metadata": metadata,
+                "namespace": namespace,
+            }
+        )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +223,10 @@ def _construct_client(desc: VectorFrameworkDescriptor, adapter: Any) -> Any:
         ) from e
 
 
-def _call_with_fallbacks(fn: Callable[..., Any], attempts: Sequence[tuple[tuple[Any, ...], dict[str, Any]]]) -> Any:
+def _call_with_fallbacks(
+    fn: Callable[..., Any],
+    attempts: Sequence[tuple[tuple[Any, ...], dict[str, Any]]],
+) -> Any:
     """
     Call `fn` using a small set of explicit candidate calling conventions.
 
@@ -184,7 +249,91 @@ def _call_with_fallbacks(fn: Callable[..., Any], attempts: Sequence[tuple[tuple[
         except TypeError as e:
             last_type_error = e
             continue
-    raise AssertionError(f"All call candidates failed with TypeError; last error: {last_type_error}") from last_type_error
+    raise AssertionError(
+        f"All call candidates failed with TypeError; last error: {last_type_error}"
+    ) from last_type_error
+
+
+def _extract_batch_results(value: Any) -> Optional[Sequence[Any]]:
+    """
+    Extract a per-query result sequence from a batch_query return value.
+
+    Contract intent:
+    - batch_query is a bulk API; it should return something containing per-query results.
+    - Different wrappers may return:
+      * list/tuple of results
+      * mapping like {"results": [...]} or {"items": [...]}
+      * object with attribute .results or .items
+
+    We keep this extraction conservative:
+    - If we can confidently find a sequence, return it.
+    - Otherwise return None (the test will assert minimal properties only).
+    """
+    if isinstance(value, (list, tuple)):
+        return value
+
+    if isinstance(value, dict):
+        for key in ("results", "items", "data", "output"):
+            v = value.get(key)
+            if isinstance(v, (list, tuple)):
+                return v
+
+    for attr in ("results", "items", "data", "output"):
+        if hasattr(value, attr):
+            v = getattr(value, attr)
+            if isinstance(v, (list, tuple)):
+                return v
+
+    return None
+
+
+async def _ensure_namespace_seeded(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Any,
+    *,
+    namespace: str,
+) -> None:
+    """
+    Create namespace (with required dimensions) and upsert one vector.
+
+    Some adapters require the namespace to exist and contain at least one vector
+    before query/batch_query will succeed.
+
+    This is a test precondition setup step; it should not weaken production behavior.
+    """
+    ctx = _base_framework_context(namespace)
+
+    create_fn = _get_method(
+        vector_client_instance, framework_descriptor.create_namespace_method
+    )
+    await _maybe_await(
+        _call_with_fallbacks(
+            create_fn,
+            attempts=[
+                ((namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": namespace}, context=ctx))),
+            ],
+        )
+    )
+
+    # Seed with one vector so query paths don't fail with IndexNotReady or empty-index rules.
+    seed_docs = _make_documents(
+        namespace=namespace,
+        ids=["seed-0"],
+        texts=["seed"],
+        metadatas=[{"source": "seed"}],
+    )
+    upsert_fn = _get_method(vector_client_instance, framework_descriptor.upsert_method)
+    await _maybe_await(
+        _call_with_fallbacks(
+            upsert_fn,
+            attempts=[
+                ((seed_docs,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_documents": seed_docs}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"documents": seed_docs}, context=ctx))),
+            ],
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -192,7 +341,8 @@ class _UpsertItem:
     """
     Minimal structured upsert item fallback.
 
-    Some wrappers accept structured items rather than parallel arrays.
+    Some wrappers accept structured items rather than mapping-based raw_documents/documents.
+    This is kept for forward-compat and as a diagnostic option when wrappers evolve.
     """
     id: str
     text: str
@@ -205,7 +355,9 @@ class _UpsertItem:
 
 
 @pytest.fixture(params=list(iter_vector_framework_descriptors()), name="framework_descriptor")
-def framework_descriptor_fixture(request: pytest.FixtureRequest) -> VectorFrameworkDescriptor:
+def framework_descriptor_fixture(
+    request: pytest.FixtureRequest,
+) -> VectorFrameworkDescriptor:
     """
     Parameterized over all registered vector framework descriptors.
 
@@ -218,7 +370,10 @@ def framework_descriptor_fixture(request: pytest.FixtureRequest) -> VectorFramew
 
 
 @pytest.fixture
-def vector_client_instance(framework_descriptor: VectorFrameworkDescriptor, adapter: Any) -> Any:
+def vector_client_instance(
+    framework_descriptor: VectorFrameworkDescriptor,
+    adapter: Any,
+) -> Any:
     """
     Construct a concrete vector client/store instance for the given descriptor.
 
@@ -226,6 +381,41 @@ def vector_client_instance(framework_descriptor: VectorFrameworkDescriptor, adap
     We must respect descriptor.adapter_init_kwarg (tests must not hardcode "adapter").
     """
     return _construct_client(framework_descriptor, adapter)
+
+
+@pytest.fixture
+def test_namespace(framework_descriptor: VectorFrameworkDescriptor, request: pytest.FixtureRequest) -> str:
+    """
+    Unique namespace per test + per framework.
+
+    Why this matters:
+    - Prevents cross-test contamination (especially in parallel CI).
+    - Prevents "already exists" / "unknown namespace" flake from shared global state.
+    - Makes failures attributable to the test in question.
+    """
+    # Use node name + framework name + short uuid to ensure uniqueness while staying readable.
+    node = request.node.name.replace("[", "_").replace("]", "_")
+    suffix = uuid.uuid4().hex[:8]
+    return f"contract-{framework_descriptor.name}-{node}-{suffix}"
+
+
+@pytest.fixture
+async def seeded_namespace(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Any,
+    test_namespace: str,
+) -> str:
+    """
+    Ensure a namespace exists and is seeded for query/batch_query/delete tests.
+
+    We seed once per test function (cheap enough, and robust across differing adapter semantics).
+    """
+    await _ensure_namespace_seeded(
+        framework_descriptor,
+        vector_client_instance,
+        namespace=test_namespace,
+    )
+    return test_namespace
 
 
 # ---------------------------------------------------------------------------
@@ -365,47 +555,123 @@ async def test_health_type_stable_across_calls(
 async def test_create_namespace_does_not_crash(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    test_namespace: str,
 ) -> None:
     """
-    create_namespace() should accept a simple namespace name without crashing.
+    create_namespace() should accept a namespace name when provided with required context.
+
+    IMPORTANT:
+    The SDK requires "dimensions" for namespace creation. This test supplies it via
+    the framework context to avoid hardcoding wrapper-specific signatures.
     """
     fn = _get_method(vector_client_instance, framework_descriptor.create_namespace_method)
-    result = await _maybe_await(fn(TEST_NAMESPACE))
-    # Shape is framework-defined; we assert only non-crash and non-None where possible.
-    assert result is not None or result is None  # explicit: "no over-specification"
+    ctx = _base_framework_context(test_namespace)
+
+    _ = await _maybe_await(
+        _call_with_fallbacks(
+            fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
+    # Shape is framework-defined; we assert only non-crash.
 
 
 @pytest.mark.asyncio
-async def test_delete_namespace_does_not_crash(
+async def test_delete_namespace_does_not_crash_when_namespace_exists(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    test_namespace: str,
 ) -> None:
     """
-    delete_namespace() should accept a simple namespace name without crashing.
+    delete_namespace() should accept a namespace name without crashing when the namespace exists.
+
+    We explicitly create the namespace first to avoid ambiguous "not found" semantics.
     """
-    fn = _get_method(vector_client_instance, framework_descriptor.delete_namespace_method)
-    result = await _maybe_await(fn(TEST_NAMESPACE))
-    assert result is not None or result is None  # explicit: "no over-specification"
+    ctx = _base_framework_context(test_namespace)
+
+    create_fn = _get_method(vector_client_instance, framework_descriptor.create_namespace_method)
+    await _maybe_await(
+        _call_with_fallbacks(
+            create_fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
+
+    delete_fn = _get_method(vector_client_instance, framework_descriptor.delete_namespace_method)
+    _ = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
+    # Shape is framework-defined; we assert only non-crash.
 
 
 @pytest.mark.asyncio
 async def test_namespace_ops_type_stable_across_calls(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    test_namespace: str,
 ) -> None:
     """
     Namespace op return types should remain stable across repeated calls.
+
+    NOTE:
+    Some adapters may return None for these operations; in that case we do not enforce type stability.
     """
     create_fn = _get_method(vector_client_instance, framework_descriptor.create_namespace_method)
     delete_fn = _get_method(vector_client_instance, framework_descriptor.delete_namespace_method)
 
-    c1 = await _maybe_await(create_fn(TEST_NAMESPACE))
-    c2 = await _maybe_await(create_fn(TEST_NAMESPACE))
+    ctx = _base_framework_context(test_namespace)
+
+    c1 = await _maybe_await(
+        _call_with_fallbacks(
+            create_fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
+    c2 = await _maybe_await(
+        _call_with_fallbacks(
+            create_fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
     if c1 is not None and c2 is not None:
         _type_stability_assert(c1, c2, label="create_namespace()")
 
-    d1 = await _maybe_await(delete_fn(TEST_NAMESPACE))
-    d2 = await _maybe_await(delete_fn(TEST_NAMESPACE))
+    d1 = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
+    d2 = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            attempts=[
+                ((test_namespace,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"name": test_namespace}, context=ctx))),
+            ],
+        )
+    )
     if d1 is not None and d2 is not None:
         _type_stability_assert(d1, d2, label="delete_namespace()")
 
@@ -419,6 +685,7 @@ async def test_namespace_ops_type_stable_across_calls(
 async def test_upsert_accepts_single_and_multiple_items(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     The upsert surface should accept both single-item and multi-item batches without crashing.
@@ -427,45 +694,41 @@ async def test_upsert_accepts_single_and_multiple_items(
     small, explicit set of common conventions used across wrappers.
     """
     upsert_fn = _get_method(vector_client_instance, framework_descriptor.upsert_method)
+    ctx = _base_framework_context(seeded_namespace)
 
-    single_items = [_UpsertItem(id=UPSERT_SINGLE_IDS[0], text=UPSERT_SINGLE_TEXTS[0], metadata=UPSERT_SINGLE_METADATAS[0])]
-    multi_items = [
-        _UpsertItem(id=i, text=t, metadata=m)
-        for i, t, m in zip(UPSERT_MULTI_IDS, UPSERT_MULTI_TEXTS, UPSERT_MULTI_METADATAS)
-    ]
-
-    # Single batch candidates
-    single_kwargs_1 = _inject_context_if_declared(framework_descriptor, {"texts": UPSERT_SINGLE_TEXTS, "metadatas": UPSERT_SINGLE_METADATAS, "ids": UPSERT_SINGLE_IDS}, context={})
-    single_kwargs_2 = _inject_context_if_declared(framework_descriptor, {"items": single_items}, context={})
-    single_kwargs_3 = _inject_context_if_declared(framework_descriptor, {"documents": UPSERT_SINGLE_TEXTS, "metadatas": UPSERT_SINGLE_METADATAS, "ids": UPSERT_SINGLE_IDS}, context={})
+    single_docs = _make_documents(
+        namespace=seeded_namespace,
+        ids=UPSERT_SINGLE_IDS,
+        texts=UPSERT_SINGLE_TEXTS,
+        metadatas=UPSERT_SINGLE_METADATAS,
+    )
+    multi_docs = _make_documents(
+        namespace=seeded_namespace,
+        ids=UPSERT_MULTI_IDS,
+        texts=UPSERT_MULTI_TEXTS,
+        metadatas=UPSERT_MULTI_METADATAS,
+    )
 
     single_result = await _maybe_await(
         _call_with_fallbacks(
             upsert_fn,
             attempts=[
-                (tuple(), dict(single_kwargs_1)),
-                (tuple(), dict(single_kwargs_2)),
-                (tuple(), dict(single_kwargs_3)),
-                ((UPSERT_SINGLE_TEXTS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
+                ((single_docs,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_documents": single_docs}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"documents": single_docs}, context=ctx))),
             ],
-        ),
+        )
     )
-
-    # Multi batch candidates
-    multi_kwargs_1 = _inject_context_if_declared(framework_descriptor, {"texts": UPSERT_MULTI_TEXTS, "metadatas": UPSERT_MULTI_METADATAS, "ids": UPSERT_MULTI_IDS}, context={})
-    multi_kwargs_2 = _inject_context_if_declared(framework_descriptor, {"items": multi_items}, context={})
-    multi_kwargs_3 = _inject_context_if_declared(framework_descriptor, {"documents": UPSERT_MULTI_TEXTS, "metadatas": UPSERT_MULTI_METADATAS, "ids": UPSERT_MULTI_IDS}, context={})
 
     multi_result = await _maybe_await(
         _call_with_fallbacks(
             upsert_fn,
             attempts=[
-                (tuple(), dict(multi_kwargs_1)),
-                (tuple(), dict(multi_kwargs_2)),
-                (tuple(), dict(multi_kwargs_3)),
-                ((UPSERT_MULTI_TEXTS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
+                ((multi_docs,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_documents": multi_docs}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"documents": multi_docs}, context=ctx))),
             ],
-        ),
+        )
     )
 
     # We do not require non-None returns, but if both are non-None, enforce type stability.
@@ -477,25 +740,47 @@ async def test_upsert_accepts_single_and_multiple_items(
 async def test_upsert_result_type_stable_across_calls(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     Repeated upsert calls with similar batch shapes should return a stable result type.
     """
     upsert_fn = _get_method(vector_client_instance, framework_descriptor.upsert_method)
+    ctx = _base_framework_context(seeded_namespace)
 
-    kwargs_a = _inject_context_if_declared(
-        framework_descriptor,
-        {"texts": UPSERT_SINGLE_TEXTS, "metadatas": UPSERT_SINGLE_METADATAS, "ids": UPSERT_SINGLE_IDS},
-        context={},
+    docs_a = _make_documents(
+        namespace=seeded_namespace,
+        ids=UPSERT_SINGLE_IDS,
+        texts=UPSERT_SINGLE_TEXTS,
+        metadatas=UPSERT_SINGLE_METADATAS,
     )
-    kwargs_b = _inject_context_if_declared(
-        framework_descriptor,
-        {"texts": UPSERT_SINGLE_TEXTS, "metadatas": UPSERT_SINGLE_METADATAS, "ids": ["vec-id-single-2"]},
-        context={},
+    docs_b = _make_documents(
+        namespace=seeded_namespace,
+        ids=["vec-id-single-2"],
+        texts=UPSERT_SINGLE_TEXTS,
+        metadatas=UPSERT_SINGLE_METADATAS,
     )
 
-    r1 = await _maybe_await(_call_with_fallbacks(upsert_fn, [(( ), dict(kwargs_a)), ((UPSERT_SINGLE_TEXTS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))) ]))
-    r2 = await _maybe_await(_call_with_fallbacks(upsert_fn, [(( ), dict(kwargs_b)), ((UPSERT_SINGLE_TEXTS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))) ]))
+    r1 = await _maybe_await(
+        _call_with_fallbacks(
+            upsert_fn,
+            [
+                ((docs_a,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_documents": docs_a}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"documents": docs_a}, context=ctx))),
+            ],
+        )
+    )
+    r2 = await _maybe_await(
+        _call_with_fallbacks(
+            upsert_fn,
+            [
+                ((docs_b,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_documents": docs_b}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"documents": docs_b}, context=ctx))),
+            ],
+        )
+    )
 
     if r1 is not None and r2 is not None:
         _type_stability_assert(r1, r2, label="upsert() type stability")
@@ -510,17 +795,35 @@ async def test_upsert_result_type_stable_across_calls(
 async def test_delete_accepts_single_and_multiple_ids(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     The delete surface should accept both single-id and multi-id batches without crashing.
+
+    IMPORTANT:
+    We ensure the namespace exists and is seeded first; some adapters reject deletes
+    for unknown namespaces.
     """
     delete_fn = _get_method(vector_client_instance, framework_descriptor.delete_method)
+    ctx = _base_framework_context(seeded_namespace)
 
-    single_kwargs = _inject_context_if_declared(framework_descriptor, {"ids": DELETE_SINGLE_IDS}, context={})
-    multi_kwargs = _inject_context_if_declared(framework_descriptor, {"ids": DELETE_MULTI_IDS}, context={})
-
-    r1 = await _maybe_await(_call_with_fallbacks(delete_fn, [ (tuple(), dict(single_kwargs)), ((DELETE_SINGLE_IDS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))) ]))
-    r2 = await _maybe_await(_call_with_fallbacks(delete_fn, [ (tuple(), dict(multi_kwargs)), ((DELETE_MULTI_IDS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))) ]))
+    r1 = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            [
+                ((DELETE_SINGLE_IDS,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                ((DELETE_SINGLE_IDS[0],), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+            ],
+        )
+    )
+    r2 = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            [
+                ((DELETE_MULTI_IDS,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+            ],
+        )
+    )
 
     if r1 is not None and r2 is not None:
         _type_stability_assert(r1, r2, label="delete(single) vs delete(multi)")
@@ -530,17 +833,31 @@ async def test_delete_accepts_single_and_multiple_ids(
 async def test_delete_result_type_stable_across_calls(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     Repeated delete calls should return a stable result type when non-None.
     """
     delete_fn = _get_method(vector_client_instance, framework_descriptor.delete_method)
+    ctx = _base_framework_context(seeded_namespace)
 
-    kwargs_a = _inject_context_if_declared(framework_descriptor, {"ids": DELETE_SINGLE_IDS}, context={})
-    kwargs_b = _inject_context_if_declared(framework_descriptor, {"ids": ["vec-del-single-2"]}, context={})
-
-    r1 = await _maybe_await(_call_with_fallbacks(delete_fn, [ (tuple(), dict(kwargs_a)), ((DELETE_SINGLE_IDS,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))) ]))
-    r2 = await _maybe_await(_call_with_fallbacks(delete_fn, [ (tuple(), dict(kwargs_b)), ((["vec-del-single-2"],), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))) ]))
+    r1 = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            [
+                ((DELETE_SINGLE_IDS,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+            ],
+        )
+    )
+    r2 = await _maybe_await(
+        _call_with_fallbacks(
+            delete_fn,
+            [
+                ((["vec-del-single-2"],), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (("vec-del-single-2",), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+            ],
+        )
+    )
 
     if r1 is not None and r2 is not None:
         _type_stability_assert(r1, r2, label="delete() type stability")
@@ -555,6 +872,7 @@ async def test_delete_result_type_stable_across_calls(
 async def test_query_result_type_stable_across_calls(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     For simple similarity queries, the vector client should return the same *type*
@@ -564,27 +882,25 @@ async def test_query_result_type_stable_across_calls(
     would break callers relying on type stability.
     """
     query_fn = _get_method(vector_client_instance, framework_descriptor.query_method)
-
-    q_kwargs_1 = _inject_context_if_declared(framework_descriptor, {"query": QUERY_TEXT_1}, context={})
-    q_kwargs_2 = _inject_context_if_declared(framework_descriptor, {"query": QUERY_TEXT_2}, context={})
+    ctx = _base_framework_context(seeded_namespace)
 
     r1 = await _maybe_await(
         _call_with_fallbacks(
             query_fn,
             attempts=[
-                ((QUERY_TEXT_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
-                (tuple(), dict(q_kwargs_1)),
+                ((QUERY_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_query": QUERY_1}, context=ctx))),
             ],
-        ),
+        )
     )
     r2 = await _maybe_await(
         _call_with_fallbacks(
             query_fn,
             attempts=[
-                ((QUERY_TEXT_2,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
-                (tuple(), dict(q_kwargs_2)),
+                ((QUERY_2,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_query": QUERY_2}, context=ctx))),
             ],
-        ),
+        )
     )
 
     _type_stability_assert(r1, r2, label="query()")
@@ -594,6 +910,7 @@ async def test_query_result_type_stable_across_calls(
 async def test_batch_query_accepts_multiple_queries_and_type_stable(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     When batch_query is declared at the wrapper surface, it should accept multiple queries
@@ -606,27 +923,27 @@ async def test_batch_query_accepts_multiple_queries_and_type_stable(
         return
 
     bq_fn = _get_method(vector_client_instance, framework_descriptor.batch_query_method)
-
-    kwargs_a = _inject_context_if_declared(framework_descriptor, {"queries": BATCH_QUERY_TEXTS_1}, context={})
-    kwargs_b = _inject_context_if_declared(framework_descriptor, {"queries": BATCH_QUERY_TEXTS_2}, context={})
+    ctx = _base_framework_context(seeded_namespace)
 
     r1 = await _maybe_await(
         _call_with_fallbacks(
             bq_fn,
             attempts=[
-                ((BATCH_QUERY_TEXTS_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
-                (tuple(), dict(kwargs_a)),
+                ((BATCH_QUERIES_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_queries": BATCH_QUERIES_1}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"queries": BATCH_QUERIES_1}, context=ctx))),
             ],
-        ),
+        )
     )
     r2 = await _maybe_await(
         _call_with_fallbacks(
             bq_fn,
             attempts=[
-                ((BATCH_QUERY_TEXTS_2,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
-                (tuple(), dict(kwargs_b)),
+                ((BATCH_QUERIES_2,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_queries": BATCH_QUERIES_2}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"queries": BATCH_QUERIES_2}, context=ctx))),
             ],
-        ),
+        )
     )
 
     if r1 is not None and r2 is not None:
@@ -634,15 +951,60 @@ async def test_batch_query_accepts_multiple_queries_and_type_stable(
 
 
 @pytest.mark.asyncio
+async def test_batch_query_result_cardinality_matches_input_when_extractable(
+    framework_descriptor: VectorFrameworkDescriptor,
+    vector_client_instance: Any,
+    seeded_namespace: str,
+) -> None:
+    """
+    Bulk contract (robust, not over-prescriptive):
+
+    If batch_query returns an extractable per-query result sequence, its length should match
+    the number of queries submitted. This protects callers relying on 1:1 correspondence.
+
+    We do not fail adapters that return non-sequence batch structures; those are validated by
+    type-stability tests and parity checks instead.
+    """
+    if not framework_descriptor.has_batch_query:
+        return
+
+    bq_fn = _get_method(vector_client_instance, framework_descriptor.batch_query_method)
+    ctx = _base_framework_context(seeded_namespace)
+
+    out = await _maybe_await(
+        _call_with_fallbacks(
+            bq_fn,
+            attempts=[
+                ((BATCH_QUERIES_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_queries": BATCH_QUERIES_1}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"queries": BATCH_QUERIES_1}, context=ctx))),
+            ],
+        )
+    )
+
+    results = _extract_batch_results(out)
+    if results is not None:
+        assert len(results) == len(BATCH_QUERIES_1), (
+            "batch_query result count does not match input query count: "
+            f"{len(results)} vs {len(BATCH_QUERIES_1)}"
+        )
+
+
+@pytest.mark.asyncio
 async def test_batch_query_result_type_compatible_with_query_when_both_non_none(
     framework_descriptor: VectorFrameworkDescriptor,
     vector_client_instance: Any,
+    seeded_namespace: str,
 ) -> None:
     """
     Minimal parity check:
     If both query() and batch_query() return non-None values, their return types
-    should be compatible (often identical), because callers may switch between
-    single and batched execution paths.
+    should be compatible, because callers may switch between single and batched
+    execution paths.
+
+    Compatibility definition used here:
+    - If we can extract a single per-query result from the batch response, the element type
+      should match query() result type.
     """
     if not framework_descriptor.has_batch_query:
         return
@@ -650,29 +1012,36 @@ async def test_batch_query_result_type_compatible_with_query_when_both_non_none(
     query_fn = _get_method(vector_client_instance, framework_descriptor.query_method)
     bq_fn = _get_method(vector_client_instance, framework_descriptor.batch_query_method)
 
+    ctx = _base_framework_context(seeded_namespace)
+
     q_res = await _maybe_await(
         _call_with_fallbacks(
             query_fn,
             attempts=[
-                ((QUERY_TEXT_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
-                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"query": QUERY_TEXT_1}, context={}))),
+                ((QUERY_1,), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_query": QUERY_1}, context=ctx))),
             ],
-        ),
+        )
     )
     bq_res = await _maybe_await(
         _call_with_fallbacks(
             bq_fn,
             attempts=[
-                (([QUERY_TEXT_1],), dict(_inject_context_if_declared(framework_descriptor, {}, context={}))),
-                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"queries": [QUERY_TEXT_1]}, context={}))),
+                (([QUERY_1],), dict(_inject_context_if_declared(framework_descriptor, {}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"raw_queries": [QUERY_1]}, context=ctx))),
+                (tuple(), dict(_inject_context_if_declared(framework_descriptor, {"queries": [QUERY_1]}, context=ctx))),
             ],
-        ),
+        )
     )
 
-    if q_res is not None and bq_res is not None:
-        assert type(q_res) is type(bq_res), (
-            "batch_query() result type does not match query() result type: "
-            f"{type(q_res).__name__} vs {type(bq_res).__name__}"
+    if q_res is None or bq_res is None:
+        return
+
+    extracted = _extract_batch_results(bq_res)
+    if extracted is not None and len(extracted) == 1:
+        assert type(extracted[0]) is type(q_res), (
+            "batch_query single-result element type does not match query() result type: "
+            f"{type(extracted[0]).__name__} vs {type(q_res).__name__}"
         )
 
 
