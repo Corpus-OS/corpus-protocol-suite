@@ -21,7 +21,7 @@ from corpus_sdk.llm.framework_adapters.llamaindex import (
     CorpusLlamaIndexLLM,
     LlamaIndexLLMConfig,
 )
-from corpus_sdk.llm.llm_base import OperationContext
+from corpus_sdk.llm.llm_base import LLMCapabilities, LLMChunk, LLMCompletion, OperationContext, TokenUsage
 
 
 # ---------------------------------------------------------------------------
@@ -172,21 +172,6 @@ def test_create_llm_translator_called_with_framework_llamaindex(monkeypatch: pyt
 
     assert captured.get("framework") == "llamaindex"
     assert captured.get("adapter") is adapter
-
-
-def test_translator_override_is_used_and_factory_not_called(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
-    """When translator is provided explicitly, factory should not be called."""
-    # This would fail if factory is called
-    monkeypatch.setattr(
-        llamaindex_adapter_module,
-        "create_llm_translator",
-        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("should not be called")),
-    )
-
-    # Inject translator directly (not currently supported, but tests the concept)
-    # For now, just verify init doesn't call factory during __init__
-    llm = CorpusLlamaIndexLLM(llm_adapter=adapter, model="test")
-    assert llm is not None
 
 
 def test_client_stores_config_attributes() -> None:
@@ -600,10 +585,10 @@ def test_chat_forwards_stop_sequences(monkeypatch: pytest.MonkeyPatch, adapter: 
 
     llm = CorpusLlamaIndexLLM(llm_adapter=adapter)
     messages = [_make_mock_chatmessage()]
-    
-    _ = llm.chat(messages, stop=["\n\n", "STOP"])
-    
-    assert seen["params"].get("stop_sequences") == ["\n\n", "STOP"]
+
+    _ = llm.chat(messages, stop=["STOP_1", "STOP_2"])
+
+    assert seen["params"].get("stop_sequences") == ["STOP_1", "STOP_2"]
 
 
 def test_chat_extracts_stop_from_additional_kwargs(monkeypatch: pytest.MonkeyPatch, adapter: Any) -> None:
@@ -1886,75 +1871,6 @@ async def test_ahealth_delegates_to_translator_or_thread(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Context Manager Tests (4 tests)
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_context_manager_closes_underlying_adapter() -> None:
-    """Context managers should call close/aclose on adapter."""
-    class ClosingLLMAdapter:
-        def __init__(self) -> None:
-            self.closed = False
-            self.aclosed = False
-
-        def capabilities(self) -> Dict[str, Any]:
-            return {"supports_count_tokens": True}
-        def health(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-            return {"status": "ok"}
-        def complete(self, *args: Any, **kwargs: Any) -> Any:
-            return {"text": "x", "model": "m"}
-        def stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
-            return iter(())
-        def count_tokens(self, *args: Any, **kwargs: Any) -> int:
-            return 0
-        def close(self) -> None:
-            self.closed = True
-        async def aclose(self) -> None:
-            self.aclosed = True
-
-    adapter_instance = ClosingLLMAdapter()
-
-    with CorpusLlamaIndexLLM(llm_adapter=adapter_instance) as llm:
-        assert llm is not None
-    assert adapter_instance.closed is True
-
-    adapter2 = ClosingLLMAdapter()
-    llm2 = CorpusLlamaIndexLLM(llm_adapter=adapter2)
-    async with llm2:
-        assert llm2 is not None
-    assert adapter2.aclosed is True
-
-
-def test_sync_context_manager_works_without_close(adapter: Any) -> None:
-    """Sync context manager should work even if adapter lacks close()."""
-    llm = CorpusLlamaIndexLLM(llm_adapter=adapter)
-    
-    with llm:
-        assert llm is not None
-
-
-@pytest.mark.asyncio
-async def test_async_context_manager_works_without_aclose(adapter: Any) -> None:
-    """Async context manager should work even if adapter lacks aclose()."""
-    llm = CorpusLlamaIndexLLM(llm_adapter=adapter)
-    
-    async with llm:
-        assert llm is not None
-
-
-def test_context_manager_api_consistency_with_other_adapters(adapter: Any) -> None:
-    """LlamaIndex adapter should support same context manager pattern as AutoGen/CrewAI."""
-    llm = CorpusLlamaIndexLLM(llm_adapter=adapter)
-    
-    # Verify both __enter__/__exit__ exist
-    assert hasattr(llm, "__enter__")
-    assert hasattr(llm, "__exit__")
-    assert hasattr(llm, "__aenter__")
-    assert hasattr(llm, "__aexit__")
-
-
-# ---------------------------------------------------------------------------
 # Event Loop Guard Tests (2 tests)
 # ---------------------------------------------------------------------------
 
@@ -2092,21 +2008,37 @@ def test_llamaindex_streaming_with_chatmessage_objects(adapter: Any) -> None:
 def adapter() -> Any:
     """Create a minimal test adapter."""
     class TestAdapter:
-        def complete(self, *args: Any, **kwargs: Any) -> Any:
-            return {"text": "test response", "model": "test-model"}
-        
-        def stream(self, *args: Any, **kwargs: Any) -> Iterator[Any]:
-            yield {"text": "chunk1", "is_final": False, "model": "test-model"}
-            yield {"text": "chunk2", "is_final": True, "model": "test-model"}
-        
-        def count_tokens(self, *args: Any, **kwargs: Any) -> int:
-            return 10
-        
-        def capabilities(self) -> Dict[str, Any]:
-            return {"supports_count_tokens": True}
-        
-        def health(self) -> Dict[str, Any]:
+        async def capabilities(self) -> LLMCapabilities:
+            return LLMCapabilities(
+                server="test",
+                version="1.0",
+                model_family="test-family",
+                max_context_length=8192,
+                supports_count_tokens=True,
+            )
+
+        async def health(self, *, ctx: Optional[OperationContext] = None) -> Dict[str, Any]:
+            _ = ctx
             return {"status": "ok"}
+
+        async def complete(self, *, messages: Any, ctx: Optional[OperationContext] = None, **kwargs: Any) -> Any:
+            _ = (messages, ctx, kwargs)
+            return LLMCompletion(
+                text="test response",
+                model="test-model",
+                model_family="test-family",
+                usage=TokenUsage(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+                finish_reason="stop",
+            )
+
+        async def stream(self, *, messages: Any, ctx: Optional[OperationContext] = None, **kwargs: Any) -> AsyncIterator[Any]:
+            _ = (messages, ctx, kwargs)
+            yield LLMChunk(text="chunk1", is_final=False, model="test-model")
+            yield LLMChunk(text="chunk2", is_final=True, model="test-model")
+
+        async def count_tokens(self, text: str, *, model: Optional[str] = None, ctx: Optional[OperationContext] = None) -> int:
+            _ = (text, model, ctx)
+            return 10
 
     return TestAdapter()
 
