@@ -1,7 +1,7 @@
 # Corpus SDK
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
-![Python](https://img.shields.io/badge/python-3.9+-blue)
+![Python](https://img.shields.io/badge/python-3.10+-blue)
 
 Reference implementation of the **Corpus Protocol Suite** — a protocol-first, vendor-neutral SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
@@ -230,7 +230,7 @@ If any of these stop being true, corpus_sdk is the incremental next step; Corpus
 pip install corpus_sdk
 ```
 
-* Python ≥ 3.9 recommended
+* Python ≥ 3.10 recommended
 * No heavy runtime dependencies; bring your own metrics sink or use the provided `NoopMetrics`
 
 ---
