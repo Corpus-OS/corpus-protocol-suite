@@ -4,10 +4,11 @@ Registry of vector framework adapters used by the conformance test suite.
 
 This module is TEST-ONLY. It provides lightweight metadata describing how to:
 - Import each vector framework adapter
-- Construct its client/store
-- Call its sync / async add, delete, query, streaming, and MMR methods
-- Pass framework-specific context
-- Know which extra semantics (health, capabilities, streaming, MMR) to expect
+- Construct its client (including injected underlying Corpus vector adapter)
+- Call its async vector protocol methods (capabilities, query, batch_query, upsert, delete, namespace ops, health)
+- Pass framework-specific context (if applicable)
+- Know which wrapper-level surfaces should exist so conformance tests can be strict
+  without hardcoding framework specifics.
 
 Contract tests in tests/frameworks/vector/ use this registry to stay
 framework-agnostic. Adding a new vector framework typically means:
@@ -36,8 +37,19 @@ try:  # Optional, used only for version ordering validation
 except Exception:  # pragma: no cover - packaging may not be installed
     Version = None  # type: ignore[assignment]
 
-# Simple in-memory cache to avoid repeatedly importing modules for availability checks.
+
+# ---------------------------------------------------------------------------
+# Availability cache
+# ---------------------------------------------------------------------------
+# IMPORTANT:
+# Cache key must be stable across descriptor overwrites. Caching by name can
+# produce stale results when tests overwrite registry entries under the same name.
+# We therefore cache on a composite key derived from adapter_module + availability_attr.
 _AVAILABILITY_CACHE: Dict[str, bool] = {}
+
+
+def _availability_cache_key(adapter_module: str, availability_attr: Optional[str]) -> str:
+    return f"{adapter_module}:{availability_attr or ''}"
 
 
 @dataclass(frozen=True)
@@ -45,136 +57,113 @@ class VectorFrameworkDescriptor:
     """
     Description of a vector framework adapter (TEST-ONLY).
 
-    Fields
-    ------
+    Identity / import
+    -----------------
     name:
-        Short, stable identifier (e.g. "llamaindex", "semantic_kernel").
+        Short, stable identifier (e.g. "autogen", "langchain").
     adapter_module:
         Dotted import path for the adapter module.
     adapter_class:
         Name of the adapter class within adapter_module (bare class name).
 
-    add_method:
-        Name of the *sync* add/upsert method (vector insert), e.g. "add" or
-        "add_texts". Must accept batched inputs.
-    async_add_method:
-        Name of the *async* add/upsert method, or None if not supported.
+    Constructor wiring
+    ------------------
+    adapter_init_kwarg:
+        Name of the constructor kwarg used to inject the underlying Corpus vector adapter.
+        Tests MUST use this field rather than hardcoding `adapter=...`.
 
-    delete_method:
-        Name of the *sync* delete method, or None if not supported.
-        The exact semantics (by ID, by ref_doc_id, by filter) are framework-
-        specific; tests use this via framework-agnostic helpers.
-    async_delete_method:
-        Name of the *async* delete method, or None.
+    docstore_init_kwarg:
+        Optional constructor kwarg used to inject a docstore (if wrapper supports injection).
+    config_init_kwarg:
+        Optional constructor kwarg used to inject VectorAdapterConfig (if wrapper supports it).
+    mode_init_kwarg:
+        Optional constructor kwarg used to set adapter mode ("thin"/"standalone") if wrapper supports it.
 
-    query_method:
-        Name of the *sync* similarity query method (non-streaming).
-    async_query_method:
-        Name of the *async* similarity query method, or None.
+    Async protocol surface (VectorProtocolV1)
+    -----------------------------------------
+    capabilities_method, query_method, batch_query_method, upsert_method, delete_method,
+    create_namespace_method, delete_namespace_method, health_method:
+        Method names on the wrapper/adapter instance.
 
-    stream_query_method:
-        Name of the *sync* streaming query method, or None.
-    async_stream_query_method:
-        Name of the *async* streaming query method, or None.
-
-    mmr_query_method:
-        Name of the *sync* Maximal Marginal Relevance (MMR) query method, or None.
-    async_mmr_query_method:
-        Name of the *async* MMR query method, or None.
-
+    Context injection
+    -----------------
     context_kwarg:
-        Name of the kwargs parameter used for framework-specific context
-        (e.g. "callback_manager", "sk_context", "config").
+        Name of the kwargs parameter used for framework-specific context, if any.
 
-    has_capabilities:
-        True if the adapter exposes a capabilities()/acapabilities() surface.
+    Wrapper-level surface expectations (what tests should assert exists)
+    -------------------------------------------------------------------
+    has_batch_query:
+        True if the adapter surface includes batch_query method (even if it may raise NotSupported at runtime
+        depending on capabilities.supports_batch_queries).
 
-    has_health:
-        True if the adapter exposes a health()/ahealth() surface.
+    supports_wire_handler:
+        True if conformance tests should validate WireVectorHandler envelope behavior against this adapter.
 
-    supports_streaming:
-        True if the adapter is expected to support streaming queries.
+    supports_docstore_injection / supports_config_injection / supports_mode_switch / supports_auto_normalize_toggle:
+        Whether the wrapper constructor is expected to accept those knobs (the kwarg names are provided above).
+        These are *test expectations* about the wrapper API shape, not backend capability flags.
+        Backend capability flags live in VectorCapabilities returned by capabilities().
 
-    supports_mmr:
-        True if the adapter is expected to support MMR queries.
-
+    Availability + versions
+    -----------------------
     availability_attr:
-        Optional module-level boolean that indicates whether the underlying
-        framework is actually installed, e.g. "LANGCHAIN_VECTOR_AVAILABLE".
-        Tests can skip or adjust expectations when this is False.
-
-    minimum_framework_version:
-        Optional minimum framework version (string) this adapter/registry entry
-        has been validated against.
-
-    tested_up_to_version:
-        Optional maximum framework version (string) this adapter/registry entry
-        is known to work with.
+        Optional module-level boolean that indicates whether the underlying framework is installed.
+    minimum_framework_version / tested_up_to_version:
+        Informational bounds with best-effort ordering validation.
     """
 
     name: str
     adapter_module: str
     adapter_class: str
 
-    add_method: str
-    async_add_method: Optional[str] = None
+    # Constructor injection kwarg for the underlying Corpus vector adapter.
+    adapter_init_kwarg: str = "adapter"
 
-    delete_method: Optional[str] = None
-    async_delete_method: Optional[str] = None
+    # Optional constructor kwargs for additional knobs.
+    docstore_init_kwarg: Optional[str] = None
+    config_init_kwarg: Optional[str] = None
+    mode_init_kwarg: Optional[str] = None
 
-    query_method: str
-    async_query_method: Optional[str] = None
+    # VectorProtocolV1 surface (async-first).
+    capabilities_method: str = "capabilities"
+    query_method: str = "query"
+    batch_query_method: Optional[str] = "batch_query"
+    upsert_method: str = "upsert"
+    delete_method: str = "delete"
+    create_namespace_method: str = "create_namespace"
+    delete_namespace_method: str = "delete_namespace"
+    health_method: str = "health"
 
-    stream_query_method: Optional[str] = None
-    async_stream_query_method: Optional[str] = None
-
-    mmr_query_method: Optional[str] = None
-    async_mmr_query_method: Optional[str] = None
-
+    # Framework-specific context kwarg (optional).
     context_kwarg: Optional[str] = None
 
-    has_capabilities: bool = False
-    has_health: bool = False
+    # Wrapper-level expectations for tests.
+    has_batch_query: bool = True
+    supports_wire_handler: bool = True
 
-    supports_streaming: bool = False
-    supports_mmr: bool = False
+    supports_docstore_injection: bool = False
+    supports_config_injection: bool = False
+    supports_mode_switch: bool = False
+    supports_auto_normalize_toggle: bool = False
 
     availability_attr: Optional[str] = None
     minimum_framework_version: Optional[str] = None
     tested_up_to_version: Optional[str] = None
 
     def __post_init__(self) -> None:
-        """
-        Run basic consistency checks after dataclass initialization.
-
-        This will raise early for obviously invalid descriptors (e.g. missing
-        core method names) and emit non-fatal warnings for softer issues.
-        """
-        # Since the dataclass is frozen, we must not mutate; validation is read-only.
         self.validate()
-
-    @property
-    def supports_async(self) -> bool:
-        """True if any async method is declared."""
-        return bool(
-            self.async_add_method
-            or self.async_delete_method
-            or self.async_query_method
-            or self.async_stream_query_method
-            or self.async_mmr_query_method
-        )
 
     def is_available(self) -> bool:
         """
         Check if the underlying framework appears available for testing.
 
-        If availability_attr is set, this checks that boolean on the adapter
-        module. Otherwise assumes the framework is available.
+        If availability_attr is set, this checks that boolean on the adapter module.
+        Otherwise assumes the framework is available.
 
-        Results are cached per-descriptor name to avoid repeated imports in
-        large test suites.
+        Results are cached using adapter_module + availability_attr to avoid stale results
+        when descriptors are overwritten in tests.
         """
-        cache_key = self.name
+        cache_key = _availability_cache_key(self.adapter_module, self.availability_attr)
         if cache_key in _AVAILABILITY_CACHE:
             return _AVAILABILITY_CACHE[cache_key]
 
@@ -206,12 +195,9 @@ class VectorFrameworkDescriptor:
     def version_range(self) -> Optional[str]:
         """
         Return a human-readable version range string, if any.
-
-        Example: ">=0.1.0, <=0.3.5" or None if no constraints are set.
         """
         if not self.minimum_framework_version and not self.tested_up_to_version:
             return None
-
         if self.minimum_framework_version and self.tested_up_to_version:
             return f">={self.minimum_framework_version}, <= {self.tested_up_to_version}"
         if self.minimum_framework_version:
@@ -224,83 +210,28 @@ class VectorFrameworkDescriptor:
 
         Raises
         ------
-        ValueError
-            If required fields like add_method/query_method are missing,
-            or when version bounds are obviously inconsistent.
+        ValueError on missing required fields or obviously inconsistent version bounds.
         """
-        # Required core methods: add_method and query_method.
-        if not self.add_method or not self.query_method:
-            raise ValueError(
-                f"{self.name}: add_method and query_method must both be set",
-            )
+        # Required: adapter init kwarg must be non-empty.
+        if not isinstance(self.adapter_init_kwarg, str) or not self.adapter_init_kwarg.strip():
+            raise ValueError(f"{self.name}: adapter_init_kwarg must be a non-empty string")
 
-        # Async consistency warnings (soft).
+        # Required: core operations must exist (async protocol).
+        for field_name in ("capabilities_method", "query_method", "upsert_method", "delete_method", "health_method"):
+            v = getattr(self, field_name)
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError(f"{self.name}: {field_name} must be a non-empty string")
 
-        if self.async_add_method and not self.add_method:
-            warnings.warn(
-                f"{self.name}: async_add_method is set but add_method is None "
-                f"(async should usually have a sync counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        for field_name in ("create_namespace_method", "delete_namespace_method"):
+            v = getattr(self, field_name)
+            if not isinstance(v, str) or not v.strip():
+                raise ValueError(f"{self.name}: {field_name} must be a non-empty string")
 
-        if self.async_delete_method and not self.delete_method:
-            warnings.warn(
-                f"{self.name}: async_delete_method is set but delete_method is None "
-                f"(async should usually have a sync counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        # Batch query expectations.
+        if self.has_batch_query and not (self.batch_query_method and self.batch_query_method.strip()):
+            raise ValueError(f"{self.name}: has_batch_query=True requires batch_query_method to be set")
 
-        if self.async_query_method and not self.query_method:
-            warnings.warn(
-                f"{self.name}: async_query_method is set but query_method is None "
-                f"(async should usually have a sync counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        if self.async_stream_query_method and not self.stream_query_method:
-            warnings.warn(
-                f"{self.name}: async_stream_query_method is set but "
-                f"stream_query_method is None (async streaming should have a "
-                f"sync counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        if self.async_mmr_query_method and not self.mmr_query_method:
-            warnings.warn(
-                f"{self.name}: async_mmr_query_method is set but "
-                f"mmr_query_method is None (async should usually have a "
-                f"sync counterpart)",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        # Feature flags vs method names (soft warnings).
-
-        if self.supports_streaming and not (
-            self.stream_query_method or self.async_stream_query_method
-        ):
-            warnings.warn(
-                f"{self.name}: supports_streaming is True but neither "
-                f"stream_query_method nor async_stream_query_method is set",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        if self.supports_mmr and not (
-            self.mmr_query_method or self.async_mmr_query_method
-        ):
-            warnings.warn(
-                f"{self.name}: supports_mmr is True but neither mmr_query_method "
-                f"nor async_mmr_query_method is set",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-
-        # adapter_class should be a bare class name, not a dotted path
+        # adapter_class should be a bare class name, not a dotted path.
         if "." in self.adapter_class:
             warnings.warn(
                 f"{self.name}: adapter_class should be a class name only, "
@@ -309,10 +240,40 @@ class VectorFrameworkDescriptor:
                 stacklevel=2,
             )
 
-        # Version ordering validation (best-effort)
+        # Constructor knobs expectations: if tests expect injection, require kwarg names.
+        if self.supports_docstore_injection and not self.docstore_init_kwarg:
+            warnings.warn(
+                f"{self.name}: supports_docstore_injection=True but docstore_init_kwarg is None; "
+                "tests may not know how to inject a docstore",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.supports_config_injection and not self.config_init_kwarg:
+            warnings.warn(
+                f"{self.name}: supports_config_injection=True but config_init_kwarg is None; "
+                "tests may not know how to inject VectorAdapterConfig",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.supports_mode_switch and not self.mode_init_kwarg:
+            warnings.warn(
+                f"{self.name}: supports_mode_switch=True but mode_init_kwarg is None; "
+                "tests may not know how to set thin/standalone mode",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if self.supports_auto_normalize_toggle and not self.supports_config_injection:
+            # In your base, auto_normalize is driven by VectorAdapterConfig, so this is a reasonable sanity check.
+            warnings.warn(
+                f"{self.name}: supports_auto_normalize_toggle=True but supports_config_injection=False; "
+                "auto_normalize is typically toggled via VectorAdapterConfig",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        # Version ordering validation (best-effort).
         if self.minimum_framework_version and self.tested_up_to_version:
             if Version is None:
-                # packaging not installed; we can't validate ordering robustly
                 warnings.warn(
                     f"{self.name}: cannot validate version range ordering because "
                     "'packaging' is not installed "
@@ -342,45 +303,113 @@ class VectorFrameworkDescriptor:
                             f"{self.tested_up_to_version!r}",
                         )
 
-        # If only one bound is set, there's nothing to order-check; they remain
-        # informational for tests.
-
 
 # ---------------------------------------------------------------------------
 # Known vector framework adapters
 # ---------------------------------------------------------------------------
-
+# NOTE:
+# These entries are *wrapper surface* descriptors for conformance tests.
+# Backend capability truth comes from adapter.capabilities() at runtime.
 VECTOR_FRAMEWORKS: Dict[str, VectorFrameworkDescriptor] = {
+    # ------------------------------------------------------------------ #
+    # AutoGen
+    # ------------------------------------------------------------------ #
+    "autogen": VectorFrameworkDescriptor(
+        name="autogen",
+        adapter_module="corpus_sdk.vector.framework_adapters.autogen",
+        adapter_class="CorpusAutoGenVectorClient",
+        adapter_init_kwarg="adapter",
+        # VectorProtocolV1 surface
+        capabilities_method="capabilities",
+        query_method="query",
+        batch_query_method="batch_query",
+        upsert_method="upsert",
+        delete_method="delete",
+        create_namespace_method="create_namespace",
+        delete_namespace_method="delete_namespace",
+        health_method="health",
+        # Framework context
+        context_kwarg="conversation",
+        # Expectations
+        has_batch_query=True,
+        supports_wire_handler=True,
+        # If your wrapper supports passing config/mode/docstore, flip these to True and set kwargs.
+        supports_docstore_injection=False,
+        supports_config_injection=False,
+        supports_mode_switch=False,
+        supports_auto_normalize_toggle=False,
+        availability_attr=None,
+    ),
+
+    # ------------------------------------------------------------------ #
+    # CrewAI
+    # ------------------------------------------------------------------ #
+    "crewai": VectorFrameworkDescriptor(
+        name="crewai",
+        adapter_module="corpus_sdk.vector.framework_adapters.crewai",
+        adapter_class="CorpusCrewAIVectorClient",
+        adapter_init_kwarg="adapter",
+        capabilities_method="capabilities",
+        query_method="query",
+        batch_query_method="batch_query",
+        upsert_method="upsert",
+        delete_method="delete",
+        create_namespace_method="create_namespace",
+        delete_namespace_method="delete_namespace",
+        health_method="health",
+        context_kwarg="task",
+        has_batch_query=True,
+        supports_wire_handler=True,
+        supports_docstore_injection=False,
+        supports_config_injection=False,
+        supports_mode_switch=False,
+        supports_auto_normalize_toggle=False,
+        availability_attr=None,
+    ),
+
+    # ------------------------------------------------------------------ #
+    # LangChain
+    # ------------------------------------------------------------------ #
+    "langchain": VectorFrameworkDescriptor(
+        name="langchain",
+        adapter_module="corpus_sdk.vector.framework_adapters.langchain",
+        adapter_class="CorpusLangChainVectorClient",
+        adapter_init_kwarg="adapter",
+        capabilities_method="capabilities",
+        query_method="query",
+        batch_query_method="batch_query",
+        upsert_method="upsert",
+        delete_method="delete",
+        create_namespace_method="create_namespace",
+        delete_namespace_method="delete_namespace",
+        health_method="health",
+        context_kwarg="config",
+        has_batch_query=True,
+        supports_wire_handler=True,
+        # Reuse the common availability flag pattern if your adapter module defines it.
+        availability_attr="LANGCHAIN_AVAILABLE",
+    ),
+
     # ------------------------------------------------------------------ #
     # LlamaIndex
     # ------------------------------------------------------------------ #
     "llamaindex": VectorFrameworkDescriptor(
         name="llamaindex",
         adapter_module="corpus_sdk.vector.framework_adapters.llamaindex",
-        adapter_class="CorpusLlamaIndexVectorStore",
-        # Node-based add / delete; batched by design.
-        add_method="add",
-        async_add_method="aadd",
-        delete_method="delete",           # delete(ref_doc_id=...)
-        async_delete_method="adelete",
-        # Core similarity query surface.
+        adapter_class="CorpusLlamaIndexVectorClient",
+        adapter_init_kwarg="adapter",
+        capabilities_method="capabilities",
         query_method="query",
-        async_query_method="aquery",
-        # Streaming query.
-        stream_query_method="query_stream",
-        async_stream_query_method=None,   # No explicit async streaming variant today.
-        # MMR surface.
-        mmr_query_method="query_mmr",
-        async_mmr_query_method="aquery_mmr",
-        # LlamaIndex-specific context path.
+        batch_query_method="batch_query",
+        upsert_method="upsert",
+        delete_method="delete",
+        create_namespace_method="create_namespace",
+        delete_namespace_method="delete_namespace",
+        health_method="health",
         context_kwarg="callback_manager",
-        has_capabilities=False,           # Capabilities are internal via VectorTranslator.
-        has_health=False,
-        supports_streaming=True,
-        supports_mmr=True,
-        availability_attr=None,
-        minimum_framework_version=None,
-        tested_up_to_version=None,
+        has_batch_query=True,
+        supports_wire_handler=True,
+        availability_attr="LLAMAINDEX_AVAILABLE",
     ),
 
     # ------------------------------------------------------------------ #
@@ -389,31 +418,20 @@ VECTOR_FRAMEWORKS: Dict[str, VectorFrameworkDescriptor] = {
     "semantic_kernel": VectorFrameworkDescriptor(
         name="semantic_kernel",
         adapter_module="corpus_sdk.vector.framework_adapters.semantic_kernel",
-        adapter_class="CorpusSemanticKernelVectorStore",
-        # Text-based add; accepts batched texts+metadata.
-        add_method="add_texts",
-        async_add_method="aadd_texts",
+        adapter_class="CorpusSemanticKernelVectorClient",
+        adapter_init_kwarg="adapter",
+        capabilities_method="capabilities",
+        query_method="query",
+        batch_query_method="batch_query",
+        upsert_method="upsert",
         delete_method="delete",
-        async_delete_method="adelete",
-        # AI-friendly similarity search surface.
-        query_method="similarity_search",
-        async_query_method="asimilarity_search",
-        # Streaming similarity search.
-        stream_query_method="similarity_search_stream",
-        async_stream_query_method=None,  # Streaming currently sync-only on the store.
-        # MMR search surface.
-        mmr_query_method="max_marginal_relevance_search",
-        async_mmr_query_method="amax_marginal_relevance_search",
-        # Semantic Kernel–specific context.
-        context_kwarg="sk_context",
-        has_capabilities=False,          # Store uses get_capabilities/aget_capabilities,
-                                         # not capabilities()/acapabilities() by contract.
-        has_health=False,
-        supports_streaming=True,
-        supports_mmr=True,
-        availability_attr=None,
-        minimum_framework_version=None,
-        tested_up_to_version=None,
+        create_namespace_method="create_namespace",
+        delete_namespace_method="delete_namespace",
+        health_method="health",
+        context_kwarg="context",
+        has_batch_query=True,
+        supports_wire_handler=True,
+        availability_attr="SEMANTIC_KERNEL_AVAILABLE",
     ),
 }
 
@@ -422,16 +440,12 @@ def get_vector_framework_descriptor(name: str) -> VectorFrameworkDescriptor:
     """
     Look up a vector framework descriptor by name.
 
-    Raises
-    ------
-    KeyError if the framework is not registered.
+    Raises KeyError if the framework is not registered.
     """
     return VECTOR_FRAMEWORKS[name]
 
 
-def get_vector_framework_descriptor_safe(
-    name: str,
-) -> Optional[VectorFrameworkDescriptor]:
+def get_vector_framework_descriptor_safe(name: str) -> Optional[VectorFrameworkDescriptor]:
     """
     Safe lookup for a vector framework descriptor.
 
@@ -441,21 +455,17 @@ def get_vector_framework_descriptor_safe(
 
 
 def has_vector_framework(name: str) -> bool:
-    """
-    Return True if a framework with the given name is registered.
-    """
+    """Return True if a framework with the given name is registered."""
     return name in VECTOR_FRAMEWORKS
 
 
-# Backwards-compatible alias, if anything still uses the generic name.
+# Backwards-compatible alias, if anything still uses the old name.
 def has_framework(name: str) -> bool:
     return has_vector_framework(name)
 
 
 def iter_vector_framework_descriptors() -> Iterable[VectorFrameworkDescriptor]:
-    """
-    Iterate over all registered vector framework descriptors.
-    """
+    """Iterate over all registered vector framework descriptors."""
     return VECTOR_FRAMEWORKS.values()
 
 
@@ -464,7 +474,7 @@ def iter_available_vector_framework_descriptors() -> Iterable[VectorFrameworkDes
     Iterate over descriptors for frameworks that appear available.
 
     This is useful for tests that should only run when the underlying
-    framework (LlamaIndex, Semantic Kernel, etc.) is installed.
+    framework (LangChain, LlamaIndex, Semantic Kernel, etc.) is installed.
     """
     return (desc for desc in VECTOR_FRAMEWORKS.values() if desc.is_available())
 
@@ -476,17 +486,13 @@ def register_vector_framework_descriptor(
     """
     Register a new vector framework descriptor dynamically (TEST-ONLY).
 
-    This is primarily intended for test scenarios where you want to plug in
-    an experimental or third-party vector framework adapter.
-
     Parameters
     ----------
     descriptor:
         Descriptor to register. Its `name` is used as the registry key.
     overwrite:
-        If False (default), attempting to overwrite an existing entry will
-        raise KeyError. If True, an existing entry with the same name is
-        replaced (with a warning).
+        If False (default), attempting to overwrite an existing entry raises KeyError.
+        If True, replaces an existing entry (with a warning).
     """
     if descriptor.name in VECTOR_FRAMEWORKS and not overwrite:
         raise KeyError(f"Framework {descriptor.name!r} is already registered")
@@ -499,8 +505,9 @@ def register_vector_framework_descriptor(
         )
 
     VECTOR_FRAMEWORKS[descriptor.name] = descriptor
+
     # Reset availability cache for this descriptor so future checks re-evaluate.
-    _AVAILABILITY_CACHE.pop(descriptor.name, None)
+    _AVAILABILITY_CACHE.pop(_availability_cache_key(descriptor.adapter_module, descriptor.availability_attr), None)
 
 
 def unregister_vector_framework_descriptor(
@@ -510,19 +517,17 @@ def unregister_vector_framework_descriptor(
     """
     Unregister a vector framework descriptor dynamically (TEST-ONLY).
 
-    Useful for tests that temporarily override or replace registry entries.
-
     Parameters
     ----------
     name:
         Name of the framework to unregister.
     ignore_missing:
-        If False, raise KeyError when the framework is not registered.
-        If True (default), missing entries are ignored.
+        If False, raise KeyError when not registered. If True, ignore missing entries.
     """
     if name in VECTOR_FRAMEWORKS:
+        desc = VECTOR_FRAMEWORKS[name]
         del VECTOR_FRAMEWORKS[name]
-        _AVAILABILITY_CACHE.pop(name, None)
+        _AVAILABILITY_CACHE.pop(_availability_cache_key(desc.adapter_module, desc.availability_attr), None)
     elif not ignore_missing:
         raise KeyError(f"Framework {name!r} is not registered")
 
