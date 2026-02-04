@@ -1,4 +1,4 @@
-# tests/frameworks/llm/test_langchain_llm_adapter.py
+# tests/test_langchain_adapter_full_suite.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Full LangChain framework adapter test suite for CorpusLangChainLLM.
@@ -201,17 +201,17 @@ class FakeLLMProtocolV1:
             ctx=ctx,
         )
 
-        async def _agen() -> AsyncIterator[LLMChunk]:
-            try:
-                for idx, ch in enumerate(self.next_stream_chunks):
-                    if self.raise_on_stream_at_index is not None and idx == self.raise_on_stream_at_index:
-                        raise self.raise_on_stream_exc or RuntimeError("stream failure")
-                    yield ch
-            finally:
-                # Signal that the underlying async generator was closed/finished.
-                self.stream_closed = True
-
-        return _agen()
+        try:
+            for idx, ch in enumerate(self.next_stream_chunks):
+                if (
+                    self.raise_on_stream_at_index is not None
+                    and idx == self.raise_on_stream_at_index
+                ):
+                    raise self.raise_on_stream_exc or RuntimeError("stream failure")
+                yield ch
+        finally:
+            # Signal that the underlying async generator was closed/finished.
+            self.stream_closed = True
 
     async def count_tokens(
         self,
@@ -241,14 +241,13 @@ class FakeLLMProtocolV1:
         # Minimal, permissive default: your real LLMCapabilities may have more fields.
         # We populate commonly-used ones; dataclass defaults handle the rest.
         return LLMCapabilities(
+            server="fake",
+            version="0",
+            model_family="fake",
+            max_context_length=8192,
             supports_streaming=True,
             supports_tools=True,
-            supports_json_mode=True,
-            supports_vision=False,
-            supports_audio=False,
-            max_context_tokens=None,
-            provider=None,
-            models=None,
+            supports_json_output=True,
         )
 
 
