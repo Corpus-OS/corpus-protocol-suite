@@ -202,7 +202,8 @@ class VectorFrameworkDescriptor:
             return f">={self.minimum_framework_version}, <= {self.tested_up_to_version}"
         if self.minimum_framework_version:
             return f">={self.minimum_framework_version}"
-        return f"<= {self.tested_up_to_version}"
+        # Keep the upper-bound-only case compact (no space) for readability.
+        return f"<={self.tested_up_to_version}"
 
     def validate(self) -> None:
         """
