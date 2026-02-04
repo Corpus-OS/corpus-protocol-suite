@@ -9,6 +9,7 @@ MMR search, and callable embedding interfaces.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 from unittest.mock import Mock, patch
@@ -37,6 +38,21 @@ from corpus_sdk.vector.vector_base import (
 
 SAMPLE_TEXT = "hello from autogen vector tests"
 SAMPLE_EMBEDDING = [0.1, 0.2, 0.3, 0.4]
+
+
+def _make_caps(**overrides: Any) -> VectorCapabilities:
+    """Construct a protocol-valid VectorCapabilities for test doubles."""
+    base: Dict[str, Any] = {
+        "server": "test",
+        "version": "0",
+        "supports_batch_operations": True,
+        "supports_metadata_filtering": True,
+        "supports_batch_queries": True,
+        "max_top_k": 100,
+        "text_storage_strategy": "metadata",
+    }
+    base.update(overrides)
+    return VectorCapabilities(**base)
 
 
 # ---------------------------------------------------------------------------
@@ -113,21 +129,11 @@ def _make_dummy_translator() -> Any:
         async def arun_delete(self, *a: Any, **k: Any) -> Any:
             return {"deleted": 1}
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(
-                supports_upsert=True,
-                supports_delete=True,
-                supports_metadata_filtering=True,
-                max_top_k=100,
-            )
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
-        async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(
-                supports_upsert=True,
-                supports_delete=True,
-                supports_metadata_filtering=True,
-                max_top_k=100,
-            )
+        async def acapabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -140,9 +146,12 @@ def _make_dummy_translator() -> Any:
 
 def _make_mock_embedding_function(vectors: Optional[List[List[float]]] = None):
     """Create a mock embedding function that returns predefined vectors."""
-    vectors = vectors or [[0.1, 0.2, 0.3, 0.4]]
+    vectors = vectors or [list(SAMPLE_EMBEDDING)]
 
     def embedding_fn(texts: List[str]) -> List[List[float]]:
+        # Default behavior: return one embedding per input text.
+        if len(vectors) == 1:
+            return [list(vectors[0]) for _ in texts]
         return vectors[: len(texts)]
 
     return embedding_fn
@@ -173,12 +182,7 @@ def adapter() -> Any:
             return {"deleted": 1}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(
-                supports_upsert=True,
-                supports_delete=True,
-                supports_metadata_filtering=True,
-                max_top_k=100,
-            )
+            return _make_caps()
 
         def health(self) -> Dict[str, Any]:
             return {"status": "ok"}
@@ -985,8 +989,8 @@ def test_add_texts_calls_translator_upsert(
             called["upsert"] = True
             return {"ids": ["doc-0"], "count": 1}
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1044,8 +1048,8 @@ def test_add_texts_validates_upsert_result(
         def upsert(self, *a: Any, **k: Any) -> Any:
             return {"ids": [], "count": 0}
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1072,8 +1076,8 @@ def test_add_texts_builds_raw_documents_with_metadata(
             captured["raw_documents"] = raw_documents
             return {"ids": ["doc-0"], "count": 1}
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1130,7 +1134,7 @@ async def test_aadd_texts_calls_translator_arun_upsert(
             return {"ids": ["doc-0"], "count": 1}
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1198,7 +1202,7 @@ async def test_aadd_texts_validates_upsert_result(
             return {"ids": [], "count": 0}
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1227,7 +1231,7 @@ async def test_aadd_texts_builds_raw_documents_with_metadata(
             return {"ids": ["doc-0"], "count": 1}
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1373,8 +1377,8 @@ def test_similarity_search_calls_translator_query(
             called["query"] = True
             return {"matches": [], "namespace": "default"}
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1402,8 +1406,8 @@ def test_similarity_search_uses_default_top_k(
             captured["raw_query"] = raw_query
             return {"matches": [], "namespace": "default"}
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1428,8 +1432,8 @@ def test_similarity_search_validates_top_k_against_capabilities(
     """Should raise if exceeds max_top_k."""
 
     class DummyTranslator:
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(max_top_k=10)
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps(max_top_k=10)
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1451,8 +1455,8 @@ def test_similarity_search_validates_filter_support(
     """Should raise if filters not supported."""
 
     class DummyTranslator:
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(supports_metadata_filtering=False)
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps(supports_metadata_filtering=False)
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1483,8 +1487,8 @@ def test_similarity_search_applies_score_threshold(
                 "namespace": "default",
             }
 
-        def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        def capabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1539,8 +1543,8 @@ async def test_asimilarity_search_calls_translator_arun_query(
             called["arun_query"] = True
             return {"matches": [], "namespace": "default"}
 
-        async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        async def acapabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1569,8 +1573,8 @@ async def test_asimilarity_search_uses_default_top_k(
             captured["raw_query"] = raw_query
             return {"matches": [], "namespace": "default"}
 
-        async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        async def acapabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1596,8 +1600,8 @@ async def test_asimilarity_search_validates_top_k_against_capabilities(
     """Should raise if exceeds max_top_k."""
 
     class DummyTranslator:
-        async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(max_top_k=10)
+        async def acapabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps(max_top_k=10)
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1620,8 +1624,8 @@ async def test_asimilarity_search_validates_filter_support(
     """Should raise if filters not supported."""
 
     class DummyTranslator:
-        async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities(supports_metadata_filtering=False)
+        async def acapabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps(supports_metadata_filtering=False)
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1653,8 +1657,8 @@ async def test_asimilarity_search_applies_score_threshold(
                 "namespace": "default",
             }
 
-        async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+        async def acapabilities(self, *a: Any, **k: Any) -> VectorCapabilities:
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1713,7 +1717,7 @@ def test_similarity_search_with_score_includes_scores(
             }
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1768,7 +1772,7 @@ async def test_asimilarity_search_with_score_includes_scores(
             }
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1889,7 +1893,7 @@ def test_query_delegates_to_translator(
             return {"matches": [], "namespace": "default"}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1932,7 +1936,7 @@ async def test_aquery_delegates_to_translator(
             return {"matches": [], "namespace": "default"}
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -1981,7 +1985,7 @@ def test_mmr_search_uses_mmr_config(
             return {"matches": [], "namespace": "default"}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2014,7 +2018,7 @@ def test_mmr_search_requests_vectors(
             return {"matches": [], "namespace": "default"}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2048,7 +2052,7 @@ def test_mmr_search_limits_results_to_k(
             }
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2096,7 +2100,7 @@ async def test_ammr_search_uses_mmr_config(
             return {"matches": [], "namespace": "default"}
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2132,7 +2136,7 @@ def test_delete_by_ids_delegates_to_translator(
             return {"deleted": 1}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2159,7 +2163,7 @@ def test_delete_by_filter_delegates_to_translator(
             return {"deleted": 1}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2195,7 +2199,7 @@ async def test_adelete_delegates_to_translator(
             return {"deleted": 1}
 
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         async def ahealth(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2418,7 +2422,7 @@ def test_health_raises_if_translator_missing_method(
 
     class BadTranslator:
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
     monkeypatch.setattr(
         autogen_adapter_module, "create_vector_translator", lambda *_a, **_k: BadTranslator()
@@ -2454,7 +2458,7 @@ async def test_ahealth_raises_if_translator_missing_method(
 
     class BadTranslator:
         async def acapabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
     monkeypatch.setattr(
         autogen_adapter_module, "create_vector_translator", lambda *_a, **_k: BadTranslator()
@@ -2507,7 +2511,7 @@ def test_close_closes_translator(adapter: Any, monkeypatch: pytest.MonkeyPatch) 
             called["close"] = True
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2538,7 +2542,7 @@ def test_close_closes_adapter_when_owned(adapter: Any, monkeypatch: pytest.Monke
             return {"matches": [], "namespace": "default"}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Dict[str, Any]:
             return {"status": "ok"}
@@ -2676,7 +2680,7 @@ def test_add_texts_error_attaches_context(
             raise RuntimeError("upsert failed")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2712,7 +2716,7 @@ def test_similarity_search_error_attaches_context(
             raise RuntimeError("query failed")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2748,7 +2752,7 @@ def test_mmr_search_error_attaches_context(
             raise RuntimeError("mmr query failed")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2785,7 +2789,7 @@ def test_delete_error_attaches_context(
             raise RuntimeError("delete failed")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2842,7 +2846,7 @@ def test_error_context_includes_framework_autogen(
             raise RuntimeError("test error")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2876,7 +2880,7 @@ def test_error_context_includes_vector_dimension_hint(
             raise RuntimeError("test error")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -2908,7 +2912,7 @@ def test_error_context_extraction_never_raises(
             raise RuntimeError("main error")
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -3194,7 +3198,7 @@ def test_client_passes_conversation_as_framework_ctx(
             return {"matches": [], "namespace": "default"}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
@@ -3408,7 +3412,7 @@ def test_autogen_metadata_field_envelope(
             return {"ids": ["doc-0"], "count": 1}
 
         def capabilities(self) -> VectorCapabilities:
-            return VectorCapabilities()
+            return _make_caps()
 
         def health(self) -> Mapping[str, Any]:
             return {"status": "ok"}
