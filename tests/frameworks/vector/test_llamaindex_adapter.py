@@ -25,6 +25,7 @@ from corpus_sdk.vector.framework_adapters.llamaindex import (
 )
 from corpus_sdk.vector.vector_base import (
     BadRequest,
+    BaseVectorAdapter,
     NotSupported,
     OperationContext,
     QueryResult,
@@ -175,8 +176,28 @@ def _make_dummy_translator() -> Any:
 
 @pytest.fixture
 def adapter() -> Any:
-    """Adapter fixture that satisfies VectorProtocolV1 runtime checks."""
-    return MockVectorAdapter()
+    """Adapter fixture that implements VectorProtocolV1."""
+    
+    class TestVectorAdapter(BaseVectorAdapter):
+        """Minimal test adapter implementing VectorProtocolV1."""
+        
+        def _do_capabilities(self, ctx: Optional[OperationContext] = None) -> VectorCapabilities:
+            return VectorCapabilities(
+                server="test",
+                version="1.0",
+                supports_metadata_filtering=True,
+                max_top_k=100,
+            )
+        
+        async def _do_acapabilities(self, ctx: Optional[OperationContext] = None) -> VectorCapabilities:
+            return VectorCapabilities(
+                server="test",
+                version="1.0",
+                supports_metadata_filtering=True,
+                max_top_k=100,
+            )
+    
+    return TestVectorAdapter()
 
 
 @pytest.fixture
@@ -872,7 +893,7 @@ def test_add_handles_empty_list(adapter: Any) -> None:
 
 
 def test_add_validates_node_embeddings(adapter: Any, TextNode: Any) -> None:
-    """Should raise if node  embedding."""
+    """Should raise if node missing embedding."""
     store = CorpusLlamaIndexVectorStore(corpus_adapter=adapter)
 
     node = TextNode(text="test", id_="node-1")
@@ -1719,7 +1740,7 @@ def test_llamaindex_streaming_yields_nodes_progressively(
                 break
 
 # ---------------------------------------------------------------------------
-#  Metadata/Filter Translation Tests (6 tests)
+ Metadata/Filter Translation Tests (6 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -1806,7 +1827,7 @@ def test_metadata_filters_returns_none_when_empty(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Request Builder Tests (6 tests)
+ Request Builder Tests (6 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -1905,7 +1926,7 @@ def test_build_upsert_request_respects_namespace_override(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Validation Tests (8 tests)
+ Validation Tests (8 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -2037,7 +2058,7 @@ async def test_validate_delete_params_async_raises_without_ids_or_filter(adapter
 
 
 # ---------------------------------------------------------------------------
-#  Query Edge Cases (4 tests)
+ Query Edge Cases (4 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -2086,7 +2107,7 @@ def test_query_stream_raises_without_embedding(adapter: Any, VectorStoreQuery: A
 
 
 # ---------------------------------------------------------------------------
-#  Delete Async Tests (2 tests)
+ Delete Async Tests (2 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -2135,7 +2156,7 @@ async def test_adelete_nodes_delegates_to_translator(
 
 
 # ---------------------------------------------------------------------------
-#  MMR Edge Cases (4 tests)
+ MMR Edge Cases (4 tests)
 # ---------------------------------------------------------------------------
 
 
@@ -2188,7 +2209,7 @@ async def test_aquery_mmr_returns_empty_for_zero_k(adapter: Any, VectorStoreQuer
 
 
 # ---------------------------------------------------------------------------
-#  Vector Store Info Test (1 test)
+ Vector Store Info Test (1 test)
 # ---------------------------------------------------------------------------
 
 
@@ -2203,7 +2224,7 @@ def test_vector_store_info_property(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Apply Score Threshold Test (1 test)
+ Apply Score Threshold Test (1 test)
 # ---------------------------------------------------------------------------
 
 
@@ -2226,7 +2247,7 @@ def test_apply_score_threshold_filters_matches(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Validate Query Result Type Test (1 test)
+ Validate Query Result Type Test (1 test)
 # ---------------------------------------------------------------------------
 
 
@@ -2239,7 +2260,7 @@ def test_validate_query_result_type_raises_on_wrong_type(adapter: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-#  Framework Context Test (1 test)
+ Framework Context Test (1 test)
 # ---------------------------------------------------------------------------
 
 
