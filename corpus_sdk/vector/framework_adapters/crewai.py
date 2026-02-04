@@ -73,7 +73,6 @@ except ImportError:  # pragma: no cover - environments without CrewAI
 from corpus_sdk.vector.vector_base import (
     VectorProtocolV1,
     QueryResult,
-    QueryChunk,
     OperationContext,
     VectorCapabilities,
     # Errors
@@ -103,6 +102,50 @@ logger = logging.getLogger(__name__)
 
 Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# Protocol client wrapper
+# --------------------------------------------------------------------------- #
+
+
+class CorpusCrewAIVectorClient:
+    """VectorProtocolV1-shaped wrapper used by the conformance test suite.
+
+    CrewAI's primary integration surface is a tool (`CorpusCrewAIVectorSearchTool`),
+    but conformance tests expect a wrapper exposing the strict vector surface.
+    """
+
+    def __init__(self, *, adapter: VectorProtocolV1) -> None:
+        self._translator = VectorTranslator(
+            adapter=adapter,
+            framework="crewai",
+            translator=DefaultVectorFrameworkTranslator(),
+        )
+
+    def capabilities(self, *, task: Optional[Any] = None) -> Any:
+        return self._translator.capabilities(framework_ctx=task)
+
+    def health(self, *, task: Optional[Any] = None) -> Any:
+        return self._translator.health(framework_ctx=task)
+
+    def query(self, raw_query: Any, *, task: Optional[Any] = None) -> Any:
+        return self._translator.query(raw_query, framework_ctx=task)
+
+    def batch_query(self, raw_queries: Any, *, task: Optional[Any] = None) -> Any:
+        return self._translator.batch_query(raw_queries, framework_ctx=task)
+
+    def upsert(self, raw_documents: Any, *, task: Optional[Any] = None) -> Any:
+        return self._translator.upsert(raw_documents, framework_ctx=task)
+
+    def delete(self, raw_filter_or_ids: Any, *, task: Optional[Any] = None) -> Any:
+        return self._translator.delete(raw_filter_or_ids, framework_ctx=task)
+
+    def create_namespace(self, name: str, *, task: Optional[Any] = None) -> Any:
+        return self._translator.create_namespace(name, framework_ctx=task)
+
+    def delete_namespace(self, name: str, *, task: Optional[Any] = None) -> Any:
+        return self._translator.delete_namespace(name, framework_ctx=task)
 
 
 # --------------------------------------------------------------------------- #
@@ -516,7 +559,7 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         protocol results:
 
         - QueryResult is returned as-is
-        - QueryChunk is returned as-is
+        - Query chunks are returned as-is
         """
 
         def translate_query_result(
@@ -530,11 +573,11 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
 
         def translate_query_chunk(
             self,
-            chunk: QueryChunk,
+            chunk: Any,
             *,
             op_ctx: OperationContext,
             framework_ctx: Optional[Any] = None,
-        ) -> QueryChunk:
+        ) -> Any:
             return chunk
 
     @cached_property
@@ -822,9 +865,12 @@ class CorpusCrewAIVectorSearchTool(BaseTool):
         chunk: Any,
         *,
         operation: str,
-    ) -> QueryChunk:
-        """Validate that the translator returned a QueryChunk for streaming."""
-        if not isinstance(chunk, QueryChunk):
+    ) -> Any:
+        """Validate that the translator returned a usable streaming chunk."""
+        matches = getattr(chunk, "matches", None)
+        if matches is None and isinstance(chunk, Mapping):
+            matches = chunk.get("matches")
+        if matches is None:
             raise BadRequest(
                 f"{operation} yielded unsupported chunk type: {type(chunk).__name__}",
                 code=ErrorCodes.BAD_STREAM_CHUNK,
