@@ -516,6 +516,45 @@ class AutoGenDocument:
 # --------------------------------------------------------------------------- #
 
 
+class CorpusAutoGenVectorClient:
+    """VectorProtocolV1-shaped wrapper.
+
+    AutoGen integrations primarily use `CorpusAutoGenVectorStore` / tools, but
+    conformance tests expect a strict vector protocol surface.
+    """
+
+    def __init__(self, *, adapter: VectorProtocolV1) -> None:
+        self._translator = create_vector_translator(
+            adapter=adapter,
+            framework="autogen",
+            translator=None,
+        )
+
+    def capabilities(self, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.capabilities(framework_ctx=conversation)
+
+    def health(self, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.health(framework_ctx=conversation)
+
+    def query(self, raw_query: Any, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.query(raw_query, framework_ctx=conversation)
+
+    def batch_query(self, raw_queries: Any, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.batch_query(raw_queries, framework_ctx=conversation)
+
+    def upsert(self, raw_documents: Any, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.upsert(raw_documents, framework_ctx=conversation)
+
+    def delete(self, raw_filter_or_ids: Any, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.delete(raw_filter_or_ids, framework_ctx=conversation)
+
+    def create_namespace(self, name: str, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.create_namespace(name, framework_ctx=conversation)
+
+    def delete_namespace(self, name: str, *, conversation: Optional[Any] = None) -> Any:
+        return self._translator.delete_namespace(name, framework_ctx=conversation)
+
+
 class CorpusAutoGenVectorStore:
     """
     AutoGen-friendly vector store backed by a Corpus `VectorProtocolV1`
