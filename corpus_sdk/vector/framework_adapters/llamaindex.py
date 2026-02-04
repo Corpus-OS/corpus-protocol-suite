@@ -664,8 +664,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         this information for query planning and tool descriptions in agent workflows.
         """
         return VectorStoreInfo(
-            name="corpus",
-            description="Corpus VectorProtocol-backed vector store for LlamaIndex.",
+            content_info="Vector store content",
             metadata_info=[
                 MetadataInfo(
                     name=self.node_id_field,
@@ -957,9 +956,13 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
 
         for node in nodes:
             # Extract embedding - LlamaIndex should have computed this already
-            embedding = (
-                node.get_embedding() if hasattr(node, "get_embedding") else None
-            )
+            embedding = None
+            if hasattr(node, "get_embedding"):
+                try:
+                    embedding = node.get_embedding()
+                except ValueError:
+                    # get_embedding() raises ValueError if embedding is None
+                    embedding = None
             if embedding is None:
                 embedding = getattr(node, "embedding", None)
             if embedding is None:
@@ -979,7 +982,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
             metadata = node_to_metadata_dict(
                 node,
                 remove_text=False,
-                mode=MetadataMode.ALL,
+                flat_metadata=self.flat_metadata,
             )
 
             # Ensure reserved keys are populated for proper node reconstruction
@@ -1112,34 +1115,35 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
                 if key is None:
                     continue
 
-                op_name = str(operator).upper() if operator is not None else "EQ"
+                # Extract operator value (e.g., FilterOperator.EQ -> "==")
+                op_value = operator.value if operator is not None and hasattr(operator, "value") else "=="
 
-                if op_name in ("EQ", "=="):
+                if op_value in ("==", "EQ"):
                     clauses.append({key: value})
-                elif op_name in ("NE", "!="):
+                elif op_value in ("!=", "NE"):
                     clauses.append({key: {"$ne": value}})
-                elif op_name in ("IN", "ANY"):
+                elif op_value in ("in", "IN", "ANY"):
                     if isinstance(value, (list, tuple, set)):
                         clauses.append({key: {"$in": list(value)}})
                     else:
                         clauses.append({key: {"$in": [value]}})
-                elif op_name in ("NIN", "NOT_IN"):
+                elif op_value in ("nin", "NIN", "NOT_IN"):
                     if isinstance(value, (list, tuple, set)):
                         clauses.append({key: {"$nin": list(value)}})
                     else:
                         clauses.append({key: {"$nin": [value]}})
-                elif op_name == "GT":
+                elif op_value in (">", "GT"):
                     clauses.append({key: {"$gt": value}})
-                elif op_name == "GTE":
+                elif op_value in (">=", "GTE"):
                     clauses.append({key: {"$gte": value}})
-                elif op_name == "LT":
+                elif op_value in ("<", "LT"):
                     clauses.append({key: {"$lt": value}})
-                elif op_name == "LTE":
+                elif op_value in ("<=", "LTE"):
                     clauses.append({key: {"$lte": value}})
                 else:
                     logger.debug(
                         "Unsupported metadata filter operator %r for key=%r; skipping",
-                        op_name,
+                        op_value,
                         key,
                     )
 
@@ -2132,7 +2136,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         namespace: Optional[str] = kwargs.get("namespace")
         ctx, framework_ctx = self._build_contexts(namespace=namespace, **kwargs)
 
-        k_raw = query.similarity_top_k or self.default_top_k
+        k_raw = query.similarity_top_k if query.similarity_top_k is not None else self.default_top_k
         k = int(k_raw)
         if k <= 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
@@ -2256,7 +2260,7 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         namespace: Optional[str] = kwargs.get("namespace")
         ctx, framework_ctx = self._build_contexts(namespace=namespace, **kwargs)
 
-        k_raw = query.similarity_top_k or self.default_top_k
+        k_raw = query.similarity_top_k if query.similarity_top_k is not None else self.default_top_k
         k = int(k_raw)
         if k <= 0:
             return VectorStoreQueryResult(nodes=[], similarities=[], ids=[])
