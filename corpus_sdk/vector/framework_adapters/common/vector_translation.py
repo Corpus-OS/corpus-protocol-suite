@@ -724,6 +724,102 @@ class DefaultVectorFrameworkTranslator:
             "usage": dict(chunk.usage or {}) if chunk.usage is not None else None,
         }
 
+    def build_batch_query_specs(
+        self,
+        raw_queries: Any,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> List[VectorQuerySpec]:
+        """
+        Build a list of VectorQuerySpec for batch query.
+
+        This is a convenience for wrappers that expose a batch_query surface.
+        It intentionally reuses build_query_spec to preserve validation, filter
+        normalization, and namespace resolution behavior.
+        """
+        if isinstance(raw_queries, (list, tuple)):
+            return [
+                self.build_query_spec(q, op_ctx=op_ctx, framework_ctx=framework_ctx, stream=False)
+                for q in raw_queries
+            ]
+        # Allow passing a single query object; normalize to a single-item batch.
+        return [self.build_query_spec(raw_queries, op_ctx=op_ctx, framework_ctx=framework_ctx, stream=False)]
+
+    def translate_batch_query_results(
+        self,
+        results: Sequence[QueryResult],
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Translate a batch of QueryResult objects to a framework-facing shape.
+
+        Default behavior: return a list of per-query translated results,
+        preserving the same output shape as translate_query_result.
+        """
+        return [
+            self.translate_query_result(r, op_ctx=op_ctx, framework_ctx=framework_ctx)
+            for r in results
+        ]
+
+    def translate_capabilities(
+        self,
+        capabilities: Any,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """
+        Translate adapter capabilities to a framework-facing shape.
+
+        Default behavior: passthrough as-is. Framework translators may override.
+        """
+        return capabilities
+
+    def translate_health(
+        self,
+        health: Any,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """
+        Translate adapter health to a framework-facing shape.
+
+        Default behavior: passthrough as-is. Framework translators may override.
+        """
+        return health
+
+    def translate_create_namespace_result(
+        self,
+        result: Any,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """
+        Translate create_namespace result to a framework-facing shape.
+
+        Default behavior: passthrough as-is.
+        """
+        return result
+
+    def translate_delete_namespace_result(
+        self,
+        result: Any,
+        *,
+        op_ctx: OperationContext,  # noqa: ARG002
+        framework_ctx: Optional[Any] = None,  # noqa: ARG002
+    ) -> Any:
+        """
+        Translate delete_namespace result to a framework-facing shape.
+
+        Default behavior: passthrough as-is.
+        """
+        return result
+
     # ---- mutation translation ----
 
     def build_upsert_spec(
@@ -1222,6 +1318,67 @@ class VectorTranslator:
     # API Implementations (DRY via Executor)
     # --------------------------------------------------------------------- #
 
+    def capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Synchronous capabilities API.
+
+        This method exists to support strict wrapper-level conformance tests.
+        It calls into the adapter capabilities surface and allows the translator
+        to post-process or reshape the response for framework-facing needs.
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                caps = await self._adapter.capabilities(ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            # Translator hook is optional; default translator provides passthrough.
+            translate = getattr(self._translator, "translate_capabilities", None)
+            if callable(translate):
+                return translate(caps, op_ctx=ctx, framework_ctx=framework_ctx)
+            return caps
+
+        return self._run_operation(
+            op_name="capabilities",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_capabilities(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async capabilities API."""
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                caps = await self._adapter.capabilities(ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_capabilities", None)
+            if callable(translate):
+                return translate(caps, op_ctx=ctx, framework_ctx=framework_ctx)
+            return caps
+
+        return await self._run_operation(
+            op_name="capabilities",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
     def query(
         self,
         raw_query: Any,
@@ -1312,6 +1469,176 @@ class VectorTranslator:
 
         return await self._run_operation(
             op_name="query",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def batch_query(
+        self,
+        raw_queries: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+        mmr_config: Optional[MMRConfig] = None,
+    ) -> Any:
+        """
+        Synchronous batch_query API.
+
+        Batch query is a strict wrapper-level surface expected by conformance tests.
+        This implementation:
+            - Builds VectorQuerySpec objects via the translator (or falls back to per-item build_query_spec),
+            - Calls adapter.batch_query when available, otherwise performs a safe sequential fallback
+              using adapter.query (preserving error mapping and MMR behavior per result),
+            - Translates results via the translator (or returns a simple list).
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            build_specs = getattr(self._translator, "build_batch_query_specs", None)
+            if callable(build_specs):
+                specs = build_specs(raw_queries, op_ctx=ctx, framework_ctx=framework_ctx)
+            else:
+                if isinstance(raw_queries, (list, tuple)):
+                    specs = [
+                        self._translator.build_query_spec(q, op_ctx=ctx, framework_ctx=framework_ctx, stream=False)
+                        for q in raw_queries
+                    ]
+                else:
+                    specs = [self._translator.build_query_spec(raw_queries, op_ctx=ctx, framework_ctx=framework_ctx, stream=False)]
+
+            results: List[QueryResult] = []
+
+            batch_fn = getattr(self._adapter, "batch_query", None)
+            if callable(batch_fn):
+                try:
+                    batch_results = await batch_fn(specs, ctx=ctx)
+                except VectorAdapterError as e:
+                    raise self._translator.map_adapter_error(
+                        e, op_ctx=ctx, framework_ctx=framework_ctx
+                    ) from e
+
+                # Defensive validation: conformance tests depend on truthful output types.
+                if not isinstance(batch_results, (list, tuple)):
+                    raise BadRequest(
+                        f"Invalid batch_query result type: {type(batch_results)}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                for r in batch_results:
+                    if not isinstance(r, QueryResult):
+                        raise BadRequest(
+                            f"Invalid batch_query element type: {type(r)}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
+                    results.append(r)
+            else:
+                # Fallback path: call query sequentially to preserve deterministic behavior.
+                for spec in specs:
+                    try:
+                        r = await self._adapter.query(spec, ctx=ctx)
+                    except VectorAdapterError as e:
+                        raise self._translator.map_adapter_error(
+                            e, op_ctx=ctx, framework_ctx=framework_ctx
+                        ) from e
+                    if not isinstance(r, QueryResult):
+                        raise BadRequest(
+                            f"Invalid result type: {type(r)}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
+                    results.append(r)
+
+            # Apply MMR per-result (MMR is a post-processing step, not a protocol behavior).
+            if mmr_config is not None and mmr_config.enabled:
+                results = [self._apply_mmr_to_query_result(r, mmr_config) for r in results]
+
+            translate_batch = getattr(self._translator, "translate_batch_query_results", None)
+            if callable(translate_batch):
+                return translate_batch(results, op_ctx=ctx, framework_ctx=framework_ctx)
+
+            return [
+                self._translator.translate_query_result(r, op_ctx=ctx, framework_ctx=framework_ctx)
+                for r in results
+            ]
+
+        return self._run_operation(
+            op_name="batch_query",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_batch_query(
+        self,
+        raw_queries: Any,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+        mmr_config: Optional[MMRConfig] = None,
+    ) -> Any:
+        """Async batch_query API."""
+        async def _logic(ctx: OperationContext) -> Any:
+            build_specs = getattr(self._translator, "build_batch_query_specs", None)
+            if callable(build_specs):
+                specs = build_specs(raw_queries, op_ctx=ctx, framework_ctx=framework_ctx)
+            else:
+                if isinstance(raw_queries, (list, tuple)):
+                    specs = [
+                        self._translator.build_query_spec(q, op_ctx=ctx, framework_ctx=framework_ctx, stream=False)
+                        for q in raw_queries
+                    ]
+                else:
+                    specs = [self._translator.build_query_spec(raw_queries, op_ctx=ctx, framework_ctx=framework_ctx, stream=False)]
+
+            results: List[QueryResult] = []
+
+            batch_fn = getattr(self._adapter, "batch_query", None)
+            if callable(batch_fn):
+                try:
+                    batch_results = await batch_fn(specs, ctx=ctx)
+                except VectorAdapterError as e:
+                    raise self._translator.map_adapter_error(
+                        e, op_ctx=ctx, framework_ctx=framework_ctx
+                    ) from e
+
+                if not isinstance(batch_results, (list, tuple)):
+                    raise BadRequest(
+                        f"Invalid batch_query result type: {type(batch_results)}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                for r in batch_results:
+                    if not isinstance(r, QueryResult):
+                        raise BadRequest(
+                            f"Invalid batch_query element type: {type(r)}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
+                    results.append(r)
+            else:
+                for spec in specs:
+                    try:
+                        r = await self._adapter.query(spec, ctx=ctx)
+                    except VectorAdapterError as e:
+                        raise self._translator.map_adapter_error(
+                            e, op_ctx=ctx, framework_ctx=framework_ctx
+                        ) from e
+                    if not isinstance(r, QueryResult):
+                        raise BadRequest(
+                            f"Invalid result type: {type(r)}",
+                            code="BAD_ADAPTER_RESULT",
+                        )
+                    results.append(r)
+
+            if mmr_config is not None and mmr_config.enabled:
+                results = [self._apply_mmr_to_query_result(r, mmr_config) for r in results]
+
+            translate_batch = getattr(self._translator, "translate_batch_query_results", None)
+            if callable(translate_batch):
+                return translate_batch(results, op_ctx=ctx, framework_ctx=framework_ctx)
+
+            return [
+                self._translator.translate_query_result(r, op_ctx=ctx, framework_ctx=framework_ctx)
+                for r in results
+            ]
+
+        return await self._run_operation(
+            op_name="batch_query",
             op_ctx=op_ctx,
             sync=False,
             logic=_logic,
@@ -1562,6 +1889,187 @@ class VectorTranslator:
 
         return await self._run_operation(
             op_name="update",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def create_namespace(
+        self,
+        name: str,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Synchronous create_namespace API.
+
+        Namespace operations are part of the strict wrapper-level surface in the
+        conformance suite; backend support may still be capability-gated.
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                result = await self._adapter.create_namespace(name, ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_create_namespace_result", None)
+            if callable(translate):
+                return translate(result, op_ctx=ctx, framework_ctx=framework_ctx)
+            return result
+
+        return self._run_operation(
+            op_name="create_namespace",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_create_namespace(
+        self,
+        name: str,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async create_namespace API."""
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                result = await self._adapter.create_namespace(name, ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_create_namespace_result", None)
+            if callable(translate):
+                return translate(result, op_ctx=ctx, framework_ctx=framework_ctx)
+            return result
+
+        return await self._run_operation(
+            op_name="create_namespace",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def delete_namespace(
+        self,
+        name: str,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Synchronous delete_namespace API.
+
+        Namespace operations are part of the strict wrapper-level surface in the
+        conformance suite; backend support may still be capability-gated.
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                result = await self._adapter.delete_namespace(name, ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_delete_namespace_result", None)
+            if callable(translate):
+                return translate(result, op_ctx=ctx, framework_ctx=framework_ctx)
+            return result
+
+        return self._run_operation(
+            op_name="delete_namespace",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_delete_namespace(
+        self,
+        name: str,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async delete_namespace API."""
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                result = await self._adapter.delete_namespace(name, ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_delete_namespace_result", None)
+            if callable(translate):
+                return translate(result, op_ctx=ctx, framework_ctx=framework_ctx)
+            return result
+
+        return await self._run_operation(
+            op_name="delete_namespace",
+            op_ctx=op_ctx,
+            sync=False,
+            logic=_logic,
+        )
+
+    def health(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """
+        Synchronous health API.
+
+        Health is part of the strict wrapper-level surface; the adapter determines
+        how to implement health checks and what structure to return.
+        """
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                h = await self._adapter.health(ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_health", None)
+            if callable(translate):
+                return translate(h, op_ctx=ctx, framework_ctx=framework_ctx)
+            return h
+
+        return self._run_operation(
+            op_name="health",
+            op_ctx=op_ctx,
+            sync=True,
+            logic=_logic,
+        )
+
+    async def arun_health(
+        self,
+        *,
+        op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
+        framework_ctx: Optional[Any] = None,
+    ) -> Any:
+        """Async health API."""
+        async def _logic(ctx: OperationContext) -> Any:
+            try:
+                h = await self._adapter.health(ctx=ctx)  # type: ignore[attr-defined]
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            translate = getattr(self._translator, "translate_health", None)
+            if callable(translate):
+                return translate(h, op_ctx=ctx, framework_ctx=framework_ctx)
+            return h
+
+        return await self._run_operation(
+            op_name="health",
             op_ctx=op_ctx,
             sync=False,
             logic=_logic,
