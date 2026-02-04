@@ -53,6 +53,7 @@ from typing import (
     Any,
     AsyncIterator,
     Dict,
+    Iterator,
     List,
     Mapping,
     Optional,
@@ -63,9 +64,6 @@ from typing import (
     Tuple,
     TypeVar,
 )
-
-from corpus_sdk.core.async_bridge import AsyncBridge
-from corpus_sdk.core.sync_bridge import SyncStreamBridge
 
 from corpus_sdk.core.context_translation import (
     from_dict as context_from_dict,
@@ -310,6 +308,7 @@ def _extract_dynamic_context(
                 stream = operation in (
                     "get_streaming_chat_message_content",
                     "get_streaming_chat_message_contents",
+                    "get_streaming_chat_message_content_sync",
                 )
                 ctx, params, model_for_context, _ = instance._build_request_context(  # type: ignore[attr-defined]
                     settings,
@@ -438,6 +437,37 @@ def with_async_llm_error_context(
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """Decorator for async LLM methods with rich dynamic context extraction."""
     return _create_error_context_decorator(operation, is_async=True)(**static_context)
+
+
+# ---------------------------------------------------------------------------
+# Event loop guards for sync APIs
+# ---------------------------------------------------------------------------
+
+
+def _ensure_not_in_event_loop(
+    sync_api_name: str,
+    async_api_name: Optional[str] = None,
+) -> None:
+    """
+    Prevent deadlocks from calling sync APIs inside an active asyncio event loop.
+
+    This is a lightweight guard used only on sync entrypoints. If a running
+    event loop is detected, we raise a clear RuntimeError with guidance to
+    use the async variant instead.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        # No running loop: safe to call sync API.
+        return
+
+    hint = ""
+    if async_api_name:
+        hint = f" Use the async variant instead (e.g. '{async_api_name}')."
+    raise RuntimeError(
+        f"{sync_api_name} was called from inside an active asyncio event loop."
+        f"{hint} [SEMANTIC_KERNEL_LLM_SYNC_WRAPPER_CALLED_IN_EVENT_LOOP]"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -596,6 +626,36 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
             service_id or "default",
             self.framework_version or "unknown",
         )
+
+    # ------------------------------------------------------------------ #
+    # Resource management (context managers)
+    # ------------------------------------------------------------------ #
+
+    def __enter__(self) -> "CorpusSemanticKernelChatCompletion":
+        """Support sync context manager protocol for resource cleanup."""
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Clean up resources when exiting sync context."""
+        close = getattr(self.llm_adapter, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while closing LLM adapter in __exit__: %s", exc)
+
+    async def __aenter__(self) -> "CorpusSemanticKernelChatCompletion":
+        """Support async context manager protocol."""
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        """Clean up resources when exiting async context."""
+        aclose = getattr(self.llm_adapter, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Error while async-closing LLM adapter in __aexit__: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Internal validation / helpers
@@ -933,7 +993,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         **kwargs: Any,
     ) -> "ChatMessageContent":
         """
-        Execute a single chat completion call via LLMTranslator.
+        Execute a single async chat completion call via LLMTranslator.
 
         The Semantic Kernel framework translator is responsible for turning
         the raw messages + completion into `ChatMessageContent`.
@@ -968,27 +1028,52 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         )
         return cast("ChatMessageContent", result)
 
+    @with_llm_error_context("get_chat_message_content_sync")
     def get_chat_message_content_sync(
         self,
         chat_history: "ChatHistory",
         settings: Any = None,
         **kwargs: Any,
     ) -> "ChatMessageContent":
-        """Synchronous wrapper around `get_chat_message_content`.
-
-        This exists primarily for registry parity so that frameworks declaring
-        async completion also have a sync entrypoint.
         """
-        return cast(
-            "ChatMessageContent",
-            AsyncBridge.run_async(
-                self.get_chat_message_content(
-                    chat_history,
-                    settings=settings,
-                    **kwargs,
-                )
-            ),
+        Synchronous chat completion call via LLMTranslator.
+
+        Calls translator.complete() directly (no AsyncBridge).
+        """
+        _ensure_not_in_event_loop(
+            "get_chat_message_content_sync",
+            "get_chat_message_content",
         )
+
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_chat_history(chat_history)
+
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            settings,
+            kwargs,
+            operation="get_chat_message_content_sync",
+            stream=False,
+        )
+
+        # Convert SK chat history to generic dicts for translator
+        normalized_messages = self._to_translator_messages(chat_history)
+
+        result = self._translator.complete(
+            raw_messages=normalized_messages,
+            model=params.get("model"),
+            max_tokens=params.get("max_tokens"),
+            temperature=params.get("temperature"),
+            top_p=params.get("top_p"),
+            frequency_penalty=params.get("frequency_penalty"),
+            presence_penalty=params.get("presence_penalty"),
+            stop_sequences=params.get("stop_sequences"),
+            tools=kwargs.get("tools"),
+            tool_choice=kwargs.get("tool_choice"),
+            system_message=kwargs.get("system_message"),
+            op_ctx=ctx,
+            framework_ctx=framework_ctx,
+        )
+        return cast("ChatMessageContent", result)
 
     @with_async_llm_error_context("get_chat_message_contents")
     async def get_chat_message_contents(
@@ -1012,7 +1097,7 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
         **kwargs: Any,
     ) -> AsyncIterator["StreamingChatMessageContent"]:
         """
-        Streaming chat completion via LLMTranslator.
+        Async streaming chat completion via LLMTranslator.
 
         Yields incremental StreamingChatMessageContent chunks compatible
         with Semantic Kernel's streaming APIs. The SK framework translator
@@ -1082,31 +1167,82 @@ class CorpusSemanticKernelChatCompletion(ChatCompletionClientBase):
                             exc_info=True,
                         )
 
+    @with_llm_error_context("get_streaming_chat_message_content_sync")
     def get_streaming_chat_message_content_sync(
         self,
         chat_history: "ChatHistory",
         settings: Any = None,
         **kwargs: Any,
-    ) -> "Any":
-        """Synchronous streaming wrapper around `get_streaming_chat_message_content`.
-
-        Uses `SyncStreamBridge` to avoid nested event loops and to provide a
-        deterministic sync iterator surface for the conformance registry.
+    ) -> Iterator["StreamingChatMessageContent"]:
         """
-        bridge = SyncStreamBridge(
-            coro_factory=lambda: self.get_streaming_chat_message_content(
-                chat_history,
-                settings=settings,
-                **kwargs,
-            ),
-            framework=_FRAMEWORK_NAME,
-            error_context={
-                "operation": "get_streaming_chat_message_content_sync",
-                "model": getattr(self, "model", "default"),
-                "stream": True,
-            },
+        Synchronous streaming chat completion via LLMTranslator.
+
+        Calls translator.stream() directly (no SyncStreamBridge).
+        """
+        _ensure_not_in_event_loop(
+            "get_streaming_chat_message_content_sync",
+            "get_streaming_chat_message_content",
         )
-        return bridge.run()
+
+        if getattr(self, "_validate_inputs_flag", True):
+            self._validate_chat_history(chat_history)
+
+        ctx, params, model_for_context, framework_ctx = self._build_request_context(
+            settings,
+            kwargs,
+            operation="get_streaming_chat_message_content_sync",
+            stream=True,
+        )
+
+        # Convert SK chat history to generic dicts for translator
+        normalized_messages = self._to_translator_messages(chat_history)
+
+        # Call sync stream method directly
+        gen: Optional[Iterator[Any]] = None
+        try:
+            gen = self._translator.stream(
+                raw_messages=normalized_messages,
+                model=params.get("model"),
+                max_tokens=params.get("max_tokens"),
+                temperature=params.get("temperature"),
+                top_p=params.get("top_p"),
+                frequency_penalty=params.get("frequency_penalty"),
+                presence_penalty=params.get("presence_penalty"),
+                stop_sequences=params.get("stop_sequences"),
+                tools=kwargs.get("tools"),
+                tool_choice=kwargs.get("tool_choice"),
+                system_message=kwargs.get("system_message"),
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
+
+            for chunk in gen:
+                yield cast("StreamingChatMessageContent", chunk)
+        except Exception as exc:  # noqa: BLE001
+            attach_context(
+                exc,
+                framework=_FRAMEWORK_NAME,
+                operation="llm_get_streaming_chat_message_content_sync",
+                resource_type="llm",
+                stream=True,
+                model=str(params.get("model", self.model)),
+                request_id=getattr(ctx, "request_id", None),
+                tenant=getattr(ctx, "tenant", None),
+                error_codes=ERROR_CODES,
+            )
+            raise
+        finally:
+            # Best-effort cleanup
+            if gen is not None:
+                close_method = getattr(gen, "close", None)
+                if close_method and callable(close_method):
+                    try:
+                        close_method()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close Semantic Kernel sync streaming generator",
+                            exc_info=True,
+                        )
 
     @with_async_llm_error_context("get_streaming_chat_message_contents")
     async def get_streaming_chat_message_contents(
