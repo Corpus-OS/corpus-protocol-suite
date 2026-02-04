@@ -120,7 +120,6 @@ from corpus_sdk.vector.vector_base import (
     Vector,
     VectorMatch,
     QueryResult,
-    QueryChunk,
     UpsertResult,
     DeleteResult,
     OperationContext,
@@ -1248,7 +1247,10 @@ class MCPVectorService:
                 op_ctx=ctx,
                 framework_ctx=framework_ctx,
             ):
-                if not isinstance(chunk, QueryChunk):
+                raw_matches_obj = getattr(chunk, "matches", None)
+                if raw_matches_obj is None and isinstance(chunk, Mapping):
+                    raw_matches_obj = chunk.get("matches")
+                if raw_matches_obj is None:
                     err = VectorAdapterError(
                         f"VectorTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
                         code="BAD_STREAM_CHUNK",
@@ -1263,7 +1265,7 @@ class MCPVectorService:
                     )
                     raise err
 
-                raw_matches = list(chunk.matches or [])
+                raw_matches = list(raw_matches_obj or [])
                 filtered_matches = self._apply_score_threshold(raw_matches)
 
                 if not filtered_matches:
