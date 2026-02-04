@@ -89,7 +89,7 @@ from functools import cached_property, wraps
 from threading import RLock
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Sequence, Tuple
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 
 from llama_index.core.schema import (
     BaseNode,
@@ -335,7 +335,7 @@ def _build_delete_context(
 
 
 _OPERATION_CONTEXT_BUILDERS: Dict[
-    str, Callable[[Tuple[Any, ...], Dict[str, Any]], Dict[str, Any]]
+    str, callable
 ] = {
     # Add operations
     "add_sync": _build_add_context,
@@ -551,12 +551,11 @@ class CorpusLlamaIndexVectorStore(BasePydanticVectorStore):
         ),
     )
 
-    # Cached capabilities (lazy-loaded)
-    _caps: Optional[VectorCapabilities] = None
-
-    # Vector dimension hint for consistency checks (first-write-wins)
-    _vector_dim_hint: Optional[int] = None
-    _dim_lock: RLock = RLock()
+    # Private attributes using PrivateAttr to avoid Pydantic deepcopy issues
+    # These are not part of the model schema and won't be validated/serialized
+    _caps: Optional[VectorCapabilities] = PrivateAttr(default=None)
+    _vector_dim_hint: Optional[int] = PrivateAttr(default=None)
+    _dim_lock: RLock = PrivateAttr(default_factory=RLock)
 
     # Pydantic v2-style config
     model_config = {"arbitrary_types_allowed": True}
