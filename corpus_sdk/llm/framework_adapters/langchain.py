@@ -55,6 +55,7 @@ This keeps framework adapters consistent across LangChain/LlamaIndex/SK/etc.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 from dataclasses import dataclass
 from functools import wraps
@@ -358,15 +359,50 @@ def _create_error_context_decorator(
         def decorator(func: Callable[..., T]) -> Callable[..., T]:
             if is_async:
 
+                # IMPORTANT: if we decorate an async generator function with an
+                # `async def` wrapper, callers would need to `await` it to get the
+                # async iterator, which breaks LangChain's expected pattern:
+                # `async for chunk in self._astream(...)`.
+                #
+                # So for async generators, return an async *generator* wrapper.
+                if inspect.isasyncgenfunction(func):
+
+                    @wraps(func)
+                    async def asyncgen_wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+                        inner = None
+                        try:
+                            inner = func(self, *args, **kwargs)
+                            async for item in inner:
+                                yield item
+                        except Exception as exc:  # noqa: BLE001
+                            dynamic_ctx = _extract_dynamic_context(self, args, kwargs, operation)
+                            full_ctx = {**static_context, **dynamic_ctx}
+                            full_ctx.pop("operation", None)
+                            attach_context(
+                                exc,
+                                framework=_FRAMEWORK_NAME,
+                                operation=f"llm_{operation}",
+                                **full_ctx,
+                            )
+                            raise
+                        finally:
+                            # Best-effort cleanup: if the caller cancels early and closes
+                            # the outer generator, ensure the wrapped generator is also
+                            # closed so downstream streams can release resources.
+                            if inner is not None:
+                                aclose = getattr(inner, "aclose", None)
+                                if callable(aclose):
+                                    try:
+                                        await aclose()
+                                    except Exception:
+                                        pass
+
+                    return asyncgen_wrapper  # type: ignore[return-value]
+
                 @wraps(func)
                 async def async_wrapper(self: Any, *args: Any, **kwargs: Any) -> T:
                     try:
-                        result = func(self, *args, **kwargs)
-                        # If the function returns an async iterator (async generator),
-                        # do not await it. This preserves "true streaming" semantics.
-                        if hasattr(result, "__aiter__"):
-                            return result
-                        return await result
+                        return await func(self, *args, **kwargs)
                     except Exception as exc:  # noqa: BLE001
                         dynamic_ctx = _extract_dynamic_context(self, args, kwargs, operation)
                         full_ctx = {**static_context, **dynamic_ctx}
@@ -994,12 +1030,14 @@ class CorpusLangChainLLM(BaseChatModel):
         model_for_context = params.get("model", self.model)
 
         if run_manager is not None:
-            await run_manager.on_llm_start(
-                self,
-                messages,
-                invocation_params=params,
-                run_id=ctx.request_id,
-            )
+            on_start = getattr(run_manager, "on_llm_start", None)
+            if callable(on_start):
+                await on_start(
+                    self,
+                    messages,
+                    invocation_params=params,
+                    run_id=ctx.request_id,
+                )
 
         try:
             result = await self._translator.arun_complete(
@@ -1053,12 +1091,14 @@ class CorpusLangChainLLM(BaseChatModel):
         model_for_context = params.get("model", self.model)
 
         if run_manager is not None:
-            await run_manager.on_llm_start(
-                self,
-                messages,
-                invocation_params=params,
-                run_id=ctx.request_id,
-            )
+            on_start = getattr(run_manager, "on_llm_start", None)
+            if callable(on_start):
+                await on_start(
+                    self,
+                    messages,
+                    invocation_params=params,
+                    run_id=ctx.request_id,
+                )
 
         stream_canceled = False
         agen: Optional[AsyncIterator[Any]] = None
@@ -1084,17 +1124,17 @@ class CorpusLangChainLLM(BaseChatModel):
             async for chunk in agen:
                 gen_chunk = CorpusLangChainLLM._ensure_generation_chunk(chunk)
                 text = gen_chunk.message.content or ""
+                yield gen_chunk
 
                 if run_manager is not None and text:
                     try:
                         await run_manager.on_llm_new_token(text, chunk=gen_chunk)
                     except Exception as callback_error:  # noqa: BLE001
-                        # Callback failures should not crash the stream; mark canceled and unwind.
+                        # Callback failures should not crash the stream; stop after yielding
+                        # the current chunk so consumers still see partial output.
                         logger.warning("LLM new token callback failed: %s", callback_error)
                         stream_canceled = True
                         break
-
-                yield gen_chunk
         except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
@@ -1168,12 +1208,14 @@ class CorpusLangChainLLM(BaseChatModel):
         model_for_context = params.get("model", self.model)
 
         if run_manager is not None:
-            run_manager.on_llm_start(
-                self,
-                messages,
-                invocation_params=params,
-                run_id=ctx.request_id,
-            )
+            on_start = getattr(run_manager, "on_llm_start", None)
+            if callable(on_start):
+                on_start(
+                    self,
+                    messages,
+                    invocation_params=params,
+                    run_id=ctx.request_id,
+                )
 
         try:
             result = self._translator.complete(
@@ -1233,12 +1275,14 @@ class CorpusLangChainLLM(BaseChatModel):
         model_for_context = params.get("model", self.model)
 
         if run_manager is not None:
-            run_manager.on_llm_start(
-                self,
-                messages,
-                invocation_params=params,
-                run_id=ctx.request_id,
-            )
+            on_start = getattr(run_manager, "on_llm_start", None)
+            if callable(on_start):
+                on_start(
+                    self,
+                    messages,
+                    invocation_params=params,
+                    run_id=ctx.request_id,
+                )
 
         stream_canceled = False
         iterator: Optional[Iterator[Any]] = None
@@ -1263,6 +1307,7 @@ class CorpusLangChainLLM(BaseChatModel):
             for chunk in iterator:
                 gen_chunk = CorpusLangChainLLM._ensure_generation_chunk(chunk)
                 text = gen_chunk.message.content or ""
+                yield gen_chunk
 
                 if run_manager is not None and text:
                     try:
@@ -1271,8 +1316,6 @@ class CorpusLangChainLLM(BaseChatModel):
                         logger.warning("LLM new token callback failed: %s", callback_error)
                         stream_canceled = True
                         break
-
-                yield gen_chunk
         except Exception as exc:  # noqa: BLE001
             attach_context(
                 exc,
