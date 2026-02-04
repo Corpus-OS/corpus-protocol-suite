@@ -217,7 +217,13 @@ class VectorFrameworkDescriptor:
             raise ValueError(f"{self.name}: adapter_init_kwarg must be a non-empty string")
 
         # Required: core operations must exist (async protocol).
-        for field_name in ("capabilities_method", "query_method", "upsert_method", "delete_method", "health_method"):
+        for field_name in (
+            "capabilities_method",
+            "query_method",
+            "upsert_method",
+            "delete_method",
+            "health_method",
+        ):
             v = getattr(self, field_name)
             if not isinstance(v, str) or not v.strip():
                 raise ValueError(f"{self.name}: {field_name} must be a non-empty string")
