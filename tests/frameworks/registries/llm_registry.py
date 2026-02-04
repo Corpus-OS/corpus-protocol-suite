@@ -37,7 +37,16 @@ except Exception:  # pragma: no cover - packaging may not be installed
     Version = None  # type: ignore[assignment]
 
 # Simple in-memory cache to avoid repeatedly importing modules for availability checks.
+#
+# IMPORTANT: cache key must be stable across descriptor overwrites. Caching only by
+# descriptor.name can lead to stale results when a test overwrites the registry entry.
+# We therefore cache on a composite key derived from adapter_module + availability_attr.
 _AVAILABILITY_CACHE: Dict[str, bool] = {}
+
+
+def _availability_cache_key(adapter_module: str, availability_attr: Optional[str]) -> str:
+    """Build a stable cache key for availability checks (do not use descriptor.name)."""
+    return f"{adapter_module}:{availability_attr or ''}"
 
 
 @dataclass(frozen=True)
@@ -198,10 +207,10 @@ class LLMFrameworkDescriptor:
         If availability_attr is set, this checks that boolean on the adapter
         module. Otherwise assumes the framework is available.
 
-        Results are cached per-descriptor name to avoid repeated imports in
-        large test suites.
+        Results are cached per module+attribute to avoid repeated imports in
+        large test suites while staying stable across descriptor overwrites.
         """
-        cache_key = self.name
+        cache_key = _availability_cache_key(self.adapter_module, self.availability_attr)
         if cache_key in _AVAILABILITY_CACHE:
             return _AVAILABILITY_CACHE[cache_key]
 
@@ -649,7 +658,7 @@ def register_llm_framework_descriptor(
 
     LLM_FRAMEWORKS[descriptor.name] = descriptor
     # Reset availability cache for this descriptor so future checks re-evaluate.
-    _AVAILABILITY_CACHE.pop(descriptor.name, None)
+    _AVAILABILITY_CACHE.pop(_availability_cache_key(descriptor.adapter_module, descriptor.availability_attr), None)
 
 
 def unregister_llm_framework_descriptor(
@@ -670,8 +679,9 @@ def unregister_llm_framework_descriptor(
         If True (default), missing entries are ignored.
     """
     if name in LLM_FRAMEWORKS:
+        desc = LLM_FRAMEWORKS[name]
         del LLM_FRAMEWORKS[name]
-        _AVAILABILITY_CACHE.pop(name, None)
+        _AVAILABILITY_CACHE.pop(_availability_cache_key(desc.adapter_module, desc.availability_attr), None)
     elif not ignore_missing:
         raise KeyError(f"Framework {name!r} is not registered")
 
