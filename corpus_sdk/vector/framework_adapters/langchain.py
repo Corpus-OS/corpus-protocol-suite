@@ -134,7 +134,6 @@ from corpus_sdk.vector.vector_base import (
     Vector,
     VectorMatch,
     QueryResult,
-    QueryChunk,
     UpsertResult,
     DeleteResult,  # kept for API parity (even if unused directly here)
     OperationContext,
@@ -168,6 +167,46 @@ logger = logging.getLogger(__name__)
 
 Embeddings = Sequence[Sequence[float]]
 Metadata = Dict[str, Any]
+
+
+# --------------------------------------------------------------------------- #
+# Protocol client wrapper
+# --------------------------------------------------------------------------- #
+
+
+class CorpusLangChainVectorClient:
+    """VectorProtocolV1-shaped wrapper used by the conformance test suite."""
+
+    def __init__(self, *, adapter: VectorProtocolV1) -> None:
+        self._translator = VectorTranslator(
+            adapter=adapter,
+            framework="langchain",
+            translator=DefaultVectorFrameworkTranslator(),
+        )
+
+    def capabilities(self, *, config: Optional[Any] = None) -> Any:
+        return self._translator.capabilities(framework_ctx=config)
+
+    def health(self, *, config: Optional[Any] = None) -> Any:
+        return self._translator.health(framework_ctx=config)
+
+    def query(self, raw_query: Any, *, config: Optional[Any] = None) -> Any:
+        return self._translator.query(raw_query, framework_ctx=config)
+
+    def batch_query(self, raw_queries: Any, *, config: Optional[Any] = None) -> Any:
+        return self._translator.batch_query(raw_queries, framework_ctx=config)
+
+    def upsert(self, raw_documents: Any, *, config: Optional[Any] = None) -> Any:
+        return self._translator.upsert(raw_documents, framework_ctx=config)
+
+    def delete(self, raw_filter_or_ids: Any, *, config: Optional[Any] = None) -> Any:
+        return self._translator.delete(raw_filter_or_ids, framework_ctx=config)
+
+    def create_namespace(self, name: str, *, config: Optional[Any] = None) -> Any:
+        return self._translator.create_namespace(name, framework_ctx=config)
+
+    def delete_namespace(self, name: str, *, config: Optional[Any] = None) -> Any:
+        return self._translator.delete_namespace(name, framework_ctx=config)
 
 
 # --------------------------------------------------------------------------- #
@@ -1976,7 +2015,10 @@ class CorpusLangChainVectorStore(VectorStore):
             op_ctx=ctx,
             framework_ctx=framework_ctx,
         ):
-            if not isinstance(chunk, QueryChunk):
+            raw_matches_obj = getattr(chunk, "matches", None)
+            if raw_matches_obj is None and isinstance(chunk, Mapping):
+                raw_matches_obj = chunk.get("matches")
+            if raw_matches_obj is None:
                 err = VectorAdapterError(
                     f"VectorTranslator.query_stream yielded unsupported type: {type(chunk).__name__}",
                     code=ErrorCodes.BAD_TRANSLATED_CHUNK,
@@ -1989,7 +2031,7 @@ class CorpusLangChainVectorStore(VectorStore):
                 )
                 raise err
 
-            raw_matches = list(chunk.matches or [])
+            raw_matches = list(raw_matches_obj or [])
             filtered_matches = self._apply_score_threshold(raw_matches)
 
             for match in filtered_matches:
