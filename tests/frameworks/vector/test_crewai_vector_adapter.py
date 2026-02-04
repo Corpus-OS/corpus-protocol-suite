@@ -3006,6 +3006,132 @@ def test_crewai_streaming_with_real_task(
 
 
 # ---------------------------------------------------------------------------
+# REAL CrewAI integration tests (pass/fail; no skips)
+# ---------------------------------------------------------------------------
+
+
+def _require_crewai_for_vector_integration() -> Any:
+    """Fail-fast if CrewAI isn't importable for real integration checks."""
+    try:
+        import crewai  # noqa: F401  # type: ignore
+        from crewai.tools.base_tool import BaseTool  # type: ignore[import-not-found]
+    except Exception as exc:
+        pytest.fail(
+            "CrewAI is required for real vector integration tests in this module. Install with:\n"
+            "  pip install -U crewai\n"
+            f"Import error: {exc!r}",
+            pytrace=False,
+        )
+
+    if not getattr(crewai_adapter_module, "CREWAI_AVAILABLE", False):
+        pytest.fail(
+            "CREWAI_AVAILABLE is False but CrewAI imports succeeded. "
+            "This indicates an internal inconsistency in corpus_sdk.vector.framework_adapters.crewai.",
+            pytrace=False,
+        )
+
+    return BaseTool
+
+
+@pytest.mark.integration
+def test_real_crewai_vector_tool_is_real_basetool(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """When CrewAI is installed, our vector tool must be a real CrewAI BaseTool."""
+    BaseTool = _require_crewai_for_vector_integration()
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    tool = CorpusCrewAIVectorSearchTool(
+        corpus_adapter=adapter,
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2]]),
+    )
+    assert isinstance(tool, BaseTool)
+
+
+@pytest.mark.integration
+def test_real_crewai_vector_tool_run_executes_end_to_end(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Smoke test: call CrewAI tool entrypoint `_run` with real BaseTool class."""
+    _ = _require_crewai_for_vector_integration()
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    tool = CorpusCrewAIVectorSearchTool(
+        corpus_adapter=adapter,
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2]]),
+        default_top_k=2,
+    )
+
+    out = tool._run(query="hello", k=2)
+    assert isinstance(out, list)
+    assert all(isinstance(x, dict) for x in out)
+
+
+@pytest.mark.integration
+def test_real_crewai_vector_tool_callable_interface_executes(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Smoke test: __call__ convenience interface works with real CrewAI BaseTool."""
+    _ = _require_crewai_for_vector_integration()
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    tool = CorpusCrewAIVectorSearchTool(
+        corpus_adapter=adapter,
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2]]),
+        default_top_k=2,
+    )
+
+    out = tool("hello")
+    assert isinstance(out, list)
+    assert all(isinstance(x, dict) for x in out)
+
+
+@pytest.mark.integration
+def test_real_crewai_vector_tool_accepts_real_task_context(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Smoke test: passing a real crewai.Task as context does not crash."""
+    _ = _require_crewai_for_vector_integration()
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    import crewai  # type: ignore
+    from crewai import Task  # type: ignore
+
+    agent = crewai.Agent(
+        role="researcher",
+        goal="Test vector task context",
+        backstory="A test agent",
+        allow_delegation=False,
+        verbose=False,
+    )
+    task = Task(
+        description="Test task for CrewAI vector adapter",
+        agent=agent,
+        expected_output="A short answer",
+    )
+
+    tool = CorpusCrewAIVectorSearchTool(
+        corpus_adapter=adapter,
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2]]),
+        default_top_k=2,
+    )
+
+    out = tool._run(query="hello", k=2, context=task)
+    assert isinstance(out, list)
+    assert all(isinstance(x, dict) for x in out)
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_real_crewai_vector_tool_arun_executes_end_to_end(adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Smoke test: call CrewAI async tool entrypoint `_arun` with real BaseTool class."""
+    _ = _require_crewai_for_vector_integration()
+    monkeypatch.setenv("OPENAI_API_KEY", "fake-key-for-testing")
+
+    tool = CorpusCrewAIVectorSearchTool(
+        corpus_adapter=adapter,
+        embedding_function=_make_mock_embedding_function([[0.1, 0.2]]),
+        default_top_k=2,
+    )
+
+    out = await tool._arun(query="hello", k=2)
+    assert isinstance(out, list)
+    assert all(isinstance(x, dict) for x in out)
+
+
+# ---------------------------------------------------------------------------
 # Edge Case Tests (4 tests)
 # ---------------------------------------------------------------------------
 
