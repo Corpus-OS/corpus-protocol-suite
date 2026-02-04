@@ -63,8 +63,15 @@ def _make_client(
 
 
 def _has_autogen_installed() -> bool:
-    """Dependency-neutral check: does not import AutoGen, only checks availability."""
-    return importlib.util.find_spec("autogen") is not None
+    """Dependency-neutral check: does not import AutoGen, only checks availability.
+
+    AutoGen has moved to a split-package layout; the CORPUS framework adapter
+    exercises `autogen_core` (and optionally other `autogen_*` packages).
+    """
+    return (
+        importlib.util.find_spec("autogen_core") is not None
+        or importlib.util.find_spec("autogen_agentchat") is not None
+    )
 
 
 def _require_autogen_available_for_e2e() -> None:
@@ -72,7 +79,8 @@ def _require_autogen_available_for_e2e() -> None:
     if not _has_autogen_installed():
         raise AssertionError(
             "AutoGen is not installed, but AutoGen E2E integration tests are required (no skips). "
-            "Install AutoGen packages in the test environment to run this framework suite."
+            "Install AutoGen packages (e.g. autogen-core / autogen-agentchat) in the test environment "
+            "to run this framework suite."
         )
 
 
