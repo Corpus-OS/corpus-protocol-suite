@@ -12,8 +12,8 @@ Provide a high-level orchestration and translation layer between:
 
 This module is intentionally *framework-neutral* and focuses on:
 
-- Building `VectorQuerySpec` / mutation specs from framework-level inputs
-- Translating `QueryResult` / `QueryChunk` / mutation results back to framework-facing shapes
+- Building `QuerySpec` / mutation specs from framework-level inputs
+- Translating `QueryResult` / mutation results back to framework-facing shapes
 - Applying optional MMR / diversification on query results (CRITICAL for vector search)
 - Handling rich metadata filters (including $and / $or / range operators)
 - Providing sync + async APIs, including streaming via a sync bridge
@@ -62,6 +62,10 @@ For streaming queries, this module exposes:
 - A sync API that wraps the async generator via `SyncStreamBridge`, preserving
   proper cancellation and error propagation.
 
+Note: streaming is not part of `VectorProtocolV1` in this SDK. If an adapter
+exposes an optional streaming method, we use it; otherwise we provide a
+single synthesized chunk derived from `query()`.
+
 Registry
 --------
 A small registry lets you register per-framework vector translators:
@@ -98,20 +102,22 @@ from typing import (
 )
 
 from corpus_sdk.vector.vector_base import (
-    VectorProtocolV1,
-    VectorQuerySpec,
-    VectorUpsertSpec,
-    VectorDeleteSpec,
-    VectorUpdateSpec,
-    QueryResult,
-    QueryChunk,
-    UpsertResult,
+    BatchQuerySpec,
     DeleteResult,
-    UpdateResult,
-    VectorStats,
+    DeleteSpec,
+    NamespaceResult,
+    NamespaceSpec,
+    QueryResult,
+    QuerySpec,
+    UpsertResult,
+    UpsertSpec,
+    Vector,
     VectorAdapterError,
+    VectorID,
+    VectorProtocolV1,
     OperationContext,
     BadRequest,
+    NotSupported,
 )
 
 from corpus_sdk.core.context_translation import from_dict as ctx_from_dict
@@ -409,7 +415,7 @@ class VectorFrameworkTranslator(Protocol):
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
         stream: bool = False,
-    ) -> VectorQuerySpec:
+    ) -> QuerySpec:
         ...
 
     def translate_query_result(
@@ -423,7 +429,7 @@ class VectorFrameworkTranslator(Protocol):
 
     def translate_query_chunk(
         self,
-        chunk: QueryChunk,
+        chunk: Any,
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
@@ -438,7 +444,7 @@ class VectorFrameworkTranslator(Protocol):
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
-    ) -> VectorUpsertSpec:
+    ) -> UpsertSpec:
         ...
 
     def translate_upsert_result(
@@ -456,7 +462,7 @@ class VectorFrameworkTranslator(Protocol):
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
-    ) -> VectorDeleteSpec:
+    ) -> DeleteSpec:
         ...
 
     def translate_delete_result(
@@ -468,34 +474,7 @@ class VectorFrameworkTranslator(Protocol):
     ) -> Any:
         ...
 
-    def build_update_spec(
-        self,
-        raw_updates: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> VectorUpdateSpec:
-        ...
-
-    def translate_update_result(
-        self,
-        result: UpdateResult,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        ...
-
-    # ---- stats / inspection ----
-
-    def translate_stats(
-        self,
-        stats: VectorStats,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> Any:
-        ...
+    # NOTE: The VectorProtocolV1 surface in this SDK does not include update/stats.
 
     # ---- error mapping ----
 
@@ -549,18 +528,17 @@ class DefaultVectorFrameworkTranslator:
     Behaviors:
         - Treats raw_query as either:
             * a list/array (query vector), or
-            * a mapping with VectorQuerySpec-like keys
+            * a mapping with `QuerySpec`-like keys
         - Treats mutation inputs as:
             * sequences of dicts with Document fields, or
             * sequences of already-built Document-compatible mappings
 
         - For results:
             * QueryResult -> list of matches with scores
-            * QueryChunk  -> list of matches per chunk
             * UpsertResult -> list of IDs
             * DeleteResult -> count
-            * UpdateResult -> count
-            * VectorStats -> underlying stats object
+            * NamespaceResult -> passthrough
+            * Capabilities/health -> passthrough
     """
 
     def __init__(self) -> None:
@@ -625,22 +603,22 @@ class DefaultVectorFrameworkTranslator:
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
         stream: bool = False,
-    ) -> VectorQuerySpec:
+    ) -> QuerySpec:
         namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+        effective_namespace = str(namespace) if namespace is not None else "default"
 
         # Case 1: raw_query is a vector (list/tuple of floats).
         # Default behavior: top_k=10, include_metadata=True, include_vectors=False.
         if isinstance(raw_query, (list, tuple)):
             try:
                 vector = [float(v) for v in raw_query]
-                return VectorQuerySpec(
+                return QuerySpec(
                     vector=vector,
                     top_k=10,
-                    filters=None,
-                    namespace=namespace,
+                    filter=None,
+                    namespace=effective_namespace,
                     include_metadata=True,
                     include_vectors=False,
-                    stream=stream,
                 )
             except (TypeError, ValueError):
                 raise BadRequest(
@@ -648,9 +626,11 @@ class DefaultVectorFrameworkTranslator:
                     code="BAD_QUERY_VECTOR",
                 )
 
-        # Case 2: raw_query is a mapping with VectorQuerySpec fields
+        # Case 2: raw_query is a mapping with QuerySpec-like fields
         if isinstance(raw_query, Mapping):
             vector = raw_query.get("vector")
+            if vector is None:
+                vector = raw_query.get("embedding")
             if not isinstance(vector, (list, tuple)):
                 raise BadRequest(
                     "raw_query.vector must be a list/tuple of floats",
@@ -673,6 +653,8 @@ class DefaultVectorFrameworkTranslator:
                 )
 
             filters = raw_query.get("filters")
+            if filters is None:
+                filters = raw_query.get("filter")
             rq_namespace = raw_query.get("namespace") or raw_query.get("collection")
             include_metadata = raw_query.get("include_metadata", True)
             include_vectors = raw_query.get("include_vectors", False)
@@ -681,14 +663,16 @@ class DefaultVectorFrameworkTranslator:
             if filters is not None:
                 filters = self._filter_translator.normalize(filters)
 
-            return VectorQuerySpec(
+            # NOTE: VectorProtocolV1 QuerySpec has no stream flag.
+            _ = stream
+
+            return QuerySpec(
                 vector=vector,
                 top_k=top_k,
-                filters=filters,
-                namespace=str(rq_namespace) if rq_namespace is not None else namespace,
+                filter=filters,
+                namespace=str(rq_namespace) if rq_namespace is not None else effective_namespace,
                 include_metadata=bool(include_metadata),
                 include_vectors=bool(include_vectors),
-                stream=bool(raw_query.get("stream", stream)),
             )
 
         raise BadRequest(
@@ -707,22 +691,21 @@ class DefaultVectorFrameworkTranslator:
         return {
             "matches": list(result.matches or []),
             "namespace": result.namespace,
-            "usage": dict(result.usage or {}) if result.usage else None,
+            "total_matches": int(getattr(result, "total_matches", 0) or 0),
         }
 
     def translate_query_chunk(
         self,
-        chunk: QueryChunk,
+        chunk: Any,
         *,
         op_ctx: OperationContext,  # noqa: ARG002
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
-        # Generic behavior: return the chunk as a simple dict
-        return {
-            "matches": list(chunk.matches or []),
-            "is_final": bool(chunk.is_final),
-            "usage": dict(chunk.usage or {}) if chunk.usage is not None else None,
-        }
+        # Streaming is not part of VectorProtocolV1 in this SDK. If a framework adapter
+        # provides streaming chunks, we treat mapping-like chunks as passthrough.
+        if isinstance(chunk, Mapping):
+            return dict(chunk)
+        return {"chunk": chunk}
 
     def build_batch_query_specs(
         self,
@@ -730,9 +713,9 @@ class DefaultVectorFrameworkTranslator:
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
-    ) -> List[VectorQuerySpec]:
+    ) -> List[QuerySpec]:
         """
-        Build a list of VectorQuerySpec for batch query.
+        Build a list of QuerySpec for batch query.
 
         This is a convenience for wrappers that expose a batch_query surface.
         It intentionally reuses build_query_spec to preserve validation, filter
@@ -828,10 +811,9 @@ class DefaultVectorFrameworkTranslator:
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
-    ) -> VectorUpsertSpec:
-        from corpus_sdk.vector.vector_base import Document  # local import to avoid cycles
-
+    ) -> UpsertSpec:
         namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+        effective_namespace = str(namespace) if namespace is not None else "default"
 
         if isinstance(raw_documents, Mapping):
             raw_documents = [raw_documents]
@@ -841,16 +823,22 @@ class DefaultVectorFrameworkTranslator:
                 code="BAD_DOCUMENTS",
             )
 
-        documents: List[Document] = []
+        pending: List[Dict[str, Any]] = []
+        explicit_namespaces: List[str] = []
         for idx, item in enumerate(raw_documents):
-            if isinstance(item, Document):
-                documents.append(item)
-                continue
             if not isinstance(item, Mapping):
                 raise BadRequest(
-                    f"raw_documents[{idx}] must be a mapping or Document",
+                    f"raw_documents[{idx}] must be a mapping",
                     code="BAD_DOCUMENTS",
                     details={"index": idx, "type": type(item).__name__},
+                )
+
+            raw_id = item.get("id")
+            if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
+                raise BadRequest(
+                    f"raw_documents[{idx}] is missing a valid 'id'",
+                    code="BAD_DOCUMENT_ID",
+                    details={"index": idx},
                 )
 
             # Extract vector
@@ -871,16 +859,52 @@ class DefaultVectorFrameworkTranslator:
                     details={"index": idx},
                 )
 
-            doc_ns = item.get("namespace") or item.get("collection") or namespace
-            doc = Document(
-                id=item.get("id"),
-                vector=vector,
-                metadata=item.get("metadata") or {},
-                namespace=doc_ns,
-            )
-            documents.append(doc)
+            doc_ns = item.get("namespace") or item.get("collection")
+            if doc_ns is not None and str(doc_ns).strip():
+                explicit_namespaces.append(str(doc_ns))
 
-        return VectorUpsertSpec(documents=documents, namespace=namespace)
+            pending.append(
+                {
+                    "id": str(raw_id),
+                    "vector": vector,
+                    "metadata": dict(item.get("metadata") or {}),
+                    "text": item.get("text"),
+                    "namespace": str(doc_ns) if doc_ns is not None and str(doc_ns).strip() else None,
+                }
+            )
+
+        # UpsertSpec.namespace is authoritative for the operation.
+        final_namespace = effective_namespace
+        if explicit_namespaces:
+            ns_set = set(explicit_namespaces)
+            if len(ns_set) > 1:
+                raise BadRequest(
+                    "upsert does not support mixed namespaces",
+                    code="BAD_DOCUMENTS",
+                    details={"namespaces": sorted(list(ns_set))},
+                )
+            final_namespace = next(iter(ns_set))
+
+        vectors: List[Vector] = []
+        for item in pending:
+            item_ns = item.get("namespace")
+            if item_ns is not None and item_ns != final_namespace:
+                raise BadRequest(
+                    "upsert does not support mixed namespaces",
+                    code="BAD_DOCUMENTS",
+                    details={"namespaces": sorted(list({item_ns, final_namespace}))},
+                )
+            vectors.append(
+                Vector(
+                    id=VectorID(item["id"]),
+                    vector=item["vector"],
+                    metadata=item["metadata"],
+                    namespace=final_namespace,
+                    text=item.get("text"),
+                )
+            )
+
+        return UpsertSpec(vectors=vectors, namespace=final_namespace)
 
     def translate_upsert_result(
         self,
@@ -890,8 +914,9 @@ class DefaultVectorFrameworkTranslator:
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
         return {
-            "ids": list(result.ids or []),
-            "count": len(result.ids or []),
+            "upserted_count": int(getattr(result, "upserted_count", 0) or 0),
+            "failed_count": int(getattr(result, "failed_count", 0) or 0),
+            "failures": list(getattr(result, "failures", []) or []),
         }
 
     def build_delete_spec(
@@ -900,10 +925,11 @@ class DefaultVectorFrameworkTranslator:
         *,
         op_ctx: OperationContext,
         framework_ctx: Optional[Any] = None,
-    ) -> VectorDeleteSpec:
+    ) -> DeleteSpec:
         namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
+        effective_namespace = str(namespace) if namespace is not None else "default"
 
-        ids: List[str] = []
+        ids: List[VectorID] = []
         filter_expr: Optional[Mapping[str, Any]] = None
 
         # Mapping -> filter-based delete
@@ -920,12 +946,12 @@ class DefaultVectorFrameworkTranslator:
                 if isinstance(first, Mapping):
                     filter_expr = self._filter_translator.normalize(raw_filter_or_ids)
                 else:
-                    ids = [str(x) for x in raw_filter_or_ids]
+                    ids = [VectorID(str(x)) for x in raw_filter_or_ids]
         else:
             # Single scalar ID
-            ids = [str(raw_filter_or_ids)]
+            ids = [VectorID(str(raw_filter_or_ids))]
 
-        return VectorDeleteSpec(ids=ids, namespace=namespace, filters=filter_expr)
+        return DeleteSpec(ids=ids, namespace=effective_namespace, filter=dict(filter_expr) if filter_expr is not None else None)
 
     def translate_delete_result(
         self,
@@ -935,86 +961,10 @@ class DefaultVectorFrameworkTranslator:
         framework_ctx: Optional[Any] = None,  # noqa: ARG002
     ) -> Any:
         return {
-            "count": result.count or 0,
+            "deleted_count": int(getattr(result, "deleted_count", 0) or 0),
+            "failed_count": int(getattr(result, "failed_count", 0) or 0),
+            "failures": list(getattr(result, "failures", []) or []),
         }
-
-    def build_update_spec(
-        self,
-        raw_updates: Any,
-        *,
-        op_ctx: OperationContext,
-        framework_ctx: Optional[Any] = None,
-    ) -> VectorUpdateSpec:
-        namespace = self.preferred_namespace(op_ctx=op_ctx, framework_ctx=framework_ctx)
-
-        if isinstance(raw_updates, Mapping):
-            raw_updates = [raw_updates]
-        if not isinstance(raw_updates, Iterable):
-            raise BadRequest(
-                "raw_updates must be a mapping or iterable",
-                code="BAD_UPDATES",
-            )
-
-        updates: List[Dict[str, Any]] = []
-        for idx, item in enumerate(raw_updates):
-            if not isinstance(item, Mapping):
-                raise BadRequest(
-                    f"raw_updates[{idx}] must be a mapping",
-                    code="BAD_UPDATES",
-                    details={"index": idx, "type": type(item).__name__},
-                )
-
-            raw_id = item.get("id")
-            if raw_id is None or (isinstance(raw_id, str) and not raw_id.strip()):
-                raise BadRequest(
-                    f"raw_updates[{idx}] is missing a valid 'id'",
-                    code="BAD_UPDATE_ID",
-                    details={"index": idx},
-                )
-
-            update_dict: Dict[str, Any] = {
-                "id": str(raw_id),
-            }
-
-            # Optional vector update
-            if "vector" in item or "embedding" in item:
-                vector = item.get("vector") or item.get("embedding")
-                try:
-                    update_dict["vector"] = [float(v) for v in vector]
-                except (TypeError, ValueError):
-                    raise BadRequest(
-                        f"raw_updates[{idx}].vector must contain numeric values",
-                        code="BAD_UPDATE_VECTOR",
-                        details={"index": idx},
-                    )
-
-            # Optional metadata update
-            if "metadata" in item:
-                update_dict["metadata"] = dict(item["metadata"])
-
-            updates.append(update_dict)
-
-        return VectorUpdateSpec(updates=updates, namespace=namespace)
-
-    def translate_update_result(
-        self,
-        result: UpdateResult,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        return {
-            "count": result.count or 0,
-        }
-
-    def translate_stats(
-        self,
-        stats: VectorStats,
-        *,
-        op_ctx: OperationContext,  # noqa: ARG002
-        framework_ctx: Optional[Any] = None,  # noqa: ARG002
-    ) -> Any:
-        return stats
 
 
 # =============================================================================
@@ -1306,12 +1256,42 @@ class VectorTranslator:
                 framework_ctx=framework_ctx,
                 stream=True,
             )
-            async for chunk in self._adapter.stream_query(spec, ctx=ctx):
-                yield self._translator.translate_query_chunk(
-                    chunk,
-                    op_ctx=ctx,
-                    framework_ctx=framework_ctx,
+
+            stream_fn = getattr(self._adapter, "stream_query", None)
+            if callable(stream_fn):
+                async for chunk in stream_fn(spec, ctx=ctx):
+                    yield self._translator.translate_query_chunk(
+                        chunk,
+                        op_ctx=ctx,
+                        framework_ctx=framework_ctx,
+                    )
+                return
+
+            # Streaming is not part of VectorProtocolV1 in this SDK.
+            # Provide a single synthesized chunk derived from query().
+            try:
+                result = await self._adapter.query(spec, ctx=ctx)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            if not isinstance(result, QueryResult):
+                raise BadRequest(
+                    f"Invalid result type: {type(result)}",
+                    code="BAD_ADAPTER_RESULT",
                 )
+
+            synthesized = {
+                "matches": list(result.matches or []),
+                "is_final": True,
+                "namespace": result.namespace,
+            }
+            yield self._translator.translate_query_chunk(
+                synthesized,
+                op_ctx=ctx,
+                framework_ctx=framework_ctx,
+            )
         return _factory
 
     # --------------------------------------------------------------------- #
@@ -1333,7 +1313,8 @@ class VectorTranslator:
         """
         async def _logic(ctx: OperationContext) -> Any:
             try:
-                caps = await self._adapter.capabilities(ctx=ctx)  # type: ignore[attr-defined]
+                # VectorProtocolV1.capabilities() does not accept ctx.
+                caps = await self._adapter.capabilities()
             except VectorAdapterError as e:
                 raise self._translator.map_adapter_error(
                     e, op_ctx=ctx, framework_ctx=framework_ctx
@@ -1361,7 +1342,7 @@ class VectorTranslator:
         """Async capabilities API."""
         async def _logic(ctx: OperationContext) -> Any:
             try:
-                caps = await self._adapter.capabilities(ctx=ctx)  # type: ignore[attr-defined]
+                caps = await self._adapter.capabilities()
             except VectorAdapterError as e:
                 raise self._translator.map_adapter_error(
                     e, op_ctx=ctx, framework_ctx=framework_ctx
@@ -1487,7 +1468,7 @@ class VectorTranslator:
 
         Batch query is a strict wrapper-level surface expected by conformance tests.
         This implementation:
-            - Builds VectorQuerySpec objects via the translator (or falls back to per-item build_query_spec),
+                        - Builds QuerySpec objects via the translator (or falls back to per-item build_query_spec),
             - Calls adapter.batch_query when available, otherwise performs a safe sequential fallback
               using adapter.query (preserving error mapping and MMR behavior per result),
             - Translates results via the translator (or returns a simple list).
@@ -1507,43 +1488,51 @@ class VectorTranslator:
 
             results: List[QueryResult] = []
 
-            batch_fn = getattr(self._adapter, "batch_query", None)
-            if callable(batch_fn):
-                try:
-                    batch_results = await batch_fn(specs, ctx=ctx)
-                except VectorAdapterError as e:
-                    raise self._translator.map_adapter_error(
-                        e, op_ctx=ctx, framework_ctx=framework_ctx
-                    ) from e
+            namespaces = {getattr(s, "namespace", "default") for s in specs}
+            if len(namespaces) > 1:
+                raise BadRequest(
+                    "batch_query does not support mixed namespaces; split calls per namespace",
+                    code="BAD_BATCH_QUERY",
+                    details={"namespaces": sorted(list(namespaces))},
+                )
+            batch_namespace = next(iter(namespaces)) if namespaces else "default"
 
-                # Defensive validation: conformance tests depend on truthful output types.
-                if not isinstance(batch_results, (list, tuple)):
-                    raise BadRequest(
-                        f"Invalid batch_query result type: {type(batch_results)}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                for r in batch_results:
-                    if not isinstance(r, QueryResult):
-                        raise BadRequest(
-                            f"Invalid batch_query element type: {type(r)}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    results.append(r)
-            else:
-                # Fallback path: call query sequentially to preserve deterministic behavior.
+            try:
+                batch_results = await self._adapter.batch_query(
+                    BatchQuerySpec(queries=list(specs), namespace=batch_namespace),
+                    ctx=ctx,
+                )
+            except NotSupported:
+                LOG.debug(
+                    "Adapter does not support batch_query; falling back to sequential query for %d queries",
+                    len(specs),
+                )
+                batch_results = []
                 for spec in specs:
                     try:
-                        r = await self._adapter.query(spec, ctx=ctx)
+                        batch_results.append(await self._adapter.query(spec, ctx=ctx))
                     except VectorAdapterError as e:
                         raise self._translator.map_adapter_error(
                             e, op_ctx=ctx, framework_ctx=framework_ctx
                         ) from e
-                    if not isinstance(r, QueryResult):
-                        raise BadRequest(
-                            f"Invalid result type: {type(r)}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    results.append(r)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            # Defensive validation: conformance tests depend on truthful output types.
+            if not isinstance(batch_results, (list, tuple)):
+                raise BadRequest(
+                    f"Invalid batch_query result type: {type(batch_results)}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            for r in batch_results:
+                if not isinstance(r, QueryResult):
+                    raise BadRequest(
+                        f"Invalid batch_query element type: {type(r)}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                results.append(r)
 
             # Apply MMR per-result (MMR is a post-processing step, not a protocol behavior).
             if mmr_config is not None and mmr_config.enabled:
@@ -1589,41 +1578,50 @@ class VectorTranslator:
 
             results: List[QueryResult] = []
 
-            batch_fn = getattr(self._adapter, "batch_query", None)
-            if callable(batch_fn):
-                try:
-                    batch_results = await batch_fn(specs, ctx=ctx)
-                except VectorAdapterError as e:
-                    raise self._translator.map_adapter_error(
-                        e, op_ctx=ctx, framework_ctx=framework_ctx
-                    ) from e
+            namespaces = {getattr(s, "namespace", "default") for s in specs}
+            if len(namespaces) > 1:
+                raise BadRequest(
+                    "batch_query does not support mixed namespaces; split calls per namespace",
+                    code="BAD_BATCH_QUERY",
+                    details={"namespaces": sorted(list(namespaces))},
+                )
+            batch_namespace = next(iter(namespaces)) if namespaces else "default"
 
-                if not isinstance(batch_results, (list, tuple)):
-                    raise BadRequest(
-                        f"Invalid batch_query result type: {type(batch_results)}",
-                        code="BAD_ADAPTER_RESULT",
-                    )
-                for r in batch_results:
-                    if not isinstance(r, QueryResult):
-                        raise BadRequest(
-                            f"Invalid batch_query element type: {type(r)}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    results.append(r)
-            else:
+            try:
+                batch_results = await self._adapter.batch_query(
+                    BatchQuerySpec(queries=list(specs), namespace=batch_namespace),
+                    ctx=ctx,
+                )
+            except NotSupported:
+                LOG.debug(
+                    "Adapter does not support batch_query; falling back to sequential query for %d queries",
+                    len(specs),
+                )
+                batch_results = []
                 for spec in specs:
                     try:
-                        r = await self._adapter.query(spec, ctx=ctx)
+                        batch_results.append(await self._adapter.query(spec, ctx=ctx))
                     except VectorAdapterError as e:
                         raise self._translator.map_adapter_error(
                             e, op_ctx=ctx, framework_ctx=framework_ctx
                         ) from e
-                    if not isinstance(r, QueryResult):
-                        raise BadRequest(
-                            f"Invalid result type: {type(r)}",
-                            code="BAD_ADAPTER_RESULT",
-                        )
-                    results.append(r)
+            except VectorAdapterError as e:
+                raise self._translator.map_adapter_error(
+                    e, op_ctx=ctx, framework_ctx=framework_ctx
+                ) from e
+
+            if not isinstance(batch_results, (list, tuple)):
+                raise BadRequest(
+                    f"Invalid batch_query result type: {type(batch_results)}",
+                    code="BAD_ADAPTER_RESULT",
+                )
+            for r in batch_results:
+                if not isinstance(r, QueryResult):
+                    raise BadRequest(
+                        f"Invalid batch_query element type: {type(r)}",
+                        code="BAD_ADAPTER_RESULT",
+                    )
+                results.append(r)
 
             if mmr_config is not None and mmr_config.enabled:
                 results = [self._apply_mmr_to_query_result(r, mmr_config) for r in results]
@@ -1835,30 +1833,9 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous update API."""
-        async def _logic(ctx: OperationContext) -> Any:
-            spec = self._translator.build_update_spec(
-                raw_updates,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            try:
-                result = await self._adapter.update(spec, ctx=ctx)
-            except VectorAdapterError as e:
-                raise self._translator.map_adapter_error(
-                    e, op_ctx=ctx, framework_ctx=framework_ctx
-                ) from e
-            return self._translator.translate_update_result(
-                result,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return self._run_operation(
-            op_name="update",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
+        raise NotSupported(
+            "update is not part of VectorProtocolV1 in this SDK",
+            code="NOT_SUPPORTED",
         )
 
     async def arun_update(
@@ -1868,30 +1845,9 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async update API."""
-        async def _logic(ctx: OperationContext) -> Any:
-            spec = self._translator.build_update_spec(
-                raw_updates,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-            try:
-                result = await self._adapter.update(spec, ctx=ctx)
-            except VectorAdapterError as e:
-                raise self._translator.map_adapter_error(
-                    e, op_ctx=ctx, framework_ctx=framework_ctx
-                ) from e
-            return self._translator.translate_update_result(
-                result,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return await self._run_operation(
-            op_name="update",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
+        raise NotSupported(
+            "update is not part of VectorProtocolV1 in this SDK",
+            code="NOT_SUPPORTED",
         )
 
     def create_namespace(
@@ -1908,8 +1864,43 @@ class VectorTranslator:
         conformance suite; backend support may still be capability-gated.
         """
         async def _logic(ctx: OperationContext) -> Any:
+            dims = None
+            metric = None
+            if isinstance(framework_ctx, Mapping):
+                dims = framework_ctx.get("dimensions") or framework_ctx.get("vector_dimensions") or framework_ctx.get("dim")
+                metric = framework_ctx.get("distance_metric") or framework_ctx.get("metric")
+            attrs = ctx.attrs or {}
+            dims = dims or attrs.get("dimensions") or attrs.get("vector_dimensions") or attrs.get("dim")
+            metric = metric or attrs.get("distance_metric") or attrs.get("metric")
+
+            if dims is None:
+                raise BadRequest(
+                    "dimensions is required for namespace creation",
+                    code="BAD_NAMESPACE_SPEC",
+                    details={"namespace": name},
+                )
             try:
-                result = await self._adapter.create_namespace(name, ctx=ctx)  # type: ignore[attr-defined]
+                dims_i = int(dims)
+            except (TypeError, ValueError):
+                raise BadRequest(
+                    f"dimensions must be an integer, got {dims!r}",
+                    code="BAD_NAMESPACE_SPEC",
+                    details={"namespace": name, "dimensions": dims},
+                )
+            if dims_i <= 0:
+                raise BadRequest(
+                    f"dimensions must be positive, got {dims_i}",
+                    code="BAD_NAMESPACE_SPEC",
+                    details={"namespace": name, "dimensions": dims_i},
+                )
+
+            try:
+                spec = NamespaceSpec(
+                    namespace=name,
+                    dimensions=dims_i,
+                    distance_metric=str(metric) if metric is not None else "cosine",
+                )
+                result = await self._adapter.create_namespace(spec, ctx=ctx)
             except VectorAdapterError as e:
                 raise self._translator.map_adapter_error(
                     e, op_ctx=ctx, framework_ctx=framework_ctx
@@ -1936,8 +1927,43 @@ class VectorTranslator:
     ) -> Any:
         """Async create_namespace API."""
         async def _logic(ctx: OperationContext) -> Any:
+            dims = None
+            metric = None
+            if isinstance(framework_ctx, Mapping):
+                dims = framework_ctx.get("dimensions") or framework_ctx.get("vector_dimensions") or framework_ctx.get("dim")
+                metric = framework_ctx.get("distance_metric") or framework_ctx.get("metric")
+            attrs = ctx.attrs or {}
+            dims = dims or attrs.get("dimensions") or attrs.get("vector_dimensions") or attrs.get("dim")
+            metric = metric or attrs.get("distance_metric") or attrs.get("metric")
+
+            if dims is None:
+                raise BadRequest(
+                    "dimensions is required for namespace creation",
+                    code="BAD_NAMESPACE_SPEC",
+                    details={"namespace": name},
+                )
             try:
-                result = await self._adapter.create_namespace(name, ctx=ctx)  # type: ignore[attr-defined]
+                dims_i = int(dims)
+            except (TypeError, ValueError):
+                raise BadRequest(
+                    f"dimensions must be an integer, got {dims!r}",
+                    code="BAD_NAMESPACE_SPEC",
+                    details={"namespace": name, "dimensions": dims},
+                )
+            if dims_i <= 0:
+                raise BadRequest(
+                    f"dimensions must be positive, got {dims_i}",
+                    code="BAD_NAMESPACE_SPEC",
+                    details={"namespace": name, "dimensions": dims_i},
+                )
+
+            try:
+                spec = NamespaceSpec(
+                    namespace=name,
+                    dimensions=dims_i,
+                    distance_metric=str(metric) if metric is not None else "cosine",
+                )
+                result = await self._adapter.create_namespace(spec, ctx=ctx)
             except VectorAdapterError as e:
                 raise self._translator.map_adapter_error(
                     e, op_ctx=ctx, framework_ctx=framework_ctx
@@ -2081,26 +2107,9 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Synchronous get_stats API."""
-
-        async def _logic(ctx: OperationContext) -> Any:
-            try:
-                stats = await self._adapter.get_stats(ctx=ctx)
-            except VectorAdapterError as e:
-                raise self._translator.map_adapter_error(
-                    e, op_ctx=ctx, framework_ctx=framework_ctx
-                ) from e
-            return self._translator.translate_stats(
-                stats,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return self._run_operation(
-            op_name="get_stats",
-            op_ctx=op_ctx,
-            sync=True,
-            logic=_logic,
+        raise NotSupported(
+            "get_stats is not part of VectorProtocolV1 in this SDK",
+            code="NOT_SUPPORTED",
         )
 
     async def arun_get_stats(
@@ -2109,26 +2118,9 @@ class VectorTranslator:
         op_ctx: Optional[Union[OperationContext, Mapping[str, Any]]] = None,
         framework_ctx: Optional[Any] = None,
     ) -> Any:
-        """Async get_stats API."""
-
-        async def _logic(ctx: OperationContext) -> Any:
-            try:
-                stats = await self._adapter.get_stats(ctx=ctx)
-            except VectorAdapterError as e:
-                raise self._translator.map_adapter_error(
-                    e, op_ctx=ctx, framework_ctx=framework_ctx
-                ) from e
-            return self._translator.translate_stats(
-                stats,
-                op_ctx=ctx,
-                framework_ctx=framework_ctx,
-            )
-
-        return await self._run_operation(
-            op_name="get_stats",
-            op_ctx=op_ctx,
-            sync=False,
-            logic=_logic,
+        raise NotSupported(
+            "get_stats is not part of VectorProtocolV1 in this SDK",
+            code="NOT_SUPPORTED",
         )
 
 
