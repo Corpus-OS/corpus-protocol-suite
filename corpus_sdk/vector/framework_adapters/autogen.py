@@ -840,21 +840,6 @@ class CorpusAutoGenVectorStore:
         fw = self._build_framework_context(core, operation=operation, namespace=namespace)
         return core, fw
 
-    # Backwards-compatible alias for existing internal callers (kept intentionally).
-    def _build_ctx(
-        self,
-        *,
-        conversation: Optional[Any] = None,
-        extra_context: Optional[Mapping[str, Any]] = None,
-    ) -> Optional[OperationContext]:
-        """
-        Backwards-compatible wrapper around _build_core_context.
-
-        (Kept to avoid changing internal call patterns elsewhere; public
-        methods use _build_contexts for standardized behavior.)
-        """
-        return self._build_core_context(conversation=conversation, extra_context=extra_context)
-
     # ------------------------------------------------------------------ #
     # Namespace helper
     # ------------------------------------------------------------------ #
