@@ -153,8 +153,12 @@ SEMANTIC_KERNEL_AVAILABLE = importlib.util.find_spec("semantic_kernel") is not N
 # to a no-op decorator so the rest of the SDK remains usable.
 try:  # pragma: no cover - import guard
     from semantic_kernel.functions import kernel_function
-    from semantic_kernel.exceptions import KernelFunctionException
-except Exception:  # pragma: no cover - SK not installed
+    try:
+        from semantic_kernel.exceptions import KernelFunctionException
+    except ImportError:
+        # KernelFunctionException doesn't exist in some SK versions
+        KernelFunctionException = Exception  # type: ignore
+except ImportError:  # pragma: no cover - SK not installed
 
 
     def kernel_function(func: Any = None, **_: Any):  # type: ignore[override]
@@ -233,6 +237,26 @@ VECTOR_ERROR_CODES = VectorCoercionErrorCodes(framework_label="semantic_kernel")
 VECTOR_LIMITS = VectorResourceLimits()
 VECTOR_FLAGS = VectorValidationFlags()
 TOPK_WARNING_CONFIG = TopKWarningConfig(framework_label="semantic_kernel")
+
+
+class SemanticKernelVectorFrameworkTranslator(DefaultVectorFrameworkTranslator):
+    """
+    Custom translator for Semantic Kernel that returns QueryResult objects directly.
+    
+    This overrides the default behavior of converting QueryResult to dict,
+    since the Semantic Kernel adapter needs the full QueryResult object
+    to extract matches and apply post-processing.
+    """
+    
+    def translate_query_result(
+        self,
+        result: QueryResult,
+        *,
+        op_ctx: OperationContext,
+        framework_ctx: Optional[Any] = None,
+    ) -> QueryResult:
+        """Return QueryResult directly without converting to dict."""
+        return result
 
 
 class CorpusSemanticKernelVectorStore:
@@ -352,8 +376,11 @@ class CorpusSemanticKernelVectorStore:
         - Batch splitting according to backend capabilities
         - Raw→spec translation (dicts → QuerySpec/UpsertSpec/DeleteSpec)
         - Error recovery and partial failure handling for batch operations
+        
+        Uses SemanticKernelVectorFrameworkTranslator to return QueryResult objects
+        directly instead of converting them to dicts.
         """
-        framework_translator = DefaultVectorFrameworkTranslator()
+        framework_translator = SemanticKernelVectorFrameworkTranslator()
         return VectorTranslator(
             adapter=self.corpus_adapter,
             framework="semantic_kernel",
@@ -875,17 +902,25 @@ class CorpusSemanticKernelVectorStore:
         vectors: List[Vector],
         *,
         namespace: Optional[str],
-    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Build the raw upsert request + framework_ctx for VectorTranslator.
+        
+        Returns a list of document dicts that the VectorTranslator can process.
+        Each dict has 'id', 'vector', 'metadata', and 'namespace' fields.
         """
         ns = self._effective_namespace(namespace)
-        raw: Dict[str, Any] = {
-            "namespace": ns,
-            "vectors": vectors,
-        }
+        # Convert Vector objects to dicts expected by VectorTranslator
+        raw_documents: List[Dict[str, Any]] = []
+        for v in vectors:
+            raw_documents.append({
+                "id": v.id,
+                "vector": v.vector,
+                "metadata": v.metadata or {},
+                "namespace": v.namespace or ns,
+            })
         framework_ctx = self._framework_ctx_for_namespace(ns)
-        return raw, framework_ctx
+        return raw_documents, framework_ctx
 
     def _build_query_request(
         self,
