@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import importlib
-import inspect
-from collections.abc import Sequence
-from typing import Any, Callable, Type
+from typing import Any, Callable, Dict, Optional, Sequence, Tuple, Type
 
 import pytest
 
@@ -14,9 +12,9 @@ from tests.frameworks.registries.vector_registry import (
     iter_vector_framework_descriptors,
 )
 
-VECTOR_OPERATION_PREFIX = "vector_"
+# IMPORTANT: wire/protocol operation names use "vector.<op>"
+VECTOR_OPERATION_PREFIX = "vector."
 FAILURE_MESSAGE_SYNC = "intentional vector backend failure (sync)"
-FAILURE_MESSAGE_ASYNC = "intentional vector backend failure (async)"
 
 
 # ---------------------------------------------------------------------------
@@ -45,147 +43,56 @@ def framework_descriptor_fixture(
 
 
 # ---------------------------------------------------------------------------
-# "Evil" vector backends
+# Helpers: robust "construct a minimal instance" for protocol result classes
 # ---------------------------------------------------------------------------
 
 
-class InvalidResultVectorAdapter:
+def _construct_minimal(cls: Type[Any], **overrides: Any) -> Any:
     """
-    Backend that returns blatantly invalid results.
+    Best-effort constructor for protocol result objects.
 
-    - query() / query_mmr() return non-vector scalar values
-    - query_stream() / astream_query() return non-iterables
-    - async variants mirror the same shape errors
-
-    Framework adapters should surface coercion / validation errors rather
-    than silently treating these as valid vector results.
+    This avoids hardcoding dataclass signatures across SDK changes:
+    - Uses inspect.signature to fill required params with safe defaults
+    - Applies overrides (e.g., matches=[], upserted_count=0)
     """
+    import inspect
 
-    # Sync add / delete surfaces (kept simple; not directly asserted here)
-    def add(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-an-add-result"
+    sig = inspect.signature(cls)  # type: ignore[arg-type]
+    kwargs: Dict[str, Any] = {}
 
-    def delete(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-a-delete-result"
+    for name, param in sig.parameters.items():
+        if name == "self":
+            continue
+        if name in overrides:
+            continue
 
-    # Sync query surfaces
-    def query(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-a-query-result"
+        if param.default is not inspect._empty:
+            # Let default apply by not providing it.
+            continue
 
-    def query_stream(self, *args: Any, **kwargs: Any) -> Any:
-        # Return something that is not iterable
-        return 123456
+        # Required parameter: choose a conservative default by annotation/name.
+        ann = param.annotation
+        if name in {"matches", "failures", "items", "results"}:
+            kwargs[name] = []
+        elif name.endswith("_count") or name in {"count"}:
+            kwargs[name] = 0
+        elif name in {"ok", "success"}:
+            kwargs[name] = True
+        elif ann in (int, float, bool, str):
+            if ann is int:
+                kwargs[name] = 0
+            elif ann is float:
+                kwargs[name] = 0.0
+            elif ann is bool:
+                kwargs[name] = False
+            else:
+                kwargs[name] = ""
+        else:
+            # Fallback: None is usually accepted for optional-ish fields.
+            kwargs[name] = None
 
-    def query_mmr(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-an-mmr-result"
-
-    # Async variants
-    async def aadd(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-an-add-result"
-
-    async def adelete(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-a-delete-result"
-
-    async def aquery(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-a-query-result"
-
-    async def astream_query(self, *args: Any, **kwargs: Any) -> Any:
-        # Could be an awaitable that resolves to a non-iterable
-        return 123456
-
-    async def aquery_mmr(self, *args: Any, **kwargs: Any) -> Any:
-        return "not-an-mmr-result"
-
-
-class EmptyResultVectorAdapter:
-    """
-    Backend that always returns obviously empty results.
-
-    Used to verify that adapters do not crash when backends return degenerate
-    responses for query / stream / MMR surfaces.
-    """
-
-    # Sync surfaces
-    def add(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    def delete(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    def query(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    def query_stream(self, *args: Any, **kwargs: Any) -> Any:
-        return iter(())
-
-    def query_mmr(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    # Async surfaces
-    async def aadd(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    async def adelete(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    async def aquery(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-    async def astream_query(self, *args: Any, **kwargs: Any) -> Any:
-        async def _aiter():
-            if False:  # pragma: no cover - structure only
-                yield None
-
-        return _aiter()
-
-    async def aquery_mmr(self, *args: Any, **kwargs: Any) -> Any:
-        return []
-
-
-class RaisingVectorAdapter:
-    """
-    Backend that always raises.
-
-    Used to validate that error-context decorators still attach context when
-    failures originate in the vector backend rather than the higher-level code.
-    """
-
-    # Sync surfaces
-    def add(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_SYNC)
-
-    def delete(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_SYNC)
-
-    def query(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_SYNC)
-
-    def query_stream(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_SYNC)
-
-    def query_mmr(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_SYNC)
-
-    # Async surfaces
-    async def aadd(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-    async def adelete(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-    async def aquery(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-    async def astream_query(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-    async def aquery_mmr(self, *args: Any, **kwargs: Any) -> Any:
-        raise RuntimeError(FAILURE_MESSAGE_ASYNC)
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
+    kwargs.update(overrides)
+    return cls(**kwargs)  # type: ignore[misc]
 
 
 def _get_method(instance: Any, name: str | None) -> Callable[..., Any]:
@@ -203,83 +110,272 @@ def _make_client_with_evil_backend(
     """
     Instantiate the framework vector client with an 'evil' backend.
 
-    This bypasses the normal adapter fixture wiring and lets us simulate
-    misbehaving backends in a controlled way.
+    IMPORTANT:
+    The registry is the source of truth:
+    - import via descriptor.adapter_module
+    - class via descriptor.adapter_class
+    - inject underlying adapter using descriptor.adapter_init_kwarg (NOT hardcoded)
     """
     module = importlib.import_module(framework_descriptor.adapter_module)
     client_cls = getattr(module, framework_descriptor.adapter_class)
 
     backend = backend_cls()
-    instance = client_cls(adapter=backend)
+    init_kw = {framework_descriptor.adapter_init_kwarg: backend}
+    instance = client_cls(**init_kw)
 
-    # If adapters cache the backend under a different attribute, they should
-    # still be referencing the same object we passed as `adapter`.
     return instance
 
 
-def _call_query(
+def _maybe_with_context_kwargs(
     descriptor: VectorFrameworkDescriptor,
-    instance: Any,
-    text: str,
-) -> Any:
-    query_fn = _get_method(instance, descriptor.query_method)
+) -> Dict[str, Any]:
+    """
+    Build framework-specific context kwargs if the wrapper supports a context kwarg.
+    """
     if descriptor.context_kwarg:
-        return query_fn(text, **{descriptor.context_kwarg: {}})
-    return query_fn(text)
+        # Always pass an empty context object; content is not under test here.
+        return {descriptor.context_kwarg: {}}
+    return {}
 
 
-def _call_stream(
-    descriptor: VectorFrameworkDescriptor,
-    instance: Any,
-    text: str,
-) -> Any:
-    assert descriptor.stream_query_method is not None
-    stream_fn = _get_method(instance, descriptor.stream_query_method)
-    if descriptor.context_kwarg:
-        return stream_fn(text, **{descriptor.context_kwarg: {}})
-    return stream_fn(text)
-
-
-def _call_mmr(
-    descriptor: VectorFrameworkDescriptor,
-    instance: Any,
-    text: str,
-) -> Any:
-    assert descriptor.mmr_query_method is not None
-    mmr_fn = _get_method(instance, descriptor.mmr_query_method)
-    if descriptor.context_kwarg:
-        return mmr_fn(text, **{descriptor.context_kwarg: {}})
-    return mmr_fn(text)
-
-
-def _patch_attach_context(
+def _patch_attach_context_best_effort(
     monkeypatch: pytest.MonkeyPatch,
-    module: Any,
+    adapter_module: Any,
 ) -> list[tuple[BaseException, dict[str, Any]]]:
     """
-    Patch the module-local attach_context used by decorators and capture calls.
+    Patch attach_context where it is most likely to be invoked for protocol-level errors.
+
+    We patch BOTH:
+      1) The adapter module (framework module-local attach_context if used by decorators)
+      2) The shared VectorTranslator module (protocol/wire op error context)
+
+    The test asserts we capture at least one call across these patch points.
     """
     calls: list[tuple[BaseException, dict[str, Any]]] = []
 
     def fake_attach_context(exc: BaseException, **ctx: Any) -> None:
         calls.append((exc, ctx))
 
-    monkeypatch.setattr(module, "attach_context", fake_attach_context)
+    # 1) Framework adapter module-local attach_context (if present)
+    if hasattr(adapter_module, "attach_context"):
+        monkeypatch.setattr(adapter_module, "attach_context", fake_attach_context)
+
+    # 2) Shared translator module attach_context (protocol-focused)
+    try:
+        vt_module = importlib.import_module(
+            "corpus_sdk.vector.framework_adapters.common.vector_translation"
+        )
+    except Exception:
+        vt_module = None
+
+    if vt_module is not None and hasattr(vt_module, "attach_context"):
+        monkeypatch.setattr(vt_module, "attach_context", fake_attach_context)
+
     return calls
 
 
 # ---------------------------------------------------------------------------
-# Invalid result behavior (sync + async)
+# "Evil" protocol backends (VectorProtocolV1-shaped)
 # ---------------------------------------------------------------------------
 
 
-def test_invalid_backend_result_causes_errors_for_sync_query(
+class InvalidResultVectorAdapter:
+    """
+    Backend that returns blatantly invalid result objects for protocol methods.
+
+    Used to test that query operations properly validate result types.
+    """
+
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-capabilities-result"
+
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-health-result"
+
+    async def query(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-query-result"
+
+    async def batch_query(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-batch-query-result"
+
+    async def upsert(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-an-upsert-result"
+
+    async def delete(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-delete-result"
+
+    async def create_namespace(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-create-namespace-result"
+
+    async def delete_namespace(self, *args: Any, **kwargs: Any) -> Any:
+        return "not-a-delete-namespace-result"
+
+
+class EmptyResultVectorAdapter:
+    """
+    Backend that returns empty-but-valid protocol results.
+
+    Used to verify wrappers do not crash on degenerate (empty) results that may
+    be valid in vector space (e.g., zero matches).
+    """
+
+    def __init__(self) -> None:
+        from corpus_sdk.vector.vector_base import (
+            DeleteResult,
+            QueryResult,
+            UpsertResult,
+            VectorCapabilities,
+        )
+
+        self._QueryResult = QueryResult
+        self._VectorCapabilities = VectorCapabilities
+        self._UpsertResult = UpsertResult
+        self._DeleteResult = DeleteResult
+
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        # Minimal caps; rely on defaults where possible.
+        return _construct_minimal(self._VectorCapabilities)
+
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        # Health surface varies; commonly a bool/dict. Keep it harmless.
+        return {"ok": True}
+
+    async def query(self, *args: Any, **kwargs: Any) -> Any:
+        return _construct_minimal(self._QueryResult, matches=[])
+
+    async def batch_query(self, raw_queries: Any, *args: Any, **kwargs: Any) -> Any:
+        # If caller asks empty batch, empty batch result is valid.
+        try:
+            if raw_queries is None:
+                return []
+            if isinstance(raw_queries, Sequence) and len(raw_queries) == 0:
+                return []
+        except Exception:
+            pass
+        # Otherwise return a parallel structure with empty QueryResults where possible.
+        try:
+            n = len(raw_queries)  # type: ignore[arg-type]
+        except Exception:
+            n = 1
+        return [_construct_minimal(self._QueryResult, matches=[]) for _ in range(int(n))]
+
+    async def upsert(self, *args: Any, **kwargs: Any) -> Any:
+        return _construct_minimal(self._UpsertResult, upserted_count=0, failed_count=0, failures=[])
+
+    async def delete(self, *args: Any, **kwargs: Any) -> Any:
+        return _construct_minimal(self._DeleteResult)
+
+    async def create_namespace(self, *args: Any, **kwargs: Any) -> Any:
+        return {"created": True}
+
+    async def delete_namespace(self, *args: Any, **kwargs: Any) -> Any:
+        return {"deleted": True}
+
+
+class RaisingVectorAdapter:
+    """
+    Backend that always raises.
+
+    Used to validate that error-context attachment occurs when failures originate
+    in the underlying protocol backend.
+    """
+
+    async def capabilities(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def health(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def query(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def batch_query(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def upsert(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def delete(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def create_namespace(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+    async def delete_namespace(self, *args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(FAILURE_MESSAGE_SYNC)
+
+
+# ---------------------------------------------------------------------------
+# Protocol-call helpers (registry-driven)
+# ---------------------------------------------------------------------------
+
+
+def _call_capabilities(descriptor: VectorFrameworkDescriptor, instance: Any) -> Any:
+    fn = _get_method(instance, descriptor.capabilities_method)
+    # Capabilities typically accept only the framework context kwarg if any.
+    return fn(**_maybe_with_context_kwargs(descriptor))
+
+
+def _call_health(descriptor: VectorFrameworkDescriptor, instance: Any) -> Any:
+    fn = _get_method(instance, descriptor.health_method)
+    return fn(**_maybe_with_context_kwargs(descriptor))
+
+
+def _call_query(descriptor: VectorFrameworkDescriptor, instance: Any, raw_query: Any) -> Any:
+    fn = _get_method(instance, descriptor.query_method)
+    return fn(raw_query, **_maybe_with_context_kwargs(descriptor))
+
+
+def _call_batch_query(
+    descriptor: VectorFrameworkDescriptor, instance: Any, raw_queries: Any
+) -> Any:
+    assert descriptor.batch_query_method is not None
+    fn = _get_method(instance, descriptor.batch_query_method)
+    return fn(raw_queries, **_maybe_with_context_kwargs(descriptor))
+
+
+def _call_upsert(descriptor: VectorFrameworkDescriptor, instance: Any, raw_docs: Any) -> Any:
+    fn = _get_method(instance, descriptor.upsert_method)
+    return fn(raw_docs, **_maybe_with_context_kwargs(descriptor))
+
+
+def _call_delete(
+    descriptor: VectorFrameworkDescriptor, instance: Any, raw_filter_or_ids: Any
+) -> Any:
+    fn = _get_method(instance, descriptor.delete_method)
+    return fn(raw_filter_or_ids, **_maybe_with_context_kwargs(descriptor))
+
+
+def _call_create_namespace(
+    descriptor: VectorFrameworkDescriptor, instance: Any, name: str, dimensions: int = 384
+) -> Any:
+    fn = _get_method(instance, descriptor.create_namespace_method)
+    # Namespace creation requires dimensions - pass via context if framework expects it
+    ctx_kwargs = _maybe_with_context_kwargs(descriptor)
+    if descriptor.context_kwarg and descriptor.context_kwarg in ctx_kwargs:
+        # Add dimensions to framework context
+        ctx_kwargs[descriptor.context_kwarg]["dimensions"] = dimensions
+    return fn(name, **ctx_kwargs)
+
+
+def _call_delete_namespace(
+    descriptor: VectorFrameworkDescriptor, instance: Any, name: str
+) -> Any:
+    fn = _get_method(instance, descriptor.delete_namespace_method)
+    return fn(name, **_maybe_with_context_kwargs(descriptor))
+
+
+# ---------------------------------------------------------------------------
+# Invalid result behavior (protocol-focused)
+# ---------------------------------------------------------------------------
+
+
+def test_invalid_backend_result_causes_errors_for_query(
     framework_descriptor: VectorFrameworkDescriptor,
 ) -> None:
     """
     If the backend returns a clearly invalid result type for query(), the
-    framework adapter should surface an error rather than silently treating
-    it as a valid vector result.
+    wrapper/translator should surface an error rather than silently accepting it.
     """
     instance = _make_client_with_evil_backend(
         framework_descriptor,
@@ -287,19 +383,18 @@ def test_invalid_backend_result_causes_errors_for_sync_query(
     )
 
     with pytest.raises(Exception):  # noqa: BLE001
-        _call_query(framework_descriptor, instance, "invalid-query-test")
+        _call_query(framework_descriptor, instance, {"vector": [0.0], "top_k": 1})
 
 
-def test_invalid_backend_result_causes_errors_for_sync_stream_when_declared(
+def test_invalid_backend_result_causes_errors_for_batch_query_when_declared(
     framework_descriptor: VectorFrameworkDescriptor,
 ) -> None:
     """
-    Same as the query test, but for the sync streaming surface when declared.
+    If batch_query exists on the wrapper surface (as declared by the registry),
+    invalid backend results for batch_query() should surface as errors.
     """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+    if not framework_descriptor.has_batch_query:
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not expose batch_query surface")
 
     instance = _make_client_with_evil_backend(
         framework_descriptor,
@@ -307,148 +402,7 @@ def test_invalid_backend_result_causes_errors_for_sync_stream_when_declared(
     )
 
     with pytest.raises(Exception):  # noqa: BLE001
-        iterator = _call_stream(
-            framework_descriptor,
-            instance,
-            "invalid-stream-test",
-        )
-
-        # Force iteration to trigger type/shape errors
-        for _ in iterator:  # noqa: B007
-            pass
-
-
-def test_invalid_backend_result_causes_errors_for_sync_mmr_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
-) -> None:
-    """
-    When MMR is declared, invalid backend results for query_mmr() should also
-    surface as errors, not be treated as valid-looking MMR results.
-    """
-    if not framework_descriptor.mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare MMR support",
-        )
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultVectorAdapter,
-    )
-
-    with pytest.raises(Exception):  # noqa: BLE001
-        _call_mmr(framework_descriptor, instance, "invalid-mmr-test")
-
-
-@pytest.mark.asyncio
-async def test_async_invalid_backend_result_causes_errors_for_query_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-) -> None:
-    """
-    When async query is supported, invalid backend results for async query()
-    should also surface as errors.
-    """
-    if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultVectorAdapter,
-    )
-
-    aquery_fn = _get_method(
-        instance,
-        framework_descriptor.async_query_method,
-    )
-
-    with pytest.raises(Exception):  # noqa: BLE001
-        if framework_descriptor.context_kwarg:
-            coro = aquery_fn(
-                "invalid-async-query-test",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = aquery_fn("invalid-async-query-test")
-
-        assert inspect.isawaitable(coro), "Async query method must return an awaitable"
-        await coro  # noqa: PT018
-
-
-@pytest.mark.asyncio
-async def test_async_invalid_backend_result_causes_errors_for_stream_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-) -> None:
-    """
-    When async streaming is supported, invalid backend results for
-    astream_query() should also surface as errors.
-    """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultVectorAdapter,
-    )
-
-    astream_fn = _get_method(
-        instance,
-        framework_descriptor.async_stream_query_method,
-    )
-
-    with pytest.raises(Exception):  # noqa: BLE001
-        if framework_descriptor.context_kwarg:
-            aiter = astream_fn(
-                "invalid-async-stream-test",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            aiter = astream_fn("invalid-async-stream-test")
-
-        # Allow awaitable -> async iterator or async iterator directly
-        if inspect.isawaitable(aiter):
-            aiter = await aiter  # type: ignore[assignment]
-
-        async for _ in aiter:  # noqa: B007
-            pass
-
-
-@pytest.mark.asyncio
-async def test_async_invalid_backend_result_causes_errors_for_mmr_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-) -> None:
-    """
-    When async MMR is supported, invalid backend results for async query_mmr()
-    should also surface as errors.
-    """
-    if not framework_descriptor.async_mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async MMR support",
-        )
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        InvalidResultVectorAdapter,
-    )
-
-    ammr_fn = _get_method(
-        instance,
-        framework_descriptor.async_mmr_query_method,
-    )
-
-    with pytest.raises(Exception):  # noqa: BLE001
-        if framework_descriptor.context_kwarg:
-            coro = ammr_fn(
-                "invalid-async-mmr-test",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = ammr_fn("invalid-async-mmr-test")
-
-        assert inspect.isawaitable(coro), "Async MMR method must return an awaitable"
-        await coro  # noqa: PT018
+        _call_batch_query(framework_descriptor, instance, [{"vector": [0.0], "top_k": 1}])
 
 
 # ---------------------------------------------------------------------------
@@ -460,69 +414,59 @@ def test_empty_backend_query_does_not_crash(
     framework_descriptor: VectorFrameworkDescriptor,
 ) -> None:
     """
-    When the backend returns an obviously empty result for query(), the adapter
-    should not crash. Empty results may be valid in vector space, so this test
-    only asserts that the call completes without raising.
+    When the backend returns an empty-but-valid result for query(), the adapter
+    should not crash. Empty matches may be valid.
     """
     instance = _make_client_with_evil_backend(
         framework_descriptor,
         EmptyResultVectorAdapter,
     )
 
-    _call_query(framework_descriptor, instance, "empty-query-test")
-    # If we reach here, the test passes; no further shape assertion necessary.
+    _call_query(framework_descriptor, instance, {"vector": [0.0], "top_k": 1})
 
 
-def test_empty_backend_stream_does_not_crash_when_declared(
+def test_empty_backend_batch_query_does_not_crash_when_declared(
     framework_descriptor: VectorFrameworkDescriptor,
 ) -> None:
     """
-    When streaming is declared, an empty backend stream should not cause errors.
+    When batch_query is declared, an empty batch should not crash.
     """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+    if not framework_descriptor.has_batch_query:
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not expose batch_query surface")
 
     instance = _make_client_with_evil_backend(
         framework_descriptor,
         EmptyResultVectorAdapter,
     )
 
-    iterator = _call_stream(
-        framework_descriptor,
-        instance,
-        "empty-stream-test",
-    )
-
-    # Iterating over an empty stream should be fine.
-    for _ in iterator:  # noqa: B007
-        pass
+    # Empty batch in -> empty batch out is valid.
+    _call_batch_query(framework_descriptor, instance, [])
 
 
-def test_empty_backend_mmr_does_not_crash_when_declared(
-    framework_descriptor: VectorFrameworkDescriptor,
+# ---------------------------------------------------------------------------
+# Error-context when backend raises (protocol-focused)
+# ---------------------------------------------------------------------------
+
+
+def _assert_error_context_calls(
+    calls: list[tuple[BaseException, dict[str, Any]]],
+    *,
+    framework_name: str,
 ) -> None:
-    """
-    When MMR is declared, an empty backend MMR result should not cause errors.
-    """
-    if not framework_descriptor.mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare MMR support",
-        )
+    assert calls, "attach_context was not called for backend failure"
 
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        EmptyResultVectorAdapter,
-    )
+    exc, ctx = calls[-1]
+    assert isinstance(exc, BaseException)
 
-    _call_mmr(framework_descriptor, instance, "empty-mmr-test")
-    # Again, just asserting that the call completes successfully.
+    # We require these stable observability keys.
+    assert "framework" in ctx
+    assert "operation" in ctx
 
+    assert ctx["framework"] == framework_name
 
-# ---------------------------------------------------------------------------
-# Error-context when backend raises
-# ---------------------------------------------------------------------------
+    # Operation should follow base wire naming: "vector.<op>"
+    op_val = str(ctx["operation"])
+    assert op_val.startswith(VECTOR_OPERATION_PREFIX), f"operation={op_val!r} did not start with {VECTOR_OPERATION_PREFIX!r}"
 
 
 def test_backend_exception_is_wrapped_with_error_context_on_query(
@@ -530,14 +474,11 @@ def test_backend_exception_is_wrapped_with_error_context_on_query(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When the backend raises during a sync query operation, the framework
-    adapter's error-context decorator should:
-
-    - call attach_context() with the exception and useful metadata, and
-    - re-raise the original exception (or a wrapped one).
+    When the backend raises during a sync query operation, the protocol layer
+    should attach error context and re-raise the exception.
     """
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
+    adapter_module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context_best_effort(monkeypatch, adapter_module)
 
     instance = _make_client_with_evil_backend(
         framework_descriptor,
@@ -545,33 +486,23 @@ def test_backend_exception_is_wrapped_with_error_context_on_query(
     )
 
     with pytest.raises(RuntimeError, match="backend failure"):
-        _call_query(framework_descriptor, instance, "err-query")
+        _call_query(framework_descriptor, instance, {"vector": [0.0], "top_k": 1})
 
-    assert calls, "attach_context was not called for backend query failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
 
-def test_backend_exception_is_wrapped_with_error_context_on_stream_when_supported(
+def test_backend_exception_is_wrapped_with_error_context_on_batch_query_when_declared(
     framework_descriptor: VectorFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Same as the query error-context test, but for the sync streaming surface
-    when declared.
+    Same as query error-context test, but for batch_query when the wrapper surface exists.
     """
-    if not framework_descriptor.stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare sync streaming",
-        )
+    if not framework_descriptor.has_batch_query:
+        pytest.skip(f"Framework '{framework_descriptor.name}' does not expose batch_query surface")
 
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
+    adapter_module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context_best_effort(monkeypatch, adapter_module)
 
     instance = _make_client_with_evil_backend(
         framework_descriptor,
@@ -579,40 +510,20 @@ def test_backend_exception_is_wrapped_with_error_context_on_stream_when_supporte
     )
 
     with pytest.raises(RuntimeError, match="backend failure"):
-        iterator = _call_stream(
-            framework_descriptor,
-            instance,
-            "err-stream",
-        )
+        _call_batch_query(framework_descriptor, instance, [{"vector": [0.0], "top_k": 1}])
 
-        for _ in iterator:  # noqa: B007
-            pass
-
-    assert calls, "attach_context was not called for backend stream failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
 
-def test_backend_exception_is_wrapped_with_error_context_on_mmr_when_supported(
+def test_backend_exception_is_wrapped_with_error_context_on_capabilities_and_health(
     framework_descriptor: VectorFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Same as the query error-context test, but for the sync MMR surface
-    when declared.
+    Validate context attachment for capabilities() and health() failures.
     """
-    if not framework_descriptor.mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare MMR support",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
+    adapter_module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context_best_effort(monkeypatch, adapter_module)
 
     instance = _make_client_with_evil_backend(
         framework_descriptor,
@@ -620,170 +531,52 @@ def test_backend_exception_is_wrapped_with_error_context_on_mmr_when_supported(
     )
 
     with pytest.raises(RuntimeError, match="backend failure"):
-        _call_mmr(
-            framework_descriptor,
-            instance,
-            "err-mmr",
-        )
+        _call_capabilities(framework_descriptor, instance)
 
-    assert calls, "attach_context was not called for backend MMR failure"
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    # Reset calls and test health separately (clearer failure attribution)
+    calls.clear()
+
+    with pytest.raises(RuntimeError, match="backend failure"):
+        _call_health(framework_descriptor, instance)
+
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
 
-@pytest.mark.asyncio
-async def test_async_backend_exception_is_wrapped_with_error_context_on_query_when_supported(
+def test_backend_exception_is_wrapped_with_error_context_on_upsert_delete_and_namespace_ops(
     framework_descriptor: VectorFrameworkDescriptor,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When async is supported, backend exceptions in async query should also go
-    through the error-context decorators and call attach_context().
+    Validate context attachment for upsert/delete/namespace operations failures.
     """
-    if not framework_descriptor.async_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async query",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
+    adapter_module = importlib.import_module(framework_descriptor.adapter_module)
+    calls = _patch_attach_context_best_effort(monkeypatch, adapter_module)
 
     instance = _make_client_with_evil_backend(
         framework_descriptor,
         RaisingVectorAdapter,
     )
 
-    aquery_fn = _get_method(
-        instance,
-        framework_descriptor.async_query_method,
-    )
-
     with pytest.raises(RuntimeError, match="backend failure"):
-        if framework_descriptor.context_kwarg:
-            coro = aquery_fn(
-                "err-async-query",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = aquery_fn("err-async-query")
+        _call_upsert(framework_descriptor, instance, {"id": "test-id", "vector": [0.1, 0.2], "metadata": {}})
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
-        assert inspect.isawaitable(coro), "Async query method must return an awaitable"
-        await coro  # noqa: PT018
-
-    assert calls, "attach_context was not called for async backend query failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
-
-
-@pytest.mark.asyncio
-async def test_async_backend_exception_is_wrapped_with_error_context_on_stream_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    When async streaming is supported, backend exceptions in async stream
-    should also go through the error-context decorators and call attach_context().
-    """
-    if not framework_descriptor.async_stream_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async streaming",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingVectorAdapter,
-    )
-
-    astream_fn = _get_method(
-        instance,
-        framework_descriptor.async_stream_query_method,
-    )
-
+    calls.clear()
     with pytest.raises(RuntimeError, match="backend failure"):
-        if framework_descriptor.context_kwarg:
-            aiter = astream_fn(
-                "err-async-stream",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            aiter = astream_fn("err-async-stream")
+        _call_delete(framework_descriptor, instance, {"ids": []})
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
-        if inspect.isawaitable(aiter):
-            aiter = await aiter  # type: ignore[assignment]
-
-        async for _ in aiter:  # noqa: B007
-            pass
-
-    assert calls, "attach_context was not called for async backend stream failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
-
-
-@pytest.mark.asyncio
-async def test_async_backend_exception_is_wrapped_with_error_context_on_mmr_when_supported(
-    framework_descriptor: VectorFrameworkDescriptor,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    When async MMR is supported, backend exceptions in async MMR should also
-    go through the error-context decorators and call attach_context().
-    """
-    if not framework_descriptor.async_mmr_query_method:
-        pytest.skip(
-            f"Framework '{framework_descriptor.name}' does not declare async MMR support",
-        )
-
-    module = importlib.import_module(framework_descriptor.adapter_module)
-    calls = _patch_attach_context(monkeypatch, module)
-
-    instance = _make_client_with_evil_backend(
-        framework_descriptor,
-        RaisingVectorAdapter,
-    )
-
-    ammr_fn = _get_method(
-        instance,
-        framework_descriptor.async_mmr_query_method,
-    )
-
+    calls.clear()
     with pytest.raises(RuntimeError, match="backend failure"):
-        if framework_descriptor.context_kwarg:
-            coro = ammr_fn(
-                "err-async-mmr",
-                **{framework_descriptor.context_kwarg: {}},
-            )
-        else:
-            coro = ammr_fn("err-async-mmr")
+        _call_create_namespace(framework_descriptor, instance, "ns-err")
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
-        assert inspect.isawaitable(coro), "Async MMR method must return an awaitable"
-        await coro  # noqa: PT018
-
-    assert calls, "attach_context was not called for async backend MMR failure"
-
-    exc, ctx = calls[-1]
-    assert isinstance(exc, RuntimeError)
-    assert "framework" in ctx
-    assert "operation" in ctx
-    assert ctx["framework"] == framework_descriptor.name
-    assert str(ctx["operation"]).startswith(VECTOR_OPERATION_PREFIX)
+    calls.clear()
+    with pytest.raises(RuntimeError, match="backend failure"):
+        _call_delete_namespace(framework_descriptor, instance, "ns-err")
+    _assert_error_context_calls(calls, framework_name=framework_descriptor.name)
 
 
 if __name__ == "__main__":
