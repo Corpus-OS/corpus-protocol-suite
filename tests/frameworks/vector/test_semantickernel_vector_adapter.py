@@ -14,7 +14,7 @@ Update note (alignment):
 - Prior IMemoryStore/MemoryRecord-based tests have been replaced with store/plugin
   contract tests aligned to the current implementation. All existing section
   headers and documentation were preserved and expanded for clarity.
-  
+
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-import corpus_sdk.vector.framework_adapters.semantic_kernel as sk_adapter_module
-from corpus_sdk.vector.framework_adapters.semantic_kernel import (
+import corpus_sdk.vector.framework_adapters.semanctic_kernel as sk_adapter_module
+from corpus_sdk.vector.framework_adapters.semanctic_kernel import (
     CorpusSemanticKernelVectorPlugin,
     CorpusSemanticKernelVectorStore,
 )
