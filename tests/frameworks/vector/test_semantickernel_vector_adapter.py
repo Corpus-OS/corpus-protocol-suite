@@ -1,4 +1,5 @@
 """
+
 Semantic Kernel Vector framework adapter tests.
 
 These tests are written against the current public API in
@@ -13,6 +14,7 @@ Update note (alignment):
 - Prior IMemoryStore/MemoryRecord-based tests have been replaced with store/plugin
   contract tests aligned to the current implementation. All existing section
   headers and documentation were preserved and expanded for clarity.
+  
 """
 
 from __future__ import annotations
