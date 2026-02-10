@@ -1,7 +1,7 @@
 # CORPUS (Core Orchestration Runtime for Polyglot Unified Systems) Protocol and SDK
 
 ![Version](https://img.shields.io/badge/version-1.0.0-blue)
-![Python](https://img.shields.io/badge/python-3.9+-blue)
+![Python](https://img.shields.io/badge/python-3.10+-blue)
 
 Reference implementation of the **CORPUS Protocols Suite** — a **wire-first, vendor-neutral** SDK for interoperable AI/data backends: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
@@ -246,8 +246,8 @@ If any of these stop being true, `corpus_sdk` is the incremental next step; **CO
 pip install corpus_sdk
 ```
 
-* Python ≥ 3.9 recommended
-* No heavy runtime dependencies; bring your own metrics sink or use the provided `NoopMetrics`.
+* Python ≥ 3.10 recommended
+* No heavy runtime dependencies; bring your own metrics sink or use the provided `NoopMetrics`
 
 ---
 
@@ -917,6 +917,131 @@ logging.getLogger("corpus_sdk").setLevel(logging.DEBUG)
 **Q: How do I test my adapter?**
 
 **A:** Use the protocol as a contract. Verify your adapter satisfies `isinstance(adapter, ProtocolV1)` and test all `_do_*` method implementations.
+**Contact:** [sales@corpus.io](mailto:sales@corpus.io) or visit [corpus.io/pricing](https://corpus.io/pricing)
+
+## Corpus Router: Enterprise AI Infrastructure Orchestration**
+
+**One routing layer. Four AI domains. Learns what works.**
+
+---
+
+## **Core Features (All Tiers)**
+
+### **Universal Interface**
+One API for AI infrastructure across four domains: LLM providers, vector databases, graph databases, embedding systems. Switch backends without changing application code—just update routing config.
+
+### **Multi-Provider Routing & Failover**
+Route requests across providers in any domain. Automatic failover when services fail. 99.99% uptime even during outages.
+
+### **Request/Response Validation**
+Catch errors before expensive calls. Validate structure, enforce limits, ensure schema compliance. Stop bad requests in <1ms, not after 30 seconds.
+
+### **Unified Observability & Logging**
+Single dashboard for all domains and providers. Track latency, cost, success rates across LLMs, vector DBs, graph DBs, embeddings. Debug failures instantly with request-level traces.
+
+### **Cost Tracking & Attribution**
+Real-time cost per user, team, and project. Set budgets, get alerts before overruns. See exactly where AI infrastructure spend goes—no surprise bills.
+
+### **Deadline Propagation & Cancellation**
+Respect user timeouts. Cancel slow requests before they waste money. No orphaned calls burning budget.
+
+---
+
+## **Enterprise Features**
+
+### **Self-Learning Routing (Privacy-Preserving)**
+
+**Learns optimal routing without seeing your data:**
+- Analyzes latency, cost, quality, success/failure patterns across all four domains
+- Routes similar requests to best-performing provider (LLM, vector DB, graph DB, embedding)
+- **Never stores request or response content**—only metadata
+
+**Per-tenant models:**
+- Each tenant gets dedicated routing model trained on their usage patterns
+- Tenant A's vector search routing learns from Tenant A's query patterns only
+- Cross-tenant learning opt-in for anonymized pattern sharing
+- Full data isolation—no tenant sees another's routing decisions
+
+**Always within guardrails:**
+- Respects budget caps, rate limits, allowlists
+- Enforces data residency and compliance
+- Every decision versioned—rollback instantly if performance drops
+
+**Typical results:** 30-50% cost reduction, maintained or improved quality across all AI infrastructure.
+
+---
+
+### **Policy Enforcement**
+Hard caps on budgets, rate limits, and provider usage across all domains. Geographic routing (GDPR, data residency). Provider allowlists per environment. Policies enforced at routing time—requests that violate policies never reach providers.
+
+---
+
+### **Advanced Analytics & Reporting**
+Trend analysis, cost forecasting, quality scoring over time. Compare provider performance side-by-side across LLM, vector, graph, embedding domains. Per-provider cost/latency/quality breakdowns. Identify optimization opportunities automatically.
+
+---
+
+### **Multi-Tenancy with Isolation Guarantees**
+Isolated routing, budgets, and policies per tenant. One router instance serves multiple teams/products. Cross-tenant data leakage impossible—cryptographic isolation.
+
+---
+
+### **On-Prem Deployment**
+Run in your VPC or air-gapped environment. Zero data leaves your network. Full control over infrastructure and compliance.
+
+---
+
+### **24/7 Support with SLAs**
+Dedicated Slack channel, <15min response time for critical issues. 99.99% uptime SLA with financial penalties if breached.
+
+---
+
+## **Key Benefits**
+
+✓ **One API, four domains** – LLM, vector, graph, embedding unified  
+✓ **10x faster response times** – Routing overhead <10ms vs. 100ms+ for alternatives  
+✓ **Transparent pricing** – Exact cost per request across all infrastructure  
+✓ **Explainable decisions** – Know WHY each routing choice was made  
+✓ **Zero downtime updates** – Hot-reload routing rules without restarts  
+✓ **Audit-ready** – Every decision versioned, policies immutable  
+✓ **No vendor lock-in** – Switch providers without code changes
+
+---
+
+## **Technical Differentiators**
+
+**Unified Configuration:**  
+All domains speak the same config language. Define routing rules once, apply to LLM, vector, graph, embedding.
+
+**Zero External Dependencies:**  
+Self-contained. Audit once, trust forever. No surprise supply-chain vulnerabilities.
+
+**Built-In Governance:**  
+A/B testing, observability, policy enforcement out-of-the-box. No duct-taping tools together.
+
+**Hot-Reload Everything:**  
+Update routing rules, budgets, allowlists—zero downtime. Deploy changes in <1 second.
+
+**Schema Fingerprinting:**  
+Detect config drift automatically. Prevent silent failures from schema mismatches.
+
+---
+
+## **How Self-Learning Works**
+
+```
+Request → Feature Extraction (complexity, domain, context, user tier)
+       → Constraint Evaluation (budgets, allowlists, quotas)
+       → Partition Resolution (tenant isolation, intent classification)
+       → Provider Selection (LLM/vector/graph/embedding options)
+       → Weighted Scoring (latency, cost, quality predictions)
+       → Calibration (monotonicity guards, override policies)
+       → Tie-Breaking (entropy fallback for equal scores)
+       → Explainability (log reasoning, flags, confidence)
+       → Route to Provider
+```
+
+**Result:** Every request gets optimal routing for its context—automatically, within policy guardrails, fully auditable.
 
 ---
 
