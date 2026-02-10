@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.stats.json",
+  "title": "Embedding Statistics",
+  "type": "object",
+  "properties": {
+    "total_requests": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_texts": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total_tokens": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cache_hits": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "cache_misses": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "avg_processing_time_ms": {
+      "type": "number",
+      "minimum": 0
+    },
+    "error_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stream_requests": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stream_chunks_generated": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stream_abandoned": {
+      "type": "integer",
+      "minimum": 0
+    }
+  },
+  "required": [
+    "total_requests",
+    "total_texts",
+    "total_tokens"
+  ],
+  "additionalProperties": false
+}

@@ -1,27 +1,44 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.types.logprobs.json",
-  "title": "LLM Logprobs",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.logprobs.json",
+  "title": "LLM Log Probabilities",
+  "description": "Optional log probability information for generated tokens (structure is forward-compatible).",
   "type": "object",
-  "additionalProperties": false,
   "properties": {
-    "tokens": { "type": "array", "items": { "type": "string" }, "maxItems": 8192 },
-    "token_logprobs": { "type": "array", "items": { "type": "number" }, "maxItems": 8192 },
-    "top_logprobs": {
+    "tokens": {
       "type": "array",
       "items": {
-        "type": "array",
-        "maxItems": 5,
-        "items": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["token", "logprob"],
-          "properties": {
-            "token": { "type": "string" },
-            "logprob": { "type": "number" }
-          }
-        }
+        "type": "string"
+      }
+    },
+    "token_logprobs": {
+      "type": "array",
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "top_logprobs": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "text_offset": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "integer"
       }
     }
-  }
+  },
+  "additionalProperties": true
 }

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.count_tokens_spec.json",
+  "title": "LLM Count Tokens Specification",
+  "type": "object",
+  "properties": {
+    "text": {
+      "type": "string"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "text"
+  ],
+  "additionalProperties": true
+}

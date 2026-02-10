@@ -1,0 +1,24 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 9.6,
+  "result": {
+    "embedding": {
+      "vector": [
+        0.05,
+        0.06
+      ],
+      "text": "hi",
+      "model": "embed-small",
+      "dimensions": 2,
+      "index": null,
+      "metadata": {
+        "x-note": "metadata allowed on embedding vector"
+      }
+    },
+    "model": "embed-small",
+    "text": "hi",
+    "tokens_used": null,
+    "truncated": false
+  }
+}

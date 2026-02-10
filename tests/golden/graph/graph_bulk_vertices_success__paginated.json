@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 17.9,
+  "result": {
+    "nodes": [
+      {
+        "id": "node_2",
+        "labels": [],
+        "properties": {}
+      }
+    ],
+    "next_cursor": "cursor_1",
+    "has_more": true
+  }
+}

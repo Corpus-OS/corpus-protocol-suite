@@ -1,0 +1,15 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_min",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream hello."
+      }
+    ]
+  }
+}

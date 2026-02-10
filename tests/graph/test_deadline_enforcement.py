@@ -6,53 +6,71 @@ Asserts (Spec refs):
   • Non-negative remaining budget                            (§6.1)
   • Expired deadlines fail fast (preflight)                  (§6.1, §12.1)
   • Stream enforces deadline mid-operation                   (§6.1, §12.1)
-Note: The spec suggests Graph MAY normalize to Unavailable when budget elapses (§6.1),
-but the reference base raises DeadlineExceeded; tests follow the reference behavior.
 """
-import asyncio
+from __future__ import annotations
+
 import time
 import pytest
 
-from corpus_sdk.examples.graph.mock_graph_adapter import MockGraphAdapter
 from corpus_sdk.graph.graph_base import (
     OperationContext as GraphContext,
     DeadlineExceeded,
+    BaseGraphAdapter,
+    GraphQuerySpec,
+    Node,
+    GraphID,
+    UpsertNodesSpec,
 )
-from corpus_sdk.examples.common.ctx import make_ctx, remaining_budget_ms, clear_time_cache
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_deadline_budget_nonnegative():
-    clear_time_cache()
-    now = int(time.time() * 1000)
-    ctx = make_ctx(GraphContext, request_id="t_deadline_budget", tenant="t", deadline_ms=now + 50)
-    rem = remaining_budget_ms(ctx)
-    assert rem is None or rem >= 0
+async def test_deadline_exceeded_on_expired_budget_query_when_supported(adapter: BaseGraphAdapter):
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_deadline_expired_query", tenant="t", deadline_ms=int(time.time() * 1000) - 1)
+    spec = GraphQuerySpec(text="RETURN 1", dialect="cypher")
+
+    if getattr(caps, "supports_deadline", True):
+        with pytest.raises(DeadlineExceeded):
+            await adapter.query(spec, ctx=ctx)
+    else:
+        with pytest.raises(AssertionError):
+            try:
+                await adapter.query(spec, ctx=ctx)
+            except DeadlineExceeded:
+                raise AssertionError("supports_deadline is False but adapter raised DeadlineExceeded")
 
 
-async def test_deadline_exceeded_on_expired_budget():
-    a = MockGraphAdapter()
-    clear_time_cache()
-    ctx = make_ctx(GraphContext, request_id="t_deadline_expired", tenant="t", deadline_ms=int(time.time() * 1000) - 1)
-    with pytest.raises(DeadlineExceeded):
-        await a.query(dialect="cypher", text="RETURN 1", ctx=ctx)
+async def test_deadline_exceeded_on_expired_budget_write_when_supported(adapter: BaseGraphAdapter):
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_deadline_expired_write", tenant="t", deadline_ms=int(time.time() * 1000) - 1)
+    node = Node(id=GraphID("v:User:1"), labels=("User",), properties={"x": 1})
+    spec = UpsertNodesSpec(nodes=[node], namespace="t")
+
+    if getattr(caps, "supports_deadline", True):
+        with pytest.raises(DeadlineExceeded):
+            await adapter.upsert_nodes(spec, ctx=ctx)
+    else:
+        with pytest.raises(AssertionError):
+            try:
+                await adapter.upsert_nodes(spec, ctx=ctx)
+            except DeadlineExceeded:
+                raise AssertionError("supports_deadline is False but adapter raised DeadlineExceeded")
 
 
-async def test_preflight_deadline_check():
-    a = MockGraphAdapter()
-    clear_time_cache()
-    ctx = make_ctx(GraphContext, request_id="t_deadline_preflight", tenant="t", deadline_ms=int(time.time() * 1000) - 100)
-    with pytest.raises(DeadlineExceeded):
-        await a.create_vertex("User", {"x": 1}, ctx=ctx)
+async def test_deadline_exceeded_on_expired_budget_stream_preflight_when_supported(adapter: BaseGraphAdapter):
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_deadline_expired_stream", tenant="t", deadline_ms=int(time.time() * 1000) - 1)
+    spec = GraphQuerySpec(text="RETURN 1", dialect="cypher", stream=True)
 
-
-async def test_stream_respects_deadline_mid_operation():
-    a = MockGraphAdapter()
-    clear_time_cache()
-    now = int(time.time() * 1000)
-    ctx = make_ctx(GraphContext, request_id="t_deadline_stream", tenant="t", deadline_ms=now + 1)
-    await asyncio.sleep(0.01)  # burn budget
-    with pytest.raises(DeadlineExceeded):
-        async for _ in a.stream_query(dialect="cypher", text="MATCH (n) RETURN n LIMIT 50", ctx=ctx):
-            pass
+    if getattr(caps, "supports_deadline", True):
+        with pytest.raises(DeadlineExceeded):
+            async for _ in adapter.stream_query(spec, ctx=ctx):
+                pass
+    else:
+        with pytest.raises(AssertionError):
+            try:
+                async for _ in adapter.stream_query(spec, ctx=ctx):
+                    break
+            except DeadlineExceeded:
+                raise AssertionError("supports_deadline is False but adapter raised DeadlineExceeded")

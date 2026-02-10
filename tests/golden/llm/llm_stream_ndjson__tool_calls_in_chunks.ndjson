@@ -1,0 +1,2 @@
+{"ok":true,"code":"STREAMING","ms":10.0,"chunk":{"text":"Calling","is_final":false,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"abc\"}"}}]}}
+{"ok":true,"code":"STREAMING","ms":12.0,"chunk":{"text":" done","is_final":true,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"lookup","arguments":"{\"q\":\"abc\"}"}}]}}

@@ -1,0 +1,15 @@
+{
+  "op": "vector.query",
+  "ctx": {
+    "request_id": "t_vector_query_min",
+    "tenant": "test"
+  },
+  "args": {
+    "vector": [
+      0.1,
+      0.2,
+      0.3
+    ],
+    "top_k": 3
+  }
+}

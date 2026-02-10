@@ -1,0 +1,36 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_tools_basic",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream and use the tool."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "lookup",
+          "description": "Lookup something",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "q"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "auto"
+  }
+}

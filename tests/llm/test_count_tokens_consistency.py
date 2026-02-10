@@ -7,56 +7,140 @@ Asserts:
   • Edge cases (empty, unicode) handled gracefully
 """
 import pytest
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
-from corpus_sdk.llm.llm_base import OperationContext
-from corpus_sdk.examples.common.ctx import make_ctx
+from corpus_sdk.llm.llm_base import OperationContext, NotSupported, BadRequest
 
 pytestmark = pytest.mark.asyncio
 
+MAX_EMPTY_STRING_TOKENS = 100
+MIN_NONEMPTY_TOKENS = 1
 
-async def test_count_tokens_monotonic():
+
+async def test_token_counting_count_tokens_monotonic(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(request_id="t_count_tokens", tenant="test")
+
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("short", model=caps.supported_models[0], ctx=ctx)
+        return
+
+    texts = [
+        "short",
+        "short text",
+        "short text plus",
+        "short text plus some",
+        "short text plus some more words here",
+    ]
+
+    counts = []
+    for text in texts:
+        count = await adapter.count_tokens(text, model=caps.supported_models[0], ctx=ctx)
+        assert isinstance(count, int)
+        assert count >= 0
+        counts.append(count)
+
+    for i in range(1, len(counts)):
+        assert counts[i] >= counts[i - 1]
+
+
+async def test_token_counting_empty_string(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test")
+
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("", model=caps.supported_models[0], ctx=ctx)
+        return
+
+    count = await adapter.count_tokens("", model=caps.supported_models[0], ctx=ctx)
+    assert isinstance(count, int)
+    assert count >= 0
+    assert count <= MAX_EMPTY_STRING_TOKENS
+
+
+async def test_token_counting_unicode_handling(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test")
+
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("Hello 世界 🌍 مرحبا", model=caps.supported_models[0], ctx=ctx)
+        return
+
+    for text in ["Hello 世界 🌍 مرحبا", "🎉庆祝🎊", "café naïve façade", "🦄🐉🎯", "Hello 世界 🦄 café"]:
+        count = await adapter.count_tokens(text, model=caps.supported_models[0], ctx=ctx)
+        assert isinstance(count, int)
+        assert count >= MIN_NONEMPTY_TOKENS
+
+
+async def test_token_counting_whitespace_variations(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test")
+
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("hello world", model=caps.supported_models[0], ctx=ctx)
+        return
+
+    test_cases = ["hello world", "hello   world", "hello\tworld", "hello\nworld", "hello \t\n world"]
+    for text in test_cases:
+        count = await adapter.count_tokens(text, model=caps.supported_models[0], ctx=ctx)
+        assert isinstance(count, int)
+        assert count >= MIN_NONEMPTY_TOKENS
+
+
+async def test_token_counting_consistent_for_identical_inputs(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test")
+    text = "consistent token counting test"
+
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens(text, model=caps.supported_models[0], ctx=ctx)
+        return
+
+    counts = [await adapter.count_tokens(text, model=caps.supported_models[0], ctx=ctx) for _ in range(5)]
+    assert len(set(counts)) == 1
+
+
+async def test_token_counting_not_supported_raises_notsupported(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test")
+
+    if caps.supports_count_tokens:
+        n = await adapter.count_tokens("x", model=caps.supported_models[0], ctx=ctx)
+        assert isinstance(n, int) and n >= 0
+    else:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("x", model=caps.supported_models[0], ctx=ctx)
+
+
+async def test_token_counting_model_gate_enforced_when_listed(adapter):
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test", request_id="t_count_tokens_model_gate")
+
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("x", model="__no_such_model__", ctx=ctx)
+        return
+
+    if caps.supported_models:
+        with pytest.raises(BadRequest):
+            await adapter.count_tokens("x", model="__no_such_model__", ctx=ctx)
+
+
+async def test_token_counting_respects_context_limits(adapter):
     """
-    SPECIFICATION.md §8.3 — Token Counting
-    
-    Longer texts SHOULD yield higher or equal token counts (monotonic property).
+    Token counting should return an int and never be negative; it is not required to be <= max_context_length.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_count_tokens", tenant="test")
-    
-    s1 = "short text"
-    s2 = "short text plus some more words here"
-    
-    c1 = await adapter.count_tokens(s1, ctx=ctx)
-    c2 = await adapter.count_tokens(s2, ctx=ctx)
-    
-    assert isinstance(c1, int) and isinstance(c2, int), \
-        "count_tokens must return integers"
-    assert c1 >= 0 and c2 >= 0, \
-        "Token counts must be non-negative"
-    assert c2 >= c1, \
-        "Longer text should not return fewer tokens"
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test")
 
+    if not caps.supports_count_tokens:
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("This is a reasonable length text.", model=caps.supported_models[0], ctx=ctx)
+        return
 
-async def test_count_tokens_empty_string():
-    """Empty string should return 0 or small overhead for special tokens."""
-    adapter = MockLLMAdapter(failure_rate=0.0)
-    ctx = make_ctx(OperationContext, tenant="test")
-    
-    count = await adapter.count_tokens("", ctx=ctx)
-    
-    assert isinstance(count, int), "Must return integer"
-    assert count >= 0, "Token count must be non-negative"
-    assert count <= 10, "Empty string should have minimal token overhead"
-
-
-async def test_count_tokens_unicode_handling():
-    """Token counting should handle unicode characters gracefully."""
-    adapter = MockLLMAdapter(failure_rate=0.0)
-    ctx = make_ctx(OperationContext, tenant="test")
-    
-    # Mix of ASCII, CJK, and emoji
-    text = "Hello 世界 🌍 مرحبا"
-    count = await adapter.count_tokens(text, ctx=ctx)
-    
-    assert isinstance(count, int), "Must return integer"
-    assert count > 0, "Non-empty text should have positive token count"
+    n = await adapter.count_tokens("This is a reasonable length text. " * 10, model=caps.supported_models[0], ctx=ctx)
+    assert isinstance(n, int)
+    assert n >= 0

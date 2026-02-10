@@ -1,0 +1,40 @@
+{
+  "op": "graph.transaction",
+  "ctx": {
+    "request_id": "t_graph_tx_multi",
+    "tenant": "test"
+  },
+  "args": {
+    "operations": [
+      {
+        "op": "graph.upsert_nodes",
+        "args": {
+          "nodes": [
+            {
+              "id": "node_tx_2",
+              "properties": {
+                "name": "T"
+              }
+            }
+          ],
+          "namespace": "default"
+        }
+      },
+      {
+        "op": "graph.upsert_edges",
+        "args": {
+          "edges": [
+            {
+              "id": "edge_tx_2",
+              "src": "node_tx_2",
+              "dst": "node_tx_1",
+              "label": "REL",
+              "properties": {}
+            }
+          ],
+          "namespace": "default"
+        }
+      }
+    ]
+  }
+}

@@ -1,71 +1,54 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.types.tool.json",
-  "title": "LLM Tool Types",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.tool.json",
+  "title": "LLM Tool",
+  "description": "A single tool definition (typically used within llm.types.tools).",
   "type": "object",
-  "$comment": "This schema serves as a container for $defs. Use $ref with #/$defs/*.",
-  "$defs": {
-    "toolDefinition": {
-      "type": "object",
-      "required": ["name"],
-      "additionalProperties": false,
-      "properties": {
-        "name": {
-          "type": "string",
-          "maxLength": 64,
-          "pattern": "^[A-Za-z0-9._:-]{1,64}$",
-          "description": "Unique tool name."
-        },
-        "description": {
-          "type": "string",
-          "maxLength": 2000
-        },
-        "input_schema": {
-          "description": "JSON Schema describing tool arguments.",
-          "type": "object",
-          "additionalProperties": true
-        }
-      }
+  "properties": {
+    "type": {
+      "type": "string"
     },
-    "toolCall": {
-      "type": "object",
-      "required": ["id", "name", "arguments"],
-      "additionalProperties": false,
-      "properties": {
-        "id": {
-          "type": "string",
-          "maxLength": 128,
-          "pattern": "^[A-Za-z0-9._:-]{1,128}$"
-        },
-        "name": {
-          "type": "string",
-          "maxLength": 64,
-          "pattern": "^[A-Za-z0-9._:-]{1,64}$"
-        },
-        "arguments": {
-          "type": "object",
-          "additionalProperties": true,
-          "description": "MUST validate against tool.input_schema before execution; invalid arguments → BadRequest with details.validation_errors."
-        }
-      }
+    "function": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
     },
-    "toolChoice": {
-      "oneOf": [
-        { "type": "string", "enum": ["auto", "required"] },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["type", "name"],
-          "properties": {
-            "type": { "type": "string", "const": "tool" },
-            "name": {
-              "type": "string",
-              "maxLength": 64,
-              "pattern": "^[A-Za-z0-9._:-]{1,64}$"
-            }
-          }
-        }
+    "name": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "description": {
+      "type": [
+        "string",
+        "null"
       ]
     }
-  }
+  },
+  "required": [
+    "type"
+  ],
+  "additionalProperties": true,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "const": "function"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "then": {
+        "required": [
+          "function"
+        ]
+      }
+    }
+  ]
 }

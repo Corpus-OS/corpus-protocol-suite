@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.batch_query.request.json",
+  "title": "Vector Batch Query Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.batch_query"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "queries": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/vector/vector.types.query_spec.json"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "default": "default"
+            }
+          },
+          "required": [
+            "queries"
+          ],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}

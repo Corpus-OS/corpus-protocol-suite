@@ -1,0 +1,14 @@
+{
+  "op": "graph.delete_edges",
+  "ctx": {
+    "request_id": "t_graph_delete_edges_ids",
+    "tenant": "test"
+  },
+  "args": {
+    "ids": [
+      "edge_1",
+      "edge_2"
+    ],
+    "namespace": "default"
+  }
+}

@@ -1,0 +1,2 @@
+{"ok":true,"code":"STREAMING","ms":2.0,"chunk":{"records":[{"id":"node_partial"}],"is_final":false,"summary":null}}
+{"ok":false,"code":"TRANSIENT_NETWORK","error":"TransientNetworkError","message":"Connection lost","retry_after_ms":null,"details":null,"ms":12.3}

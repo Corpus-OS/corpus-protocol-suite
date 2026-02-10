@@ -1,0 +1,19 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 40.7,
+  "result": {
+    "results": [
+      {
+        "ok": true
+      },
+      {
+        "ok": false,
+        "code": "BAD_REQUEST"
+      }
+    ],
+    "success": false,
+    "error": "One or more ops failed",
+    "transaction_id": "tx_123"
+  }
+}

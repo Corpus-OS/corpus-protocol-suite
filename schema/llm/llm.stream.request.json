@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.stream.request.json",
+  "title": "LLM Stream Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "llm.stream"
+        },
+        "args": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.stream_spec.json"
+        }
+      }
+    }
+  ]
+}

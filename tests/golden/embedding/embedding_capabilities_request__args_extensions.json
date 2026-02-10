@@ -1,0 +1,14 @@
+{
+  "op": "embedding.capabilities",
+  "ctx": {
+    "request_id": "t_embedding_caps_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "verbose": true,
+    "x-debug": {
+      "level": 1,
+      "notes": "capabilities extension args"
+    }
+  }
+}

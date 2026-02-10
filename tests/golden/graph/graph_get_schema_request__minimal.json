@@ -1,0 +1,8 @@
+{
+  "op": "graph.get_schema",
+  "ctx": {
+    "request_id": "t_graph_get_schema_min",
+    "tenant": "test"
+  },
+  "args": {}
+}

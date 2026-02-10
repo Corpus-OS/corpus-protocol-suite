@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.edge.json",
+  "title": "Graph Edge",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "src": {
+      "type": "string",
+      "minLength": 1
+    },
+    "dst": {
+      "type": "string",
+      "minLength": 1
+    },
+    "label": {
+      "type": "string",
+      "minLength": 1
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": true,
+      "default": {}
+    },
+    "namespace": {
+      "type": "string"
+    },
+    "created_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "updated_at": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    }
+  },
+  "required": [
+    "id",
+    "src",
+    "dst",
+    "label",
+    "properties"
+  ],
+  "additionalProperties": false
+}

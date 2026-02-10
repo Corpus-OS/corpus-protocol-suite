@@ -1,0 +1,11 @@
+{
+  "op": "embedding.embed",
+  "ctx": {
+    "request_id": "t_embedding_embed_min",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "hello world",
+    "model": "embed-small"
+  }
+}

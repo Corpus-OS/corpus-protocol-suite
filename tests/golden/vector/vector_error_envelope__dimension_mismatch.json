@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "code": "DIMENSION_MISMATCH",
+  "error": "DimensionMismatchError",
+  "message": "Vector dimensions do not match namespace configuration",
+  "retry_after_ms": null,
+  "details": {
+    "expected": 1536,
+    "got": 768
+  },
+  "ms": 2.4
+}

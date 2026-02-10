@@ -1,0 +1,10 @@
+{
+  "op": "embedding.count_tokens",
+  "ctx": {
+    "request_id": "t_embedding_count_tokens_min",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "hello"
+  }
+}

@@ -8,39 +8,38 @@ Spec refs:
 """
 
 import pytest
-
-from corpus_sdk.examples.vector.mock_vector_adapter import MockVectorAdapter
-from adapter_sdk.vector_base import VectorCapabilities, VECTOR_PROTOCOL_ID
+from corpus_sdk.vector.vector_base import VectorCapabilities, VECTOR_PROTOCOL_ID
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_capabilities_returns_correct_type():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_capabilities_capabilities_returns_correct_type(adapter):
+    """Verify capabilities() returns VectorCapabilities instance."""
+    caps = await adapter.capabilities()
     assert isinstance(caps, VectorCapabilities)
 
 
-async def test_capabilities_identity_fields():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_capabilities_identity_fields(adapter):
+    """Verify identity fields are non-empty strings and protocol is correct."""
+    caps = await adapter.capabilities()
     assert isinstance(caps.server, str) and caps.server
     assert isinstance(caps.version, str) and caps.version
     assert caps.protocol == VECTOR_PROTOCOL_ID
 
 
-async def test_capabilities_supported_metrics():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_capabilities_supported_metrics(adapter):
+    """Verify supported_metrics is non-empty tuple of valid metric names."""
+    caps = await adapter.capabilities()
     assert isinstance(caps.supported_metrics, tuple)
     assert caps.supported_metrics  # non-empty
-    for m in caps.supported_metrics:
-        assert m in ("cosine", "euclidean", "dotproduct")
+    valid_metrics = {"cosine", "euclidean", "dotproduct"}
+    for metric in caps.supported_metrics:
+        assert metric in valid_metrics, f"Invalid metric: {metric}"
 
 
-async def test_capabilities_resource_limits_positive():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_capabilities_resource_limits_positive(adapter):
+    """Verify resource limits are positive integers when defined."""
+    caps = await adapter.capabilities()
     if caps.max_dimensions is not None:
         assert caps.max_dimensions > 0
     if caps.max_top_k is not None:
@@ -49,9 +48,9 @@ async def test_capabilities_resource_limits_positive():
         assert caps.max_batch_size > 0
 
 
-async def test_capabilities_feature_flags_boolean():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_capabilities_feature_flags_boolean(adapter):
+    """Verify all feature flags are boolean values."""
+    caps = await adapter.capabilities()
 
     bool_fields = [
         "supports_namespaces",
@@ -62,22 +61,43 @@ async def test_capabilities_feature_flags_boolean():
         "supports_multi_tenant",
         "supports_deadline",
     ]
-    for name in bool_fields:
-        assert isinstance(getattr(caps, name), bool)
+    for field_name in bool_fields:
+        value = getattr(caps, field_name)
+        assert isinstance(value, bool), f"{field_name} must be boolean, got {type(value).__name__}"
 
 
-async def test_capabilities_idempotent_calls():
-    a = MockVectorAdapter()
-    c1 = await a.capabilities()
-    c2 = await a.capabilities()
-    assert c1 == c2
+async def test_capabilities_idempotent_calls(adapter):
+    """Verify multiple capabilities() calls return consistent results."""
+    caps1 = await adapter.capabilities()
+    caps2 = await adapter.capabilities()
+    assert caps1 == caps2
 
 
-async def test_capabilities_all_required_fields_present():
-    a = MockVectorAdapter()
-    caps = await a.capabilities()
+async def test_capabilities_all_required_fields_present(adapter):
+    """Verify all required capability fields are present and valid."""
+    caps = await adapter.capabilities()
 
-    assert caps.server
-    assert caps.version
+    assert caps.server and isinstance(caps.server, str)
+    assert caps.version and isinstance(caps.version, str)
     assert caps.protocol == VECTOR_PROTOCOL_ID
-    assert isinstance(caps.supported_metrics, tuple)
+    assert isinstance(caps.supported_metrics, tuple) and caps.supported_metrics
+
+
+async def test_capabilities_text_storage_strategy_enum_and_text_limits(adapter):
+    """NEW: Verify text storage strategy is a known enum and text limits are well-typed."""
+    caps = await adapter.capabilities()
+
+    # Strategy enum: contract-level shape.
+    assert isinstance(caps.text_storage_strategy, str)
+    assert caps.text_storage_strategy in {"metadata", "docstore", "none"}
+
+    # max_text_length is optional; when provided must be positive int.
+    if caps.max_text_length is not None:
+        assert isinstance(caps.max_text_length, int)
+        assert caps.max_text_length > 0
+
+
+async def test_capabilities_supports_batch_queries_flag_boolean(adapter):
+    """NEW: Verify supports_batch_queries is present and boolean."""
+    caps = await adapter.capabilities()
+    assert isinstance(getattr(caps, "supports_batch_queries"), bool)

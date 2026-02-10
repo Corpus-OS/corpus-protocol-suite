@@ -1,0 +1,19 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_deadline_idem",
+    "tenant": "test",
+    "deadline_ms": 5000,
+    "idempotency_key": "idem-llm-stream-001",
+    "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream a short greeting."
+      }
+    ],
+    "model": "test-model-1"
+  }
+}

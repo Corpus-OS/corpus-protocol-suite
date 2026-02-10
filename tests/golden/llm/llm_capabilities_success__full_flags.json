@@ -1,0 +1,28 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 4.7,
+  "result": {
+    "server": "corpus-llm",
+    "version": "1.0.0",
+    "model_family": "test-family",
+    "max_context_length": 8192,
+    "protocol": "llm/v1.0",
+    "supports_streaming": true,
+    "supports_roles": true,
+    "supports_json_output": true,
+    "supports_tools": true,
+    "supports_parallel_tool_calls": true,
+    "supports_tool_choice": true,
+    "max_tool_calls_per_turn": 8,
+    "idempotent_writes": true,
+    "supports_multi_tenant": true,
+    "supports_system_message": true,
+    "supports_deadline": true,
+    "supports_count_tokens": true,
+    "supported_models": [
+      "test-model-1",
+      "test-model-2"
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "code": "BAD_REQUEST",
+  "error": "BadRequest",
+  "message": "Graph request was invalid",
+  "retry_after_ms": null,
+  "details": {
+    "component": "graph"
+  },
+  "ms": 1.0
+}

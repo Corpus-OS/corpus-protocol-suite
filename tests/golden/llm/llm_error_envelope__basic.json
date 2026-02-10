@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "code": "BAD_REQUEST",
+  "error": "BadRequest",
+  "message": "LLM request was invalid",
+  "retry_after_ms": null,
+  "details": {
+    "component": "llm"
+  },
+  "ms": 1.0
+}

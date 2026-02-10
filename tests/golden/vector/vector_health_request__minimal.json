@@ -1,0 +1,8 @@
+{
+  "op": "vector.health",
+  "ctx": {
+    "request_id": "t_vector_health_min",
+    "tenant": "test"
+  },
+  "args": {}
+}

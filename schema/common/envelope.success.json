@@ -1,379 +1,54 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/common/envelope.success.json",
-  "title": "Corpus Success Envelope",
-  "description": "Canonical success envelope for non-streaming Corpus Protocol operations. Additive, SIEM-safe, and wire-stable across v1.x.",
+  "$id": "https://corpusos.com/schemas/common/envelope.success.json",
+  "title": "Protocol Success Envelope",
   "type": "object",
-
-  "required": ["ok", "code", "result"],
   "properties": {
-    "ok": { "type": "boolean", "const": true, "description": "Always true for success responses." },
-
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
     "code": {
       "type": "string",
-      "description": "Normalized status code: 'OK', 'PARTIAL_SUCCESS', or 'ACCEPTED'.",
-      "enum": ["OK", "PARTIAL_SUCCESS", "ACCEPTED"]
+      "const": "OK"
     },
-
     "ms": {
       "type": "number",
       "minimum": 0,
-      "maximum": 3600000,
-      "description": "Elapsed wall-clock time in milliseconds (≤ 1 hour)."
+      "description": "Operation duration in milliseconds"
     },
-
-    "protocol": {
-      "type": "string",
-      "description": "Protocol identity, e.g., 'vector/v1.0', 'llm/v1.0', 'graph/v1.0', 'embedding/v1.0'.",
-      "pattern": "^(graph|llm|vector|embedding)/v1\\.0$"
-    },
-
-    "component": {
-      "type": "string",
-      "enum": ["graph", "llm", "vector", "embedding"],
-      "description": "Component that produced the result."
-    },
-
-    "schema_version": {
-      "type": "string",
-      "description": "Authoritative SemVer for this envelope schema as produced by the server (used by clients for compatibility checks).",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-      "$comment": "Producers MUST bump on backward-incompatible changes to envelope shape; minor/patch for additive/clarifications."
-    },
-
-    "schema_semver_range": {
-      "type": "string",
-      "description": "Optional SemVer range the producer asserts as compatible (e.g., '>=1.0.0 <2.0.0').",
-      "maxLength": 64
-    },
-
     "result": {
-      "description": "Component-specific result payload (JSON-serializable and SIEM-safe).",
-      "oneOf": [
-        { "$ref": "#/$defs/genericResult" },
-        { "$ref": "#/$defs/partialSuccessResult" }
+      "description": "Operation-specific result (any JSON value)",
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "array"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "integer"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "null"
+        }
       ]
-    },
-
-    "page": {
-      "type": "object",
-      "description": "Structured pagination container (preferred to legacy next_page_token).",
-      "properties": {
-        "next_token": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096,
-          "contentEncoding": "base64url",
-          "pattern": "^[A-Za-z0-9_=-]{1,4096}$",
-          "description": "Opaque, base64url-safe continuation token."
-        },
-        "has_more": { "type": "boolean", "description": "True if additional pages exist." },
-        "estimated_total": { "type": "integer", "minimum": 0, "description": "Optional soft estimate of total records." }
-      },
-      "required": ["has_more"],
-      "additionalProperties": false
-    },
-
-    "next_page_token": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 4096,
-      "contentEncoding": "base64url",
-      "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$",
-      "description": "LEGACY opaque pagination token. Prefer 'page.next_token' when available."
-    },
-
-    "warnings": {
-      "type": "array",
-      "description": "Non-fatal SIEM-safe notices (no raw tenants/prompts/vectors).",
-      "maxItems": 100,
-      "items": {
-        "type": "object",
-        "required": ["code"],
-        "properties": {
-          "code": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128,
-            "pattern": "^[A-Z0-9_:\\.-]{1,128}$",
-            "description": "Stable machine-readable warning code."
-          },
-          "message": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 2000,
-            "description": "Human-readable summary (no secrets or PII)."
-          },
-          "i18n_key": {
-            "type": "string",
-            "maxLength": 256,
-            "pattern": "^[a-z0-9_.-]{1,256}$"
-          },
-          "locale": {
-            "type": "string",
-            "maxLength": 16,
-            "pattern": "^[A-Za-z]{2}(?:[-_][A-Za-z0-9]{2,8})?$"
-          },
-          "details": {
-            "type": "object",
-            "description": "Low-cardinality, SIEM-safe metadata.",
-            "additionalProperties": true
-          }
-        },
-        "additionalProperties": false
-      }
-    },
-
-    "cache": {
-      "type": "object",
-      "description": "Advisory cache disposition (must not weaken tenant isolation).",
-      "properties": {
-        "hit": { "type": "boolean" },
-        "scope": {
-          "type": "string",
-          "enum": ["tenant", "global", "session"],
-          "default": "tenant",
-          "description": "Cache scope used by the producer."
-        }
-      },
-      "additionalProperties": false
-    },
-
-    "links": {
-      "type": "array",
-      "description": "Optional hypermedia links for discoverability.",
-      "items": {
-        "type": "object",
-        "required": ["rel", "href"],
-        "properties": {
-          "rel": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64,
-            "pattern": "^[a-z0-9._-]{1,64}$"
-          },
-          "href": { "type": "string", "format": "uri", "maxLength": 2000 },
-          "type": { "type": "string", "minLength": 1, "maxLength": 128 }
-        },
-        "additionalProperties": false
-      }
-    },
-
-    "deprecated": {
-      "type": "boolean",
-      "description": "LEGACY boolean. Prefer the structured 'deprecation' object.",
-      "default": false
-    },
-
-    "replacement_op": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 128,
-      "pattern": "^[a-z]+\\.[a-z0-9_\\.:-]+$",
-      "description": "LEGACY single replacement suggestion (e.g., 'vector.query_v2'). Prefer 'deprecation.replacements[]'."
-    },
-
-    "deprecation": {
-      "type": "object",
-      "description": "Structured deprecation metadata (additive to legacy fields).",
-      "properties": {
-        "is_deprecated": { "type": "boolean", "default": true },
-        "sunset_date": {
-          "type": "string",
-          "format": "date",
-          "description": "Planned EOL date (producer’s local policy)."
-        },
-        "reasons": {
-          "type": "array",
-          "maxItems": 10,
-          "items": { "type": "string", "maxLength": 512 }
-        },
-        "replacements": {
-          "type": "array",
-          "description": "One or more migration targets.",
-          "maxItems": 10,
-          "items": {
-            "type": "object",
-            "required": ["op"],
-            "properties": {
-              "op": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 128,
-                "pattern": "^[a-z]+\\.[a-z0-9_\\.:-]+$",
-                "description": "Target op, e.g., 'vector.query_v2'."
-              },
-              "rationale": { "type": "string", "maxLength": 1000 },
-              "migration_guide": { "type": "string", "format": "uri", "maxLength": 2000 },
-              "min_version": {
-                "type": "string",
-                "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-                "description": "Minimum SDK or protocol version where this path is supported."
-              }
-            },
-            "additionalProperties": false
-          }
-        },
-        "notes": { "type": "string", "maxLength": 2000 }
-      },
-      "additionalProperties": false
-    },
-
-    "result_hash": {
-      "type": "string",
-      "maxLength": 96,
-      "pattern": "^sha256:[A-Fa-f0-9]{64}$",
-      "description": "Deterministic hash. By default: sha256 of the canonical JSON (UTF-8, sorted keys, no whitespace changes) of the 'result' field ONLY.",
-      "$comment": "Default scope is 'result'. For hashing the entire envelope, set result_hash_scope='envelope'."
-    },
-
-    "result_hash_scope": {
-      "type": "string",
-      "enum": ["result", "envelope"],
-      "default": "result",
-      "description": "Specifies what was hashed for 'result_hash'."
-    },
-
-    "hashes": {
-      "type": "array",
-      "description": "Optional multi-hash list for future-proofing (e.g., blake3).",
-      "maxItems": 8,
-      "items": {
-        "type": "object",
-        "required": ["alg", "value", "scope"],
-        "properties": {
-          "alg": {
-            "type": "string",
-            "enum": ["sha256", "sha512", "blake3"],
-            "description": "Hash algorithm."
-          },
-          "scope": {
-            "type": "string",
-            "enum": ["result", "envelope"],
-            "description": "What portion was hashed."
-          },
-          "value": {
-            "type": "string",
-            "pattern": "^[A-Fa-f0-9]{64,128}$",
-            "description": "Hex-encoded hash value (length depends on algorithm)."
-          }
-        },
-        "additionalProperties": false
-      }
     }
   },
-
-  "additionalProperties": false,
-
-  "patternProperties": {
-    "^(vendor:)[a-z0-9_.:-]+$": {
-      "description": "Vendor/extension namespaced fields. Must not conflict with standardized keys.",
-      "type": ["string", "number", "boolean", "object", "array", "null"]
-    }
-  },
-
-  "$defs": {
-    "genericResult": {
-      "description": "Opaque success payload for non-batch or fully successful batch operations.",
-      "type": ["object", "array", "string", "number", "boolean", "null"]
-    },
-
-    "partialSuccessItem": {
-      "type": "object",
-      "description": "Per-item status for partial success.",
-      "required": ["index", "ok"],
-      "properties": {
-        "index": { "type": "integer", "minimum": 0 },
-        "ok": { "type": "boolean" },
-        "result": {
-          "type": ["object", "array", "string", "number", "boolean", "null"],
-          "description": "Present when ok=true."
-        },
-        "code": {
-          "type": "string",
-          "pattern": "^[A-Z0-9_]+$",
-          "description": "Normalized error code when ok=false."
-        },
-        "message": { "type": "string", "maxLength": 2000 },
-        "details": { "type": "object", "additionalProperties": true }
-      },
-      "allOf": [
-        { "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] }, "then": { "required": ["result"] } },
-        { "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] }, "then": { "required": ["code"] } }
-      ],
-      "additionalProperties": false
-    },
-
-    "partialSuccessResult": {
-      "type": "object",
-      "description": "Batch result where at least one item succeeded and at least one failed.",
-      "required": ["successes", "failures", "items"],
-      "properties": {
-        "successes": { "type": "integer", "minimum": 1 },
-        "failures": { "type": "integer", "minimum": 1 },
-        "items": {
-          "type": "array",
-          "minItems": 2,
-          "items": { "$ref": "#/$defs/partialSuccessItem" },
-          "description": "Per-item outcomes preserving input order."
-        }
-      },
-      "additionalProperties": false,
-      "$comment": "Invariant: successes + failures == items.length; successes >= 1; failures >= 1. Enforce in application logic or custom validators."
-    }
-  },
-
-  "examples": [
-    {
-      "ok": true,
-      "code": "OK",
-      "ms": 12.7,
-      "protocol": "vector/v1.0",
-      "component": "vector",
-      "schema_version": "1.0.1",
-      "result": {
-        "namespace": "default",
-        "query_vector": [0.1, 0.2],
-        "matches": [],
-        "total_matches": 0
-      },
-      "page": { "has_more": false },
-      "cache": { "hit": false, "scope": "tenant" },
-      "result_hash": "sha256:9f2c7e6c3f4f...deadbeef",
-      "result_hash_scope": "result"
-    },
-    {
-      "ok": true,
-      "code": "PARTIAL_SUCCESS",
-      "ms": 38.4,
-      "protocol": "embedding/v1.0",
-      "component": "embedding",
-      "schema_version": "1.0.1",
-      "result": {
-        "successes": 2,
-        "failures": 1,
-        "items": [
-          { "index": 0, "ok": true, "result": { "vector": [0.01, 0.02], "dimensions": 2 } },
-          { "index": 1, "ok": true, "result": { "vector": [0.03, 0.04], "dimensions": 2 } },
-          { "index": 2, "ok": false, "code": "TEXT_TOO_LONG", "message": "Input exceeds max_text_length" }
-        ]
-      },
-      "warnings": [
-        { "code": "VECTOR:TRUNCATED", "message": "Vector truncated for logging safety" }
-      ],
-      "deprecation": {
-        "is_deprecated": true,
-        "sunset_date": "2026-12-31",
-        "reasons": ["Unified v2 response contract"],
-        "replacements": [
-          {
-            "op": "embedding.embed_batch_v2",
-            "rationale": "Normalized partial item schema and token accounting.",
-            "migration_guide": "https://docs.example/embedding-v2-migration",
-            "min_version": "1.4.0"
-          }
-        ]
-      }
-    }
-  ]
+  "required": [
+    "ok",
+    "code",
+    "ms",
+    "result"
+  ],
+  "additionalProperties": false
 }

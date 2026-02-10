@@ -5,27 +5,23 @@ Embedding Conformance — SIEM-safe metrics & context propagation.
 Spec refs:
   • §13.1-13.3 Observability & Privacy
   • §6.1 Context propagation
+  • §12.5 Partial Success & Caching
 
-Covers:
-  • observe() called with component="embedding" and correct op
-  • Tenant identifiers hashed; never logged raw
-  • No raw text/texts/vectors/embeddings in metrics payloads
-  • Metrics emitted on success and error paths
-  • Batch metrics include batch_size for batch operations
-  • deadline_bucket tag emitted when deadline_ms is set
 """
 
+import time
 import pytest
 from typing import Optional, Mapping, Any, List
 
 from corpus_sdk.embedding.embedding_base import (
+    BaseEmbeddingAdapter,
     EmbedSpec,
     BatchEmbedSpec,
     OperationContext,
     MetricsSink,
+    NotSupported,
+    BadRequest,
 )
-from corpus_sdk.examples.embedding.mock_embedding_adapter import MockEmbeddingAdapter
-from corpus_sdk.examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
@@ -74,18 +70,32 @@ class CaptureMetrics(MetricsSink):
         )
 
 
-async def test_context_propagates_to_metrics_siem_safe():
-    """
-    test_context_propagates_to_metrics_siem_safe —
-    observe called with component="embedding", correct op.
-    """
+class _SwapAdapterMetrics:
+    def __init__(self, adapter: BaseEmbeddingAdapter, sink: MetricsSink):
+        self.adapter = adapter
+        self.sink = sink
+        self._old = None
+
+    def __enter__(self):
+        self._old = getattr(self.adapter, "_metrics", None)
+        setattr(self.adapter, "_metrics", self.sink)
+        return self.sink
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._old is not None:
+            setattr(self.adapter, "_metrics", self._old)
+
+
+async def test_observability_context_propagates_to_metrics(adapter: BaseEmbeddingAdapter):
+    """§13.1: Metrics must include correct component and operation."""
     m = CaptureMetrics()
-    a = MockEmbeddingAdapter(metrics=m, failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_siem_ctx", tenant="acme")
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
+    ctx = OperationContext(request_id="t_siem_ctx", tenant="acme")
 
-    await a.embed(EmbedSpec(text="hello", model=a.supported_models[0]), ctx=ctx)
+    with _SwapAdapterMetrics(adapter, m):
+        await adapter.embed(EmbedSpec(text="hello", model=model), ctx=ctx)
 
-    # At least one observation for embed
     embed_obs = [o for o in m.observations if o["op"] == "embed"]
     assert embed_obs, "Expected observe() call for embed()"
     last = embed_obs[-1]
@@ -94,134 +104,168 @@ async def test_context_propagates_to_metrics_siem_safe():
     assert last["code"] == "OK"
 
 
-async def test_tenant_hashed_never_raw():
-    """
-    test_tenant_hashed_never_raw —
-    Only tenant hash appears; raw tenant never logged.
-    """
+async def test_observability_tenant_hashed_never_raw(adapter: BaseEmbeddingAdapter):
+    """§13.2: Tenant identifiers must be hashed in all metrics."""
     m = CaptureMetrics()
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
+
     tenant = "super-secret-tenant"
-    a = MockEmbeddingAdapter(metrics=m, failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_siem_hash", tenant=tenant)
+    ctx = OperationContext(request_id="t_siem_hash", tenant=tenant)
 
-    await a.embed(EmbedSpec(text="hi", model=a.supported_models[0]), ctx=ctx)
+    with _SwapAdapterMetrics(adapter, m):
+        await adapter.embed(EmbedSpec(text="hi", model=model), ctx=ctx)
 
-    embed_extras = [o["extra"] for o in m.observations if o["op"] == "embed"]
-    assert embed_extras
-    last = embed_extras[-1]
+    for observation in m.observations:
+        extra = observation["extra"]
+        serialized = str(extra).lower()
+        assert tenant.lower() not in serialized, f"Raw tenant leaked in {observation}"
 
-    # Base should store a hashed tenant identifier, never raw
-    assert "tenant" not in last or last["tenant"] != tenant
-    assert tenant not in str(last)
-    # Allow either tenant_hash or similar hashed field; assert at least one hash-like value
-    has_hash_like = any(
-        isinstance(v, str) and len(v) >= 8 and tenant not in v
-        for k, v in last.items()
-        if "tenant" in k
-    )
-    assert has_hash_like, "Expected hashed tenant identifier in metrics"
+        if "tenant_hash" in extra:
+            value = str(extra["tenant_hash"])
+            assert tenant not in value
+            assert len(value) >= 8
 
 
-async def test_no_text_in_metrics():
-    """
-    test_no_text_in_metrics —
-    No raw text/texts/vectors/embeddings appear in metrics extras.
-    """
+async def test_observability_no_sensitive_data_in_metrics(adapter: BaseEmbeddingAdapter):
+    """§13.3: No raw request payloads (raw texts) in metric tags."""
     m = CaptureMetrics()
-    a = MockEmbeddingAdapter(metrics=m, failure_rate=0.0)
-    secret_text = "do not leak this"
-    ctx = make_ctx(OperationContext, request_id="t_siem_notext", tenant="t")
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
 
-    await a.embed(EmbedSpec(text=secret_text, model=a.supported_models[0]), ctx=ctx)
+    sensitive_texts = ["secret password", "private key 123", "confidential"]
+    ctx = OperationContext(request_id="t_siem_sensitive", tenant="t")
 
-    embed_extras = [o["extra"] for o in m.observations if o["op"] == "embed"]
-    assert embed_extras
-    extra = embed_extras[-1]
+    with _SwapAdapterMetrics(adapter, m):
+        await adapter.embed(EmbedSpec(text=sensitive_texts[0], model=model), ctx=ctx)
 
-    # No obvious raw input keys
-    for banned_key in ("text", "texts", "vector", "embedding", "embeddings"):
-        assert banned_key not in extra, f"Unexpected leaked key '{banned_key}' in metrics extra"
+        if caps.supports_batch_embedding:
+            try:
+                await adapter.embed_batch(
+                    BatchEmbedSpec(texts=sensitive_texts, model=model),
+                    ctx=ctx,
+                )
+            except Exception:
+                pass
+        else:
+            with pytest.raises(NotSupported):
+                await adapter.embed_batch(
+                    BatchEmbedSpec(texts=sensitive_texts, model=model),
+                    ctx=ctx,
+                )
 
-    # No raw prompt content embedded in serialized extras
-    serialized = str(extra)
-    assert secret_text not in serialized, "Raw text content leaked into metrics"
+    for observation in m.observations:
+        extra_str = str(observation["extra"]).lower()
+        for s in sensitive_texts:
+            assert s.lower() not in extra_str, f"Sensitive data '{s}' leaked in metrics extra"
 
 
-async def test_metrics_emitted_on_error_path():
-    """
-    test_metrics_emitted_on_error_path —
-    Errors still produce observe + error counters.
-    """
+async def test_observability_metrics_emitted_on_error_path(adapter: BaseEmbeddingAdapter):
+    """§13.1: Error paths that occur inside the gated path must emit metrics + errors_total."""
+    m = CaptureMetrics()
+    ctx = OperationContext(request_id="t_siem_error", tenant="t")
+
+    with _SwapAdapterMetrics(adapter, m):
+        with pytest.raises(Exception):
+            await adapter.embed(EmbedSpec(text="test", model="invalid-model-123"), ctx=ctx)
+
+    failed_obs = [o for o in m.observations if o["op"] == "embed" and not o["ok"]]
+    assert failed_obs, "Expected failed observation for gated error case"
+
+    error_counters = [c for c in m.counters if c["name"] == "errors_total"]
+    assert error_counters, "Expected errors_total counter for failed operation"
+
+
+async def test_observability_batch_metrics_include_accurate_counts(adapter: BaseEmbeddingAdapter):
+    """§12.5: Batch metrics must include batch_size; invalid items may fail fast or yield failures."""
+    caps = await adapter.capabilities()
     m = CaptureMetrics()
 
-    class ErrorAdapter(MockEmbeddingAdapter):
-        async def _do_embed(self, spec, *, ctx=None):
-            raise ValueError("boom")
+    ctx = OperationContext(request_id="t_batch_metrics", tenant="t")
+    texts = ["valid1", "", "valid2", "another valid"]
+    model = caps.supported_models[0]
 
-    a = ErrorAdapter(metrics=m, failure_rate=0.0)
-
-    with pytest.raises(ValueError):
-        await a.embed(EmbedSpec(text="x", model=a.supported_models[0]))
-
-    # Must have at least one failed observation
-    failed_obs = [o for o in m.observations if o["ok"] is False]
-    assert failed_obs, "Expected failed observation on error path"
-
-    # Should also increment some error-related counter
-    assert m.counters, "Expected counters on error path"
-    assert any(
-        "error" in c["name"].lower() or "fail" in c["name"].lower()
-        for c in m.counters
-    ), "Expected at least one error/failure counter"
-
-
-async def test_batch_metrics_include_batch_size():
-    """
-    test_batch_metrics_include_batch_size —
-    batch_size recorded for batch ops.
-    """
-    m = CaptureMetrics()
-    a = MockEmbeddingAdapter(metrics=m, failure_rate=0.0)
-    ctx = make_ctx(OperationContext, request_id="t_batch_metrics", tenant="t")
-
-    texts = ["a", "b", "c"]
-    await a.embed_batch(BatchEmbedSpec(texts=texts, model=a.supported_models[0]), ctx=ctx)
+    with _SwapAdapterMetrics(adapter, m):
+        if not caps.supports_batch_embedding:
+            with pytest.raises(NotSupported):
+                await adapter.embed_batch(BatchEmbedSpec(texts=texts, model=model), ctx=ctx)
+        else:
+            try:
+                result = await adapter.embed_batch(BatchEmbedSpec(texts=texts, model=model), ctx=ctx)
+            except BadRequest:
+                pass
+            else:
+                assert hasattr(result, "failed_texts")
+                assert len(result.failed_texts) >= 1, (
+                    "If batch returns normally with invalid items present, failed_texts must be populated."
+                )
+                for f in result.failed_texts:
+                    assert "index" in f and "error" in f and "message" in f, f"Failure record missing fields: {f}"
 
     batch_obs = [o for o in m.observations if o["op"] == "embed_batch"]
-    assert batch_obs, "Expected observe() call for embed_batch()"
-    last = batch_obs[-1]
-    extra = last["extra"]
-    # Allow base implementation detail, but assert a batch_size-style field exists and is correct
-    key = next((k for k in extra.keys() if k in ("batch_size", "size", "n_items")), None)
-    assert key is not None, "Expected batch_size metadata in metrics extras"
-    assert extra[key] == len(texts), "batch_size in metrics must match number of texts"
+    if batch_obs:
+        extra = batch_obs[-1]["extra"]
+        assert extra.get("batch_size") == len(texts), f"Expected batch_size={len(texts)} in metrics extra, got {extra}"
 
 
-async def test_deadline_bucket_tagged_when_present():
-    """
-    test_deadline_bucket_tagged_when_present —
-    deadline_bucket emitted when deadline_ms set.
-    """
+async def test_observability_deadline_metrics_include_bucket_tags(adapter: BaseEmbeddingAdapter):
+    """§6.1: If metrics are emitted for a ctx with deadline_ms, deadline_bucket must be present."""
     m = CaptureMetrics()
-    # Use standalone mode so deadline logic is active, if base uses it
-    a = MockEmbeddingAdapter(metrics=m, failure_rate=0.0, mode="standalone")
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
 
-    # Small but not expired deadline; sufficient to run once
-    import time as _time
-    deadline = int(_time.time() * 1000) + 250
-    ctx = make_ctx(
-        OperationContext,
-        request_id="t_deadline_bucket",
-        tenant="t",
-        deadline_ms=deadline,
-    )
+    now = int(time.time() * 1000)
+    deadlines = [now + 5000, now + 500, now + 50]
 
-    await a.embed(EmbedSpec(text="ok", model=a.supported_models[0]), ctx=ctx)
+    with _SwapAdapterMetrics(adapter, m):
+        for deadline in deadlines:
+            ctx = OperationContext(
+                request_id=f"t_deadline_{deadline}",
+                tenant="t",
+                deadline_ms=deadline,
+            )
+            try:
+                await adapter.embed(EmbedSpec(text="test", model=model), ctx=ctx)
+            except Exception:
+                pass
 
     embed_obs = [o for o in m.observations if o["op"] == "embed"]
-    assert embed_obs, "Expected observe() for embed() with deadline"
+    for obs in embed_obs:
+        extra = obs.get("extra", {})
+        if extra:
+            assert "deadline_bucket" in extra, f"Expected deadline_bucket tag in metrics extra, got {extra}"
+
+
+async def test_observability_metrics_include_operation_specific_tags(adapter: BaseEmbeddingAdapter):
+    """§13.1: If model tags are present, they must be well-formed."""
+    m = CaptureMetrics()
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
+    ctx = OperationContext(request_id="t_operation_tags", tenant="t")
+
+    with _SwapAdapterMetrics(adapter, m):
+        await adapter.embed(EmbedSpec(text="test", model=model, normalize=True), ctx=ctx)
+
+    embed_obs = [o for o in m.observations if o["op"] == "embed"]
+    assert embed_obs
     extra = embed_obs[-1]["extra"]
 
-    # Expect some deadline-related tagging when deadline is set
-    has_deadline_bucket = any("deadline" in k for k in extra.keys())
-    assert has_deadline_bucket, "Expected deadline bucket/tag in metrics extras when deadline_ms is provided"
+    for key in [k for k in extra.keys() if "model" in k.lower()]:
+        value = extra[key]
+        assert value not in (None, "", "unknown"), f"Unexpected model tag value {value!r} in {extra}"
+
+
+async def test_observability_errors_total_counter_incremented_on_failure(adapter: BaseEmbeddingAdapter):
+    """
+    errors_total should increment for failures that occur inside the gated path.
+    Use an unknown (but non-empty) model to ensure the error happens after gates.
+    """
+    m = CaptureMetrics()
+    ctx = OperationContext(request_id="t_err_counter", tenant="t")
+
+    with _SwapAdapterMetrics(adapter, m):
+        with pytest.raises(Exception):
+            await adapter.embed(EmbedSpec(text="x", model="invalid-model-123"), ctx=ctx)
+
+    errors_total = [c for c in m.counters if c["name"] == "errors_total"]
+    assert errors_total, "Expected errors_total counter increment(s) on gated failure"

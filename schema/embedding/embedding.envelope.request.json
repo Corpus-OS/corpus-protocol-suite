@@ -1,32 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.envelope.request.json",
-  "title": "Embedding Request Envelope",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json",
+  "title": "Embedding Protocol Request Envelope",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["op", "ctx", "args"],
-  "properties": {
-    "op": {
-      "type": "string",
-      "enum": [
-        "embedding.embed",
-        "embedding.embed_batch",
-        "embedding.count_tokens",
-        "embedding.capabilities",
-        "embedding.health"
-      ]
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.request.json"
     },
-    "ctx": {
-      "$ref": "https://adaptersdk.org/schemas/common/operation_context.json"
-    },
-    "args": {
-      "oneOf": [
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.embed.request.json" },
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.embed_batch.request.json" },
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.count_tokens.request.json" },
-        { "type": "object", "additionalProperties": false, "maxProperties": 0 },
-        { "type": "object", "additionalProperties": false, "maxProperties": 0 }
-      ]
+    {
+      "properties": {
+        "op": {
+          "type": "string"
+        }
+      }
     }
-  }
+  ]
 }

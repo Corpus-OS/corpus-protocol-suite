@@ -1,262 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://schemas.adaptersdk.org/corpus/common/envelope.request.json",
-  "title": "Corpus Protocol — Request Envelope (v1.0)",
-  "description": "Canonical wire-level request envelope used across Graph, LLM, Vector, and Embedding protocols. Matches the '{op, ctx, args}' contract in the Corpus SDK Specification (§4.1.1). Unknown fields MUST be ignored for forward/backward compatibility (§4.1.5).",
+  "$id": "https://corpusos.com/schemas/common/envelope.request.json",
+  "title": "Protocol Request Envelope",
   "type": "object",
-  "required": ["op", "ctx", "args"],
-  "additionalProperties": true,
   "properties": {
     "op": {
-      "title": "Operation",
-      "description": "Canonical operation string: '<component>.<operation>'. Components: graph, llm, vector, embedding. See §4.1.6 for the operation registry.",
       "type": "string",
-      "pattern": "^(graph|llm|vector|embedding)\\.[a-z][a-z0-9_]*$",
-      "$comment": "For stricter validation, replace this pattern with an enum via the operation registry schema: https://schemas.adaptersdk.org/corpus/common/operation.registry.v1.json"
+      "description": "Operation identifier. The wire handler only enforces that this is a string; unknown ops are handled at runtime."
     },
     "ctx": {
-      "title": "Operation Context",
-      "description": "Context propagated end-to-end (request id, idempotency, deadlines, tracing, tenant, cache hints). See §6.1.",
-      "type": "object",
-      "additionalProperties": true,
-      "properties": {
-        "request_id": {
-          "type": ["string", "null"],
-          "minLength": 1,
-          "maxLength": 256,
-          "pattern": "^[A-Za-z0-9._~:-]{1,256}$",
-          "description": "Caller-provided correlation id for logs/traces. SHOULD be unique per operation."
-        },
-        "idempotency_key": {
-          "type": ["string", "null"],
-          "minLength": 1,
-          "maxLength": 256,
-          "pattern": "^[A-Za-z0-9._~:-]{1,256}$",
-          "description": "Client-supplied token for exactly-once semantics on mutating operations. Scope is (tenant, op, args-hash). See §6.1."
-        },
-        "deadline_ms": {
-          "type": ["integer", "null"],
-          "minimum": 0,
-          "maximum": 253402300800000,
-          "description": "Absolute UNIX epoch time in milliseconds when the operation budget expires (0..253402300800000 = year 9999). Servers MUST fail fast if now() >= deadline_ms (§6.1)."
-        },
-        "traceparent": {
-          "type": ["string", "null"],
-          "description": "W3C Trace Context header value (00-<traceId>-<spanId>-<flags>). Forward unchanged per hop.",
-          "$ref": "#/$defs/traceparent"
-        },
-        "tenant": {
-          "type": ["string", "null"],
-          "minLength": 1,
-          "maxLength": 256,
-          "description": "Logical tenant identifier for isolation. MUST NOT be logged raw; hash before emitting to telemetry (§13, §15)."
-        },
-        "attrs": {
-          "type": ["object", "null"],
-          "description": "Low-cardinality attributes for routing/caching. MUST NOT contain secrets, raw prompts, vectors, or raw tenant IDs.",
-          "additionalProperties": {
-            "oneOf": [
-              { "type": "string", "maxLength": 256 },
-              { "type": "number" },
-              { "type": "boolean" },
-              { "type": "null" }
-            ]
-          },
-          "propertyNames": {
-            "type": "string",
-            "maxLength": 64,
-            "pattern": "^[a-zA-Z0-9_.:-]{1,64}$"
-          }
-        },
-        "cache_scope": {
-          "type": ["string", "null"],
-          "description": "Advisory cache scope. MUST NOT weaken tenant isolation. If unset, receivers SHOULD treat as \"tenant\" (§6.1 Cache Coordination).",
-          "enum": ["tenant", "global", "session", null],
-          "default": "tenant"
-        },
-        "cache_tags": {
-          "type": ["array", "null"],
-          "description": "Advisory cache tags for keying/invalidation. MUST be low-cardinality, non-sensitive labels.",
-          "items": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 64,
-            "pattern": "^[a-zA-Z0-9_.:-]{1,64}$"
-          },
-          "maxItems": 64,
-          "uniqueItems": true
-        }
-      }
+      "$ref": "https://corpusos.com/schemas/common/operation_context.json",
+      "description": "Operation context. REQUIRED on the wire; must be an object (mapping)."
     },
     "args": {
-      "title": "Operation Arguments",
-      "description": "Operation-specific arguments payload. Shape depends on 'op'. Unknown keys MUST be ignored by receivers.",
       "type": "object",
+      "description": "Operation-specific arguments. REQUIRED on the wire; must be an object (mapping).",
       "additionalProperties": true
-    },
-    "extensions": {
-      "title": "Namespaced Extensions (Optional)",
-      "description": "Top-level namespaced, vendor-specific extensions. Keys MUST be namespaced (e.g., 'vendor:feature.flag').",
-      "type": "object",
-      "additionalProperties": true,
-      "propertyNames": { "$ref": "#/$defs/namespaced_key" }
     }
   },
-  "$defs": {
-    "timestamp_ms": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 253402300800000,
-      "description": "UNIX epoch time in milliseconds (non-negative, ≤ year 9999)."
-    },
-    "positive_int": {
-      "type": "integer",
-      "minimum": 1,
-      "description": "Positive integer (> 0)."
-    },
-    "traceparent": {
-      "type": "string",
-      "description": "W3C Trace Context header (version 00).",
-      "pattern": "^00-[0-9a-f]{32}-[0-9a-f]{16}-0[0-9a-f]$"
-    },
-    "namespaced_key": {
-      "type": "string",
-      "description": "Namespaced extension key (e.g., 'vendor:feature.flag').",
-      "pattern": "^[a-z0-9]+:[a-z0-9_.-]+$"
-    },
-    "small_label": {
-      "type": "string",
-      "minLength": 1,
-      "maxLength": 64,
-      "pattern": "^[a-zA-Z0-9_.:-]{1,64}$",
-      "description": "Small, low-cardinality label"
-    }
-  },
-  "allOf": [
-    { "$comment": "----- Per-operation arg bindings (non-breaking hooks) -----" },
-    {
-      "if": { "properties": { "op": { "const": "vector.query" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/query.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.upsert" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/upsert.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.delete" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/delete.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.create_namespace" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/create_namespace.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "vector.delete_namespace" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/vector/delete_namespace.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "llm.complete" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/llm/complete.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "llm.stream" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/llm/stream.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "llm.count_tokens" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/llm/count_tokens.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "graph.query" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/graph/query.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "graph.stream_query" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/graph/stream_query.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "pattern": "^graph\\.(create_vertex|delete_vertex|create_edge|delete_edge)$" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/graph/crud.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "embedding.embed" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/embedding/embed.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "embedding.embed_batch" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/embedding/embed_batch.args.v1.json" } } }
-    },
-    {
-      "if": { "properties": { "op": { "const": "embedding.count_tokens" } }, "required": ["op"] },
-      "then": { "properties": { "args": { "$ref": "https://schemas.adaptersdk.org/corpus/embedding/count_tokens.args.v1.json" } } }
-    }
+  "required": [
+    "op",
+    "ctx",
+    "args"
   ],
-  "examples": [
-    {
-      "op": "vector.query",
-      "ctx": {
-        "request_id": "req_01HJ2R4S6Z2R2V2Z6V",
-        "deadline_ms": 1730935200123,
-        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        "tenant": "acme",
-        "cache_scope": "tenant",
-        "cache_tags": ["kb", "lang:en"]
-      },
-      "args": {
-        "vector": [0.12, 0.34, 0.56],
-        "top_k": 10,
-        "namespace": "acme.docs",
-        "filter": { "doc_type": "kb" },
-        "include_metadata": true,
-        "include_vectors": false
-      }
-    },
-    {
-      "op": "llm.complete",
-      "ctx": {
-        "request_id": "req_chat_9b2e",
-        "idempotency_key": "idem_9b2e_f7",
-        "deadline_ms": 1730935200123,
-        "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
-        "tenant": "acme",
-        "attrs": { "user_role": "analyst" }
-      },
-      "args": {
-        "messages": [
-          { "role": "system", "content": "You are concise." },
-          { "role": "user", "content": "Summarize this document list..." }
-        ],
-        "model": "gpt-4.1-mini",
-        "temperature": 0.2,
-        "max_tokens": 256
-      }
-    },
-    {
-      "op": "graph.query",
-      "ctx": {
-        "request_id": "gq_123",
-        "deadline_ms": 1730935200123
-      },
-      "args": {
-        "dialect": "cypher",
-        "text": "MATCH (n) RETURN n LIMIT 10",
-        "params": null
-      }
-    },
-    {
-      "op": "embedding.embed_batch",
-      "ctx": {
-        "request_id": "emb_abc",
-        "deadline_ms": 1730935200123,
-        "tenant": "acme"
-      },
-      "args": {
-        "texts": ["alpha", "beta", "gamma"],
-        "model": "example-embed-1",
-        "normalize": true,
-        "truncate": true
-      }
-    }
-  ],
-  "$comment": "Compatibility & Extensibility Notes:\n• This base schema is intentionally lenient: additionalProperties=true at all levels to satisfy §4.1.5 (ignore unknowns) and preserve v1.x wire compatibility.\n• Per-op schemas are referenced with if/then in allOf; these are additive hooks. If a reference is unavailable, validation remains lenient (the base still accepts).\n• SIEM-safety: servers MUST NOT log raw 'tenant', prompts, vectors, or source texts (§13, §15). Use irreversible hashes in telemetry.\n• Numeric rules (§4.1): JSON forbids NaN/Inf; implementers MUST still guard provider SDK boundaries.\n• Idempotency: when 'idempotency_key' is present, servers MUST deduplicate for at least 24h within (tenant, op, args-hash) scope (§6.1).\n• Deadlines: on receipt, compute remaining_ms = deadline_ms - now(); if <= 0, fail fast with DeadlineExceeded without backend calls (§6.1).\n• Operation registry: for hard enforcement of allowed 'op' values, combine with operation.registry.v1.json (enum of reserved ops in §4.1.6)."
+  "additionalProperties": true
 }

@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 33.3,
+  "result": {
+    "results": [
+      {
+        "ok": true
+      },
+      {
+        "ok": true
+      },
+      {
+        "records": [
+          {
+            "id": "node_11"
+          }
+        ]
+      }
+    ],
+    "success": true,
+    "error": null,
+    "transaction_id": null
+  }
+}

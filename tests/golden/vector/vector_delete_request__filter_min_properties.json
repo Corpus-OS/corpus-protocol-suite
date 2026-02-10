@@ -1,0 +1,13 @@
+{
+  "op": "vector.delete",
+  "ctx": {
+    "request_id": "t_vector_delete_filter_min_props",
+    "tenant": "test"
+  },
+  "args": {
+    "filter": {
+      "k": "v"
+    },
+    "namespace": "default"
+  }
+}

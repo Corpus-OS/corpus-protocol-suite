@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/common/envelope.stream.success.json",
+  "title": "Protocol Streaming Success Envelope",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean",
+      "const": true
+    },
+    "code": {
+      "type": "string",
+      "const": "STREAMING"
+    },
+    "ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Time elapsed in milliseconds"
+    },
+    "chunk": {
+      "description": "Streaming chunk payload (any JSON value)"
+    }
+  },
+  "required": [
+    "ok",
+    "code",
+    "ms",
+    "chunk"
+  ],
+  "additionalProperties": false
+}

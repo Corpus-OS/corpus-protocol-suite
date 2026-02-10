@@ -1,0 +1,14 @@
+{
+  "op": "llm.capabilities",
+  "ctx": {
+    "request_id": "t_llm_caps_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "verbose": true,
+    "x-debug": {
+      "level": 2,
+      "notes": "capabilities extension args"
+    }
+  }
+}

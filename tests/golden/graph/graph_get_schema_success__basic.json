@@ -1,0 +1,25 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 9.7,
+  "result": {
+    "nodes": {
+      "Person": {
+        "properties": [
+          "name",
+          "age"
+        ]
+      }
+    },
+    "edges": {
+      "KNOWS": {
+        "properties": [
+          "since"
+        ]
+      }
+    },
+    "metadata": {
+      "version": "1"
+    }
+  }
+}

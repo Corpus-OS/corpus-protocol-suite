@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "code": "TEXT_TOO_LONG",
+  "error": "TextTooLongError",
+  "message": "Input text exceeds maximum length",
+  "retry_after_ms": null,
+  "details": {
+    "max_text_length": 8192
+  },
+  "ms": 2.2
+}

@@ -1,0 +1,23 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_sampling_full",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream a short response."
+      }
+    ],
+    "max_tokens": 32,
+    "temperature": 0.4,
+    "top_p": 0.95,
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "stop_sequences": [
+      "END"
+    ]
+  }
+}

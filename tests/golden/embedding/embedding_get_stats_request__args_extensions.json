@@ -1,0 +1,13 @@
+{
+  "op": "embedding.get_stats",
+  "ctx": {
+    "request_id": "t_embedding_get_stats_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "window": "1h",
+    "x-stats": {
+      "include_cache": true
+    }
+  }
+}

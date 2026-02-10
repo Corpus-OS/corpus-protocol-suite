@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.get_schema.request.json",
+  "title": "Graph Get Schema Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.get_schema"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object required on the wire; may be empty; extra keys are ignored by the handler."
+        }
+      }
+    }
+  ]
+}

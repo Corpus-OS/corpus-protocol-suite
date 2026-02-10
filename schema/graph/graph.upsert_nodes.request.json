@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.upsert_nodes.request.json",
+  "title": "Graph Upsert Nodes Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.upsert_nodes"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "nodes": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.node.json"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "nodes"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

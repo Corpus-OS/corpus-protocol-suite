@@ -18,13 +18,17 @@ from corpus_sdk.vector.vector_base import (
 from examples.common.ctx import make_ctx
 from examples.common.printing import box, print_kv
 
+
 async def main():
     box("Vector ex01 — Basic query")
     adapter = MockVectorAdapter(failure_rate=0.0)  # deterministic
     ctx = make_ctx(OperationContext, tenant="ex01-tenant", timeout_ms=10_000)
 
     # Create namespace (3 dims, cosine)
-    await adapter.create_namespace(NamespaceSpec(namespace="ex01", dimensions=3, distance_metric="cosine"), ctx=ctx)
+    await adapter.create_namespace(
+        NamespaceSpec(namespace="ex01", dimensions=3, distance_metric="cosine"),
+        ctx=ctx,
+    )
 
     # Upsert a few vectors
     vecs = [
@@ -40,10 +44,16 @@ async def main():
     res = await adapter.query(spec, ctx=ctx)
     print_kv({"matches": len(res.matches), "total_matches": res.total_matches})
     for m in res.matches:
-        print(f"  id={m.vector.id} score={m.score:.3f} dist={m.distance:.3f} meta={m.vector.metadata}")
+        print(
+            f"  id={m.vector.id} score={m.score:.3f} "
+            f"dist={m.distance:.3f} meta={m.vector.metadata}"
+        )
 
-    print("\n[lesson] ex01: query returns VectorMatch list with scores/distances; context via make_ctx().")
+    print(
+        "\n[lesson] ex01: query returns VectorMatch list with scores/distances; "
+        "context via make_ctx()."
+    )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
-

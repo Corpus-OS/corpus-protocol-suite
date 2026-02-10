@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.upsert_edges.request.json",
+  "title": "Graph Upsert Edges Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.upsert_edges"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "edges": {
+              "type": "array",
+              "items": {
+                "$ref": "https://corpusos.com/schemas/graph/graph.types.edge.json"
+              },
+              "minItems": 1
+            },
+            "namespace": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "edges"
+          ],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

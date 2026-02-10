@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.chunk.json",
+  "title": "Graph Streaming Chunk",
+  "type": "object",
+  "properties": {
+    "records": {
+      "type": "array",
+      "description": "Streaming results (any JSON value)"
+    },
+    "is_final": {
+      "type": "boolean",
+      "default": false,
+      "description": "True for final chunk"
+    },
+    "summary": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "records",
+    "is_final"
+  ],
+  "additionalProperties": false
+}

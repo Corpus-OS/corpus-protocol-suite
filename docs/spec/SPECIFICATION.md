@@ -1,4 +1,6 @@
-# Corpus SDK Specification
+# CORPUS SPECIFICATION
+
+**specification_version:** `1.0.0`   
 
 ## Abstract
 
@@ -12,7 +14,7 @@ This document is not an Internet Standards Track specification; it is published 
 
 ## Copyright Notice
 
-Copyright © 2025 Corpus Protocol Suite.
+Copyright © 2026 Interoperable Intelligence Inc.
 SPDX-License-Identifier: Apache-2.0
 
 ---
@@ -28,14 +30,15 @@ SPDX-License-Identifier: Apache-2.0
 * [3. Terminology](#3-terminology)
 * [4. Conventions and Notation](#4-conventions-and-notation)
 
-  * [4.1. Wire-First Canonical Form (Normative)](#41-wire-first-canonical-form-normative)
+  * [4.1. Relationship to SCHEMA.md and PROTOCOLS.md (Normative)](#41-relationship-to-schemamd-and-protocolsmd-normative)
+  * [4.2. Wire-First Canonical Form (Normative)](#42-wire-first-canonical-form-normative)
 
-    * [4.1.1. Envelopes and Content Types (MUST)](#411-envelopes-and-content-types-must)
-    * [4.1.2. Version Identification (MUST)](#412-version-identification-must)
-    * [4.1.3. Streaming Frames (MUST where applicable)](#413-streaming-frames-must-where-applicable)
-    * [4.1.4. Transport Bindings for Streaming (Normative)](#414-transport-bindings-for-streaming-normative)
-    * [4.1.5. Compatibility and Unknown Fields (MUST)](#415-compatibility-and-unknown-fields-must)
-    * [4.1.6. Operation Registry (Normative)](#416-operation-registry-normative)
+    * [4.2.1. Envelopes and Content Types (MUST)](#421-envelopes-and-content-types-must)
+    * [4.2.2. Version Identification (MUST)](#422-version-identification-must)
+    * [4.2.3. Streaming Frames (MUST where applicable)](#423-streaming-frames-must-where-applicable)
+    * [4.2.4. Transport Bindings for Streaming (Normative)](#424-transport-bindings-for-streaming-normative)
+    * [4.2.5. Compatibility and Unknown Fields (MUST)](#425-compatibility-and-unknown-fields-must)
+    * [4.2.6. Operation Registry (Normative)](#426-operation-registry-normative)
 * [5. Architecture Overview](#5-architecture-overview)
 
   * [5.1. Protocol Relationships](#51-protocol-relationships)
@@ -53,7 +56,7 @@ SPDX-License-Identifier: Apache-2.0
   * [7.2. Data Types](#72-data-types)
   * [7.3. Operations](#73-operations)
 
-    * [7.3.1. Vertex/Edge CRUD](#731-vertexedge-crud)
+    * [7.3.1. Node/Edge CRUD](#731-nodeedge-crud)
     * [7.3.2. Queries](#732-queries)
 
       * [Streaming Finalization (Normative)](#streaming-finalization-normative)
@@ -133,7 +136,7 @@ SPDX-License-Identifier: Apache-2.0
 
   * [20.1. Normative References](#201-normative-references)
   * [20.2. Informative References](#202-informative-references)
-* [21. Author’s Address](#21-authors-address)
+* [21. Author's Address](#21-authors-address)
 * [Appendix A — End-to-End Example (Normative)](#appendix-a--end-to-end-example-normative)
 * [Appendix B — Capability Shapes (Illustrative)](#appendix-b--capability-shapes-illustrative)
 * [Appendix C — Wire-Level Envelopes](#appendix-c--wire-level-envelopes)
@@ -148,13 +151,17 @@ SPDX-License-Identifier: Apache-2.0
 
 ### 1.1. Motivation
 
-The proliferation of AI infrastructure has created a fragmented landscape of proprietary APIs and inconsistent interfaces. Fragmentation increases integration complexity, reduces operational visibility, and creates vendor lock-in. Enterprise teams need cohesive, auditable, and performance-predictable interfaces that allow swapping providers without rewriting core application code or telemetry pipelines.
+Enterprise AI teams are rebuilding the same integration logic for every model provider they adopt. Each new vendor—OpenAI, Anthropic, Cohere, internal models—brings incompatible APIs, different observability patterns, and unique failure modes. What starts as "just swap the endpoint" becomes weeks of engineering work reconciling rate limiting, streaming protocols, and telemetry formats.
+
+The real cost isn't the initial integration—it's the operational blindness that follows. Teams can't answer basic questions like "which department is driving our token spend?" or "why did response latency spike yesterday?" without building custom instrumentation for each provider. When they need to migrate workloads or negotiate better pricing, they discover they're locked in not by contracts, but by the infrastructure debt they've accumulated around each vendor's quirks.
+
+Existing abstraction layers try to solve this by creating yet another API to learn. Corpus takes a different approach: we provide protocol standards that existing frameworks like LangChain and LlamaIndex can adopt, giving enterprises unified observability, auditable operations, and genuine provider portability—without abandoning their current tooling.
 
 ### 1.2. Scope
 
 This specification defines four complementary protocols:
 
-* **Graph Protocol V1.0** — Vertex/edge CRUD, traversal, and multi-dialect query execution.
+* **Graph Protocol V1.0** — Node/edge CRUD, traversal, and multi-dialect query execution.
 * **LLM Protocol V1.0** — Chat-style completion, streaming tokens, usage accounting.
 * **Vector Protocol V1.0** — Vector upsert/delete, similarity search, and namespace management.
 * **Embedding Protocol V1.0** — Text embedding generation (single/batch), token counting, capability discovery, and health reporting.
@@ -174,28 +181,39 @@ All protocols share a **Common Foundation** for context propagation, capability 
 
 ## 2. Requirements Language
 
-The key words “MUST”, “MUST NOT”, “REQUIRED”, “SHALL”, “SHALL NOT”, “SHOULD”, “SHOULD NOT”, “RECOMMENDED”, “NOT RECOMMENDED”, “MAY”, and “OPTIONAL” in this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all capitals.
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 [RFC2119] [RFC8174] when, and only when, they appear in all capitals.
 
 ---
 
 ## 3. Terminology
 
 **Adapter** — Concrete implementation of a protocol for a specific provider/backend.
+
 **Protocol** — Interface contract that adapters MUST implement.
+
 **Operation Context** — Metadata container for tracing, deadlines, tenancy, and cache hints.
+
 **Capabilities** — Dynamically discoverable features and limits of an adapter.
+
 **SIEM-Safe** — Observability that excludes PII and uses privacy-preserving identifiers.
+
 **Idempotency Key** — Client-provided token guaranteeing idempotent semantics.
+
 **Tenant Isolation** — Logical separation of data/control plane in multi-tenant deployments.
+
 **Backpressure** — Cooperative throttling to keep systems within safe operating limits.
+
 **Streaming Frame** — Single JSON object carrying a `data`, `end`, or `error` event in a streaming operation.
+
 **Batch Partial Failure** — Outcome where some batch items succeed and others fail, with per-item status reported.
 
 ---
 
 ## 4. Conventions and Notation
 
-* JSON keys are **case-sensitive**; unknown keys **MUST** be ignored by clients and servers.
+* JSON keys are **case-sensitive**.
+* Unknown keys in **permissive objects** (e.g., `ctx`, capability objects, health results, and arguments whose schemas allow `additionalProperties: true`) **MUST** be ignored by clients and servers.
+* For **strict objects** (e.g., core response envelopes and types whose schemas use `additionalProperties: false`), behavior is governed by SCHEMA.md; unknown keys MAY cause validation to fail.
 * Durations are expressed in **milliseconds** unless otherwise specified.
 * Examples are **non-normative** unless explicitly marked **(Normative)**.
 * Field names use **lower_snake_case** unless specified.
@@ -213,11 +231,20 @@ Unless otherwise specified:
 * All durations are non-negative integers in milliseconds.
 * Implementations MUST reject NaN, +Inf, −Inf, and out-of-range numeric values with `BadRequest`.
 
-### 4.1. Wire-First Canonical Form (Normative)
+### 4.1. Relationship to SCHEMA.md and PROTOCOLS.md (Normative)
+
+This specification describes the architecture, semantics, and illustrative shapes of the Corpus Protocol Suite.
+
+- **SCHEMA.md** is the authoritative source of truth for JSON wire-format shapes and validation (including required fields and `additionalProperties` behavior).
+- **PROTOCOLS.md** describes operation-level semantics, streaming behavior, and error-handling rules consistent with SCHEMA.md.
+- When SCHEMA.md and this specification disagree on a JSON field name or type, **SCHEMA.md is authoritative** and this document MUST be updated to match.
+- When PROTOCOLS.md and this specification disagree on operation semantics, **PROTOCOLS.md is authoritative** for protocol behavior.
+
+### 4.2. Wire-First Canonical Form (Normative)
 
 The canonical interface is defined at the wire level using JSON documents and streaming frames.
 
-#### 4.1.1. Envelopes and Content Types (MUST)
+#### 4.2.1. Envelopes and Content Types (MUST)
 
 Non-streaming operations:
 
@@ -263,93 +290,128 @@ Non-streaming operations:
 * `code` MUST be a normalized code.
 * `error` MUST be a normalized error class name when `ok=false`.
 
-#### 4.1.2. Version Identification (MUST)
+**Closed Response Envelopes (Normative)**
+
+Core response envelopes are **closed objects** at the wire level:
+
+- Unary success envelopes MUST NOT contain any top-level keys other than `{ "ok", "code", "ms", "result" }`.
+- Error envelopes MUST NOT contain any top-level keys other than `{ "ok", "code", "error", "message", "retry_after_ms", "details", "ms" }`.
+- Streaming success frames use the `{ "ok", "code", "ms", "chunk" }` envelope defined in PROTOCOLS.md and MUST NOT contain any top-level keys beyond those fields.
+
+These constraints are enforced in SCHEMA.md via `additionalProperties: false` on the corresponding envelope schemas.
+
+#### 4.2.2. Version Identification (MUST)
 
 * Each protocol instance declares `"{component}/v1.0"`. Example: `"protocol": "vector/v1.0"`.
 * Clients MAY send `X-Adapter-Protocol: {component}/v1.0`.
 * All `v1.x` revisions are wire-compatible with `{component}/v1.0`.
 * Breaking changes require `"{component}/v2.0"`.
 
-#### 4.1.3. Streaming Frames (MUST where applicable)
+## 4.2.3. Streaming Frames (MUST where applicable)
 
-For streaming operations (`llm.stream`, `graph.stream_query`):
+The canonical streaming interface is defined at the wire level using **JSON envelopes** validated by **SCHEMA.md**. For streaming operations (e.g., `llm.stream`, `graph.stream_query`, `embedding.stream_embed`), adapters MUST emit a sequence of **streaming success frames** and MAY terminate with an **error envelope**.
 
-**Data frame:**
+### 4.2.3.1 Canonical Streaming Success Frame (MUST)
+
+Each streaming success frame MUST be a JSON object with the following top-level shape:
 
 ```json
-{
-  "event": "data",
-  "data": {}
-}
+{ "ok": true, "code": "STREAMING", "ms": 45.2, "chunk": { ... } }
 ```
 
-**Terminal success frame:**
+Rules:
+
+* `ok` MUST be `true`.
+* `code` MUST be `"STREAMING"` for all streaming success frames.
+* `ms` MUST be a non-negative number representing time elapsed in milliseconds (as defined in SCHEMA.md).
+* `chunk` MUST be an operation-specific payload validated by the operation’s streaming chunk schema (e.g., `llm.types.chunk`, `graph.types.chunk`, `embedding.types.chunk`).
+* Streaming success frames are **closed objects** at the top level: adapters MUST NOT include top-level keys beyond `{ "ok", "code", "ms", "chunk" }` (enforced by SCHEMA.md).
+
+### 4.2.3.2 Terminal Conditions (MUST)
+
+Exactly one terminal condition MUST occur per stream:
+
+**A) Terminal Success (MUST)**
+A stream completes successfully when a streaming success frame is emitted whose `chunk.is_final` is `true`.
+
+* A well-formed success stream MUST include exactly one frame with `chunk.is_final: true`.
+* No streaming frames (success or error) may follow the terminal success frame.
+
+**B) Terminal Error (MUST)**
+A stream terminates with failure if an **error envelope** is emitted:
 
 ```json
 {
-  "event": "end",
-  "code": "OK"
-}
-```
-
-**Terminal error frame:**
-
-```json
-{
-  "event": "error",
+  "ok": false,
   "code": "UNAVAILABLE",
   "error": "Unavailable",
-  "message": "..."
+  "message": "...",
+  "retry_after_ms": null,
+  "details": null,
+  "ms": 123.4
 }
 ```
 
 Rules:
 
-* Exactly one terminal frame (`event: "end"` or `event: "error"`) per stream.
-* No `data` frames after the terminal frame.
-* Terminal error frames MUST use normalized `code` and `error`.
-* Unknown keys (including any extensions) MUST be ignored by clients.
+* Error frames MUST use the canonical error envelope shape (validated by SCHEMA.md).
+* Error envelopes are **closed objects** at the top level: adapters MUST NOT include top-level keys beyond those permitted by the error envelope schema.
+* No frames may follow a terminal error envelope.
 
-**Frame Size and Keepalive**
+### 4.2.3.3 Ordering and Integrity (MUST)
 
-* Each frame MUST be ≤ 1 MiB.
-* For streams idle for more than 15 seconds, servers SHOULD emit a keepalive frame:
+* Streams MUST preserve semantic ordering: chunks MUST be delivered in the order defined by the operation (e.g., token order for LLM, record order for graph).
+* Chunks MUST be self-contained JSON objects valid under the appropriate chunk schema.
+* Clients MUST NOT rely on JSON field ordering within frames.
 
-  ```json
-  {
-    "event": "data",
-    "data": {
-      "heartbeat": true
-    }
-  }
-  ```
-* Clients MUST treat `heartbeat` frames and other unknown fields as no-ops.
+### 4.2.3.4 Frame Size and Keepalive (MUST/SHOULD)
 
-#### 4.1.4. Transport Bindings for Streaming (Normative)
+* Each serialized frame MUST be ≤ 1 MiB.
+* For streams idle for more than 15 seconds, adapters SHOULD emit a keepalive **as a standard streaming success frame** whose chunk is a no-op per the relevant chunk schema and/or operation guidance.
 
-The logical frame model binds to transports:
+> Note: Keepalive messages MUST still conform to the schema-defined streaming success envelope and MUST NOT violate terminal conditions.
 
-**HTTP/1.1 + NDJSON**
+### 4.2.3.5 Optional Gateway Event Overlay (Informative)
+
+Gateways or routers MAY present an alternate client-facing event model (e.g., SSE `event:` + `data:` wrappers) for convenience. Such overlays are **not** part of the base adapter wire protocol and MUST NOT replace the canonical envelope+chunk frames emitted by adapters.
+
+If a gateway chooses to expose an event overlay, it SHOULD preserve the semantics and terminal conditions described above.
+
+## 4.2.4. Transport Bindings for Streaming (Normative)
+
+This section defines how the canonical streaming frame model (§4.2.3) is carried over common transports. The base unit across all transports is a **single JSON frame** that is either:
+
+* a streaming success envelope: `{ "ok": true, "code": "STREAMING", "ms": ..., "chunk": ... }`, or
+* an error envelope: `{ "ok": false, ... }`.
+
+Adapters MAY support one or more transports and SHOULD advertise supported transports via capabilities.
+
+### 4.2.4.1 HTTP/1.1 + NDJSON (MUST if supported)
 
 * `Content-Type: application/x-ndjson`
 * `Transfer-Encoding: chunked`
-* Each line is one JSON frame.
+* Each line MUST be one complete JSON frame (streaming success envelope or error envelope).
+* The final line MUST contain the terminal condition: either a frame with `chunk.is_final: true`, or an error envelope.
 
-**Server-Sent Events (SSE)**
+### 4.2.4.2 Server-Sent Events (SSE) (MUST if supported)
 
 * `Content-Type: text/event-stream`
-* `event: <event>`
-* `data: {json}`
+* Each SSE `data:` payload MUST be a complete JSON frame (streaming success envelope or error envelope).
+* Gateways MAY set SSE `event:` fields for client convenience, but clients MUST be able to recover the canonical JSON frame from `data:`.
 
-**WebSocket**
+### 4.2.4.3 WebSocket (MUST if supported)
 
-* Each message is a JSON frame.
+* Each WebSocket message MUST contain exactly one complete JSON frame (streaming success envelope or error envelope).
+* Terminal conditions follow §4.2.3.2.
 
-**gRPC / HTTP/2 Streaming**
+### 4.2.4.4 gRPC / HTTP/2 Streaming (MUST if supported)
 
-* Each streamed message corresponds to one logical frame.
+* Each streamed message MUST correspond to exactly one logical JSON frame (streaming success envelope or error envelope), encoded in a transport-appropriate way.
+* Terminal conditions follow §4.2.3.2.
 
-Adapters MAY support one or more transports and SHOULD advertise:
+### 4.2.4.5 Advertising Transport Support (SHOULD)
+
+Adapters SHOULD advertise supported streaming transports via capabilities:
 
 ```json
 "extensions": {
@@ -357,44 +419,51 @@ Adapters MAY support one or more transports and SHOULD advertise:
 }
 ```
 
-#### 4.1.5. Compatibility and Unknown Fields (MUST)
+Unknown keys in `extensions` MUST be ignored by clients.
 
-* Unknown keys at any level MUST be ignored by clients and servers.
+#### 4.2.5. Compatibility and Unknown Fields (MUST)
+
+* Unknown keys in **permissive objects** (e.g., `ctx`, capability objects, health results, and arguments whose schemas allow `additionalProperties: true`) MUST be ignored by clients and servers.
+* Core response envelopes (success, error, streaming) and other **strict objects** follow SCHEMA.md: their schemas may reject unknown keys via `additionalProperties: false`.
 * Clients MUST NOT rely on JSON field ordering.
 * Numeric fields MUST follow §4.1 numeric rules.
 
-#### 4.1.6. Operation Registry (Normative)
+#### 4.2.6. Operation Registry (Normative)
 
 The following values of `op` are reserved for V1.0:
 
-| Section / Operation      | `op` String               |
-| ------------------------ | ------------------------- |
-| 7.3.1 `create_vertex`    | `graph.create_vertex`     |
-| 7.3.1 `delete_vertex`    | `graph.delete_vertex`     |
-| 7.3.1 `create_edge`      | `graph.create_edge`       |
-| 7.3.1 `delete_edge`      | `graph.delete_edge`       |
-| 7.3.2 `query`            | `graph.query`             |
-| 7.3.2 `stream_query`     | `graph.stream_query`      |
-| 7.3.3 `bulk_vertices`    | `graph.bulk_vertices`     |
-| 7.3.3 `batch`            | `graph.batch`             |
-| 7.5   `create_index`     | `graph.create_index`      |
-| 7.5   `drop_index`       | `graph.drop_index`        |
-| 7.6   `health`           | `graph.health`            |
-| 8.3   `complete`         | `llm.complete`            |
-| 8.3   `stream`           | `llm.stream`              |
-| 8.3   `count_tokens`     | `llm.count_tokens`        |
-| 8.4   `capabilities`     | `llm.capabilities`        |
-| 9.3   `query`            | `vector.query`            |
-| 9.3   `upsert`           | `vector.upsert`           |
-| 9.3   `delete`           | `vector.delete`           |
-| 9.3   `create_namespace` | `vector.create_namespace` |
-| 9.3   `delete_namespace` | `vector.delete_namespace` |
-| 9.3   `capabilities`     | `vector.capabilities`     |
-| 10.3  `capabilities`     | `embedding.capabilities`  |
-| 10.3  `embed`            | `embedding.embed`         |
-| 10.3  `embed_batch`      | `embedding.embed_batch`   |
-| 10.3  `count_tokens`     | `embedding.count_tokens`  |
-| 10.3  `health`           | `embedding.health`        |
+| Operation Name | op String | Protocol | Description |
+|---|---|---|---|
+| capabilities | graph.capabilities | Graph | Discover supported graph features and limits |
+| upsert_nodes | graph.upsert_nodes | Graph | Create or update multiple nodes |
+| upsert_edges | graph.upsert_edges | Graph | Create or update multiple edges |
+| delete_nodes | graph.delete_nodes | Graph | Remove nodes by ID |
+| delete_edges | graph.delete_edges | Graph | Remove edges by ID |
+| query | graph.query | Graph | Execute a graph query and return results |
+| stream_query | graph.stream_query | Graph | Execute a graph query with streaming results |
+| bulk_vertices | graph.bulk_vertices | Graph | Bulk operations on vertices (import/export) |
+| batch | graph.batch | Graph | Execute multiple operations in batch |
+| get_schema | graph.get_schema | Graph | Retrieve graph schema information |
+| health | graph.health | Graph | Check adapter and provider health status |
+| capabilities | llm.capabilities | LLM | Discover supported LLM features and models |
+| complete | llm.complete | LLM | Generate LLM completion for given messages |
+| stream | llm.stream | LLM | Stream LLM completion incrementally |
+| count_tokens | llm.count_tokens | LLM | Count tokens in text for a specific model |
+| health | llm.health | LLM | Check LLM provider health and model availability |
+| capabilities | vector.capabilities | Vector | Discover supported vector features and limits |
+| query | vector.query | Vector | Find similar vectors using approximate nearest neighbor search |
+| upsert | vector.upsert | Vector | Insert or update vectors in a namespace |
+| delete | vector.delete | Vector | Remove vectors by ID |
+| create_namespace | vector.create_namespace | Vector | Create a new vector namespace/collection |
+| delete_namespace | vector.delete_namespace | Vector | Remove a vector namespace and all its vectors |
+| health | vector.health | Vector | Check vector store health and namespace status |
+| capabilities | embedding.capabilities | Embedding | Discover supported embedding features and models |
+| embed | embedding.embed | Embedding | Generate embedding vector for a single text |
+| embed_batch | embedding.embed_batch | Embedding | Generate embeddings for multiple texts in batch |
+| count_tokens | embedding.count_tokens | Embedding | Count tokens in text for embedding model |
+| health | embedding.health | Embedding | Check embedding provider health and model status |
+
+**Note:** Filter-based deletion operations (e.g., delete by metadata filter) MAY be supported via extensions (e.g., `graph.delete_nodes_by_filter`, `vector.delete_by_filter`).
 
 Adapters MAY expose additional `op` values via namespaced extensions (e.g. `vendorX.llm.complete_raw`) but MUST NOT alter semantics of reserved `op` strings.
 
@@ -456,6 +525,8 @@ Profiles define behavior but MUST NOT change wire contracts.
 ## 6. Common Foundation
 
 ### 6.1. Operation Context
+
+The following Python dataclass is an SDK-level representation of the operation context. The **canonical wire shape** of `ctx` is defined by SCHEMA.md; this dataclass is illustrative and may include convenience fields or defaults not present on the wire.
 
 ```python
 from dataclasses import dataclass
@@ -583,7 +654,7 @@ Errors MUST use normalized `code` values and SHOULD include hints, e.g.:
 ```json
 {
   "ok": false,
-  "code": "RATE_LIMIT",
+  "code": "RESOURCE_EXHAUSTED",
   "error": "ResourceExhausted",
   "message": "Rate limit exceeded",
   "retry_after_ms": 1200,
@@ -630,6 +701,8 @@ Vendor-neutral interface for graph databases (Cypher, OpenCypher, Gremlin, GQL),
 
 ### 7.2. Data Types
 
+The Python dataclasses in this section describe typical SDK-level representations. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples in this specification. Where there is any discrepancy, SCHEMA.md is authoritative.
+
 ```python
 from dataclasses import dataclass
 from typing import NewType, Tuple, Optional, Mapping, Any, Iterable, List, AsyncIterator
@@ -656,33 +729,29 @@ class GraphCapabilities:
 
 ### 7.3. Operations
 
-#### 7.3.1. Vertex/Edge CRUD
+#### 7.3.1. Node/Edge CRUD
 
 ```python
-async def create_vertex(
-    label: str,
-    props: Mapping[str, Any],
+async def upsert_nodes(
+    nodes: Iterable[Tuple[str, Mapping[str, Any]]],
     *,
     ctx: Optional[OperationContext] = None
-) -> GraphID
+) -> List[GraphID]
 
-async def delete_vertex(
-    vertex_id: GraphID,
+async def delete_nodes(
+    node_ids: List[GraphID],
     *,
     ctx: Optional[OperationContext] = None
 ) -> None
 
-async def create_edge(
-    label: str,
-    from_id: GraphID,
-    to_id: GraphID,
-    props: Mapping[str, Any],
+async def upsert_edges(
+    edges: Iterable[Tuple[str, GraphID, GraphID, Mapping[str, Any]]],
     *,
     ctx: Optional[OperationContext] = None
-) -> GraphID
+) -> List[GraphID]
 
-async def delete_edge(
-    edge_id: GraphID,
+async def delete_edges(
+    edge_ids: List[GraphID],
     *,
     ctx: Optional[OperationContext] = None
 ) -> None
@@ -832,6 +901,8 @@ Standardized interface for chat-style completions, streaming, token accounting, 
 
 ### 8.2. Data Types
 
+The Python dataclasses in this section describe SDK-level representations of LLM types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples in this specification. Where there is any discrepancy, SCHEMA.md is authoritative.
+
 ```python
 from dataclasses import dataclass
 from typing import Optional
@@ -911,7 +982,7 @@ Validation:
 
 Streaming:
 
-* Uses §4.1.3 frame semantics.
+* Uses §4.2.3 frame semantics.
 * Last chunk MUST have `is_final=true`.
 * One final `observe` metric per stream.
 
@@ -937,6 +1008,7 @@ Streaming:
   "features": {
     "supports_streaming": true,
     "supports_roles": true,
+    "supports_system_message": true,
     "supports_json_output": false,
     "supports_parallel_tool_calls": false,
     "supports_deadline": true,
@@ -963,6 +1035,8 @@ Streaming:
 Standardized vector storage and similarity search with namespaces, filters, and consistent metrics.
 
 ### 9.2. Data Types
+
+The Python dataclasses in this section are SDK-level representations of vector types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples. Where there is any discrepancy, SCHEMA.md is authoritative.
 
 ```python
 from dataclasses import dataclass
@@ -1086,6 +1160,8 @@ Vendor-neutral interface for generating embeddings (single/batch), counting toke
 
 ### 10.2. Data Types (Formal)
 
+The Python dataclasses in this section describe SDK-level representations of embedding types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples. Where there is any discrepancy, SCHEMA.md is authoritative.
+
 ```python
 from dataclasses import dataclass
 from typing import List, Optional, Mapping, Any
@@ -1127,7 +1203,7 @@ class EmbeddingCapabilities:
     supports_truncation: bool = True
     supports_token_counting: bool = True
     supports_deadline: bool = True
-    idempotent_operations: bool = True
+    idempotent_writes: bool = True  # Wire key: idempotent_writes
     supports_multi_tenant: bool = True
 ```
 
@@ -1199,6 +1275,8 @@ Implementations MUST declare:
 * Optional: `max_batch_size`, `max_text_length`, `max_dimensions`.
 * Boolean flags as defined in `EmbeddingCapabilities`.
 
+**Note:** Both the wire-level JSON key and the SDK field share the same name: `idempotent_writes`. This field and its semantics are defined in PROTOCOLS.md and SCHEMA.md.
+
 ### 10.6. Semantics
 
 * `model` MUST be in `supported_models`.
@@ -1241,7 +1319,7 @@ Implementations MUST declare:
 
 ### 11.5. Pagination and Streaming
 
-* For streaming, follow §4.1.3.
+* For streaming, follow §4.2.3.
 * When pagination is supported (Graph or Vector or others):
 
   * Responses MUST include an opaque `next_page_token` when more results exist.
@@ -1313,6 +1391,28 @@ A `TransactionCoordinator` MAY provide best-effort multi-component workflows wit
 
 ### 12.4. Error Mapping Table (Normative)
 
+**Canonical Success Codes:**
+- `OK` - Operation completed successfully
+
+**Canonical Error Codes (Illustrative, Not Exhaustive):**
+- `BAD_REQUEST` - Invalid parameters, malformed requests
+- `AUTH_ERROR` - Invalid credentials, permissions
+- `RESOURCE_EXHAUSTED` - Rate limits, quotas exceeded
+- `TRANSIENT_NETWORK` - Network timeouts, connection issues
+- `UNAVAILABLE` - Service temporarily down
+- `NOT_SUPPORTED` - Unsupported operation or parameter
+- `DEADLINE_EXCEEDED` - Operation timeout
+- `MODEL_OVERLOADED` - Model capacity exceeded
+- `CONTENT_FILTERED` - Input violates content policy
+- `TEXT_TOO_LONG` - Input exceeds context window
+- `DIMENSION_MISMATCH` - Vector dimensions don't match
+- `INDEX_NOT_READY` - Vector index not ready for queries
+- `MODEL_NOT_AVAILABLE` - Requested model not available
+- `QUERY_PARSE_ERROR` - Invalid query syntax
+- `VERTEX_NOT_FOUND` - Graph node not found
+- `EDGE_NOT_FOUND` - Graph edge not found
+- `SCHEMA_VALIDATION_ERROR` - Schema constraint violation
+
 | Error Class        | HTTP    | Retryable   | Client Guidance                                       |
 | ------------------ | ------- | ----------- | ----------------------------------------------------- |
 | BadRequest         | 400     | No          | Fix request; do not retry                             |
@@ -1336,49 +1436,53 @@ A `TransactionCoordinator` MAY provide best-effort multi-component workflows wit
 
 For non-atomic batch operations (e.g. `embed_batch`, vector `upsert`, graph `batch`):
 
-The transport envelope for partial success MUST be:
+**Option B Selected:** Keep `code: "OK"` and encode partial vs full success inside result only (matching the existing BatchResult convention in PROTOCOLS.md).
+
+The transport envelope for batch operations MUST be:
 
 ```json
 {
   "ok": true,
-  "code": "PARTIAL_SUCCESS",
+  "code": "OK",
   "ms": 38.4,
   "result": {
-    "successes": 2,
-    "failures": 1,
-    "items": [
-      {
-        "index": 0,
-        "ok": true,
-        "result": { }
-      },
-      {
-        "index": 1,
-        "ok": true,
-        "result": { }
-      },
+    "processed_count": 2,
+    "failed_count": 1,
+    "failures": [
       {
         "index": 2,
-        "ok": false,
-        "code": "TEXT_TOO_LONG",
-        "message": "Input exceeds max_text_length",
-        "details": { }
+        "error": "TEXT_TOO_LONG",
+        "detail": "Input exceeds max_text_length"
+      }
+    ],
+    "results": [
+      {
+        "vector": [0.01, 0.02],
+        "model": "example-embed-1",
+        "dimensions": 2
+      },
+      {
+        "vector": [0.03, 0.04],
+        "model": "example-embed-1",
+        "dimensions": 2
       }
     ]
   }
 }
 ```
 
+**Note:** Protocol-specific batch operations use protocol-specific result field names (e.g., `embeddings` for embedding operations, `vectors` for vector operations) within the generic `BatchResult` wrapper.
+
 Requirements:
 
-* Use `ok:true` and `code:"PARTIAL_SUCCESS"` when at least one item succeeds and at least one fails.
-* Each failed item MUST include `index` and `code`. `message` and `details` are OPTIONAL.
-* Success items MUST preserve the input order across `items`.
+* Use `ok:true` and `code:"OK"` for all batch operations regardless of partial failures.
+* Each failed item MUST include `index` and `error`. `detail` is OPTIONAL.
+* Success items MUST preserve the input order across `results`.
 * MUST NOT drop failed items silently.
 
 ### 12.6. Backpressure Integration
 
-Implementations SHOULD integrate cooperative backpressure. On saturation, surface `ResourceExhausted` or `Unavailable` following this spec’s hints.
+Implementations SHOULD integrate cooperative backpressure. On saturation, surface `ResourceExhausted` or `Unavailable` following this spec's hints.
 
 ---
 
@@ -1561,9 +1665,81 @@ Adapters MUST:
 
 ### 17.3. Testing
 
-* Unit tests for validation, mapping, idempotency, partial failures.
-* Integration tests across Graph/LLM/Vector/Embedding flows.
-* Chaos tests with injected errors, timeouts, and overloads.
+#### 17.3.1. One-Command Conformance Testing
+
+**Recommended: Make targets (from repo root)**
+```bash
+# Test ALL protocols at once (LLM + Vector + Graph + Embedding)
+make test-all-conformance
+
+# Test specific protocols
+make test-llm-conformance
+make test-vector-conformance
+make test-graph-conformance
+make test-embedding-conformance
+```
+
+**Alternative: Corpus SDK CLI**
+Available when installed with the entrypoint: `[project.scripts] corpus-sdk = "corpus_sdk.cli:main"`
+
+```bash
+# Show help / usage
+corpus-sdk
+
+# Run ALL protocol conformance suites
+corpus-sdk test-all-conformance
+corpus-sdk verify
+
+# Run specific protocol suites
+corpus-sdk test-llm-conformance
+corpus-sdk test-vector-conformance
+corpus-sdk test-graph-conformance
+corpus-sdk test-embedding-conformance
+
+# Filtered verify (run only selected protocols)
+corpus-sdk verify -p llm -p vector
+corpus-sdk verify -p embedding
+```
+
+**Direct: pytest (no wrappers)**
+```bash
+# Run everything with coverage
+pytest tests/ -v --cov=corpus_sdk --cov-report=html
+
+# Run specific protocol suites
+pytest tests/llm/ -v
+pytest tests/vector/ -v
+pytest tests/graph/ -v
+pytest tests/embedding/ -v
+```
+
+#### 17.3.2. Conformance Test Coverage
+
+The test suite validates:
+
+* **Wire format compliance** - All request/response envelopes match specification
+* **Error normalization** - Provider errors mapped to canonical taxonomy
+* **Streaming semantics** - Proper frame sequencing and terminal events
+* **Batch operations** - Partial failure handling and atomicity
+* **Capability discovery** - Truthful feature reporting
+* **Observability** - SIEM-safe metrics and logging
+* **Security** - Tenant isolation and content redaction
+
+#### 17.3.3. Corpus Protocol Suite Badge
+
+Implementations passing the full conformance test suite may display:
+
+![LLM Protocol](https://img.shields.io/badge/CorpusLLM%20Protocol-100%25%20Conformant-brightgreen)
+![Vector Protocol](https://img.shields.io/badge/CorpusVector%20Protocol-100%25%20Conformant-brightgreen)
+![Graph Protocol](https://img.shields.io/badge/CorpusGraph%20Protocol-100%25%20Conformant-brightgreen)
+![Embedding Protocol](https://img.shields.io/badge/CorpusEmbedding%20Protocol-100%25%20Conformant-brightgreen)
+
+
+**Requirements for badge display:**
+- Pass 100% of protocol-specific conformance tests
+- Implement all required operations for claimed protocols
+- Maintain backward compatibility within major version
+- Follow SIEM-safe observability requirements
 
 ---
 
@@ -1617,11 +1793,11 @@ No IANA actions are required.
 
 ---
 
-## 21. Author’s Address
+## 21. Author's Address
 
 Corpus Working Group
-Email: [standards@adaptersdk.org](mailto:standards@adaptersdk.org)
-GitHub: [https://github.com/adapter-sdk/standards](https://github.com/adapter-sdk/standards)
+Email: [standards@corpusos.com](mailto:standards@corpusos.com)
+GitHub: [https://github.com/corpus-sdk/standards](https://github.com/corpus-sdk/standards)
 
 ---
 
@@ -1832,7 +2008,7 @@ for attempt in range(5):
   "supports_truncation": true,
   "supports_token_counting": true,
   "supports_deadline": true,
-  "idempotent_operations": true,
+  "idempotent_writes": true,
   "supports_multi_tenant": true,
   "cache": {
     "supports_tags": true,
@@ -1844,6 +2020,8 @@ for attempt in range(5):
 ---
 
 ## Appendix C — Wire-Level Envelopes
+
+Core envelopes in this appendix follow the closed-envelope rules from §4.2.1 and SCHEMA.md: adapters MUST NOT add extra top-level fields beyond those shown for success, error, and streaming envelopes.
 
 ### Embedding Batch Request
 
@@ -1871,35 +2049,30 @@ for attempt in range(5):
 ```json
 {
   "ok": true,
-  "code": "PARTIAL_SUCCESS",
+  "code": "OK",
   "ms": 38.4,
   "result": {
-    "successes": 2,
-    "failures": 1,
-    "items": [
-      {
-        "index": 0,
-        "ok": true,
-        "result": {
-          "vector": [0.01, 0.02],
-          "model": "example-embed-1",
-          "dimensions": 2
-        }
-      },
-      {
-        "index": 1,
-        "ok": true,
-        "result": {
-          "vector": [0.03, 0.04],
-          "model": "example-embed-1",
-          "dimensions": 2
-        }
-      },
+    "processed_count": 2,
+    "failed_count": 1,
+    "failures": [
       {
         "index": 2,
-        "ok": false,
-        "code": "TEXT_TOO_LONG",
-        "message": "Input exceeds max_text_length"
+        "error": "TEXT_TOO_LONG",
+        "detail": "Input exceeds max_text_length"
+      }
+    ],
+    "embeddings": [
+      {
+        "vector": [0.01, 0.02],
+        "text": "a",
+        "model": "example-embed-1",
+        "dimensions": 2
+      },
+      {
+        "vector": [0.03, 0.04],
+        "text": "b", 
+        "model": "example-embed-1",
+        "dimensions": 2
       }
     ]
   }
@@ -1915,7 +2088,6 @@ Content-Type: application/x-ndjson
 Transfer-Encoding: chunked
 X-Protocol-Streaming: chunked-json
 ```
-
 Body:
 
 ```json
@@ -1970,25 +2142,12 @@ Implementations claiming Corpus-compatible status SHOULD:
 
 ### Interoperability Test Suite
 
-Repository: `https://github.com/corpus/protocol-tests`
-
-Execution:
-
-```bash
-corpus-sdk verify --protocol=all
-```
-
 Coverage:
 
-* 247+ conformance tests
+* 400+ conformance tests
 * Cross-protocol flows
 * Error normalization and partial-failure handling
 * Streaming semantics verification
-
-### Known Implementations Registry
-
-Maintained in `protocol-tests` repository.
-Entries SHOULD include: implementation name, language, supported protocols, version(s), and conformance notes.
 
 ---
 

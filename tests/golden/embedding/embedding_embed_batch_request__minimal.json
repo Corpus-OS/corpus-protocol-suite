@@ -1,0 +1,14 @@
+{
+  "op": "embedding.embed_batch",
+  "ctx": {
+    "request_id": "t_embedding_embed_batch_min",
+    "tenant": "test"
+  },
+  "args": {
+    "texts": [
+      "a",
+      "b"
+    ],
+    "model": "embed-small"
+  }
+}

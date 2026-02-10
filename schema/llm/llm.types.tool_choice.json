@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.tool_choice.json",
+  "title": "LLM Tool Choice",
+  "anyOf": [
+    {
+      "type": "null"
+    },
+    {
+      "type": "string",
+      "enum": [
+        "auto",
+        "none",
+        "required"
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": true
+    }
+  ]
+}

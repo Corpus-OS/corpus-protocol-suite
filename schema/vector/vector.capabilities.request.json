@@ -1,9 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.health.request.json",
-  "title": "vector.health Args",
-  "description": "Explicit empty-args schema for vector.health().",
+  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.request.json",
+  "title": "Vector Capabilities Request",
   "type": "object",
-  "additionalProperties": false,
-  "maxProperties": 0
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.capabilities"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; extra keys are ignored by the handler."
+        }
+      }
+    }
+  ]
 }

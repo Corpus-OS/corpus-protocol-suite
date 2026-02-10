@@ -1,0 +1,13 @@
+{
+  "op": "graph.delete_nodes",
+  "ctx": {
+    "request_id": "t_graph_delete_nodes_filter",
+    "tenant": "test"
+  },
+  "args": {
+    "filter": {
+      "label": "Person"
+    },
+    "namespace": "default"
+  }
+}

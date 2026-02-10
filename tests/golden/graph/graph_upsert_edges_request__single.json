@@ -1,0 +1,24 @@
+{
+  "op": "graph.upsert_edges",
+  "ctx": {
+    "request_id": "t_graph_upsert_edges_single",
+    "tenant": "test"
+  },
+  "args": {
+    "edges": [
+      {
+        "id": "edge_1",
+        "src": "node_1",
+        "dst": "node_2",
+        "label": "KNOWS",
+        "properties": {
+          "since": 2020
+        },
+        "namespace": "default",
+        "created_at": 0,
+        "updated_at": 0
+      }
+    ],
+    "namespace": "default"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.get_stats.request.json",
+  "title": "Embedding Get Stats Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "embedding.get_stats"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object is required on the wire; may be empty; extra keys are ignored."
+        }
+      }
+    }
+  ]
+}

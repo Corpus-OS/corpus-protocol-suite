@@ -1,0 +1,41 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_tool_choice_object",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Use tool lookup with q='abc'."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "lookup",
+          "description": "Lookup something",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "q"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": {
+      "type": "function",
+      "function": {
+        "name": "lookup"
+      }
+    }
+  }
+}

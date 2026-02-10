@@ -1,0 +1,30 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_ctx_attrs",
+    "tenant": "test",
+    "attrs": {
+      "x-client": "golden-tests",
+      "x-run": "ci",
+      "tags": [
+        "conformance",
+        "llm",
+        "complete"
+      ]
+    },
+    "x-pass-through": {
+      "note": "ctx may include extra fields"
+    }
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Ping."
+      }
+    ],
+    "x-extra-arg": {
+      "note": "args is an explicit extension boundary"
+    }
+  }
+}

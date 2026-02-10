@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 6.0,
+  "result": {
+    "text": "",
+    "model": "test-model-1",
+    "model_family": "test-family",
+    "usage": {
+      "prompt_tokens": 8,
+      "completion_tokens": 0,
+      "total_tokens": 8
+    },
+    "finish_reason": "stop"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_tools_null",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Say hello."
+      }
+    ],
+    "tools": null
+  }
+}

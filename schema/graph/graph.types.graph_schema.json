@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.graph_schema.json",
+  "title": "Graph Schema",
+  "type": "object",
+  "properties": {
+    "nodes": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "edges": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "nodes",
+    "edges",
+    "metadata"
+  ],
+  "additionalProperties": false
+}

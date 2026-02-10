@@ -1,0 +1,35 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_tools_basic",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is the weather in Chicago? Use the tool."
+      }
+    ],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get weather by city",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "city"
+            ]
+          }
+        }
+      }
+    ]
+  }
+}

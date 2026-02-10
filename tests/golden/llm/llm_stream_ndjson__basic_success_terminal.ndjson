@@ -1,0 +1,3 @@
+{"ok":true,"code":"STREAMING","ms":5.1,"chunk":{"text":"Hel","is_final":false,"model":"test-model-1"}}
+{"ok":true,"code":"STREAMING","ms":7.4,"chunk":{"text":"lo","is_final":false,"model":"test-model-1"}}
+{"ok":true,"code":"STREAMING","ms":9.0,"chunk":{"text":"!","is_final":true,"model":"test-model-1","usage_so_far":{"prompt_tokens":2,"completion_tokens":2,"total_tokens":4}}}

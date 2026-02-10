@@ -1,5 +1,6 @@
 # corpus_sdk/graph/graph_base.py
 # SPDX-License-Identifier: Apache-2.0
+
 """
 Adapter SDK — Graph Protocol V1.0
 
@@ -48,6 +49,13 @@ mode: "standalone"
           (query / capabilities / bulk_vertices / get_schema)
         * SimpleTokenBucketLimiter
     - Intended for development / light production; NOT a full distributed control plane.
+
+IMPORTANT (clarification on caching vs mode):
+    - This SDK treats caching as a policy. To keep "thin" mode truly policy-free,
+      caching is disabled by default in "thin" mode even if a cache implementation
+      is provided.
+    - Callers that intentionally want caching in "thin" mode may enable it explicitly
+      via the BaseGraphAdapter constructor flag `enable_caching` (see BaseGraphAdapter).
 
 Versioning
 ----------
@@ -103,11 +111,25 @@ Streaming queries (graph.stream_query) follow the same pattern as llm.stream:
 
     - Request: single envelope with op="graph.stream_query"
     - Response: stream of { ok, code, ms, chunk: { ... } } or terminal error envelope.
+
+IMPORTANT WIRE STRICTNESS NOTE (Alignment)
+------------------------------------------
+For interoperability and forward/backward compatibility, this SDK treats the
+WIRE boundary as strict:
+
+- Envelopes MUST include top-level keys: op, ctx, args
+- ctx MUST be an object (mapping)
+- args MUST be an object (mapping)
+
+This is intentionally stricter than in-process calls (ctx is optional there),
+and is aligned with the canonical envelope contract.
+
 """
 
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import logging
@@ -153,15 +175,27 @@ class Node:
         labels: Optional set/list of labels / types / kinds
         properties: Arbitrary JSON-serializable property map
         namespace: Optional logical graph / tenant / dataset
+        created_at: Optional creation timestamp (epoch milliseconds)
+        updated_at: Optional last update timestamp (epoch milliseconds)
     """
     id: GraphID
     labels: Tuple[str, ...] = ()
     properties: Mapping[str, Any] = None
     namespace: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.properties is None:
             object.__setattr__(self, "properties", {})
+        # Validate labels are all strings
+        if self.labels:
+            for i, label in enumerate(self.labels):
+                if not isinstance(label, str):
+                    # Map to normalized client error rather than generic ValueError
+                    raise BadRequest(
+                        f"labels[{i}] must be a string, got {type(label).__name__}"
+                    )
 
 
 @dataclass(frozen=True)
@@ -176,6 +210,8 @@ class Edge:
         label: Relationship / predicate / type
         properties: Arbitrary JSON-serializable property map
         namespace: Optional logical graph / tenant / dataset
+        created_at: Optional creation timestamp (epoch milliseconds)
+        updated_at: Optional last update timestamp (epoch milliseconds)
     """
     id: GraphID
     src: GraphID
@@ -183,6 +219,8 @@ class Edge:
     label: str
     properties: Mapping[str, Any] = None
     namespace: Optional[str] = None
+    created_at: Optional[int] = None
+    updated_at: Optional[int] = None
 
     def __post_init__(self) -> None:
         if self.properties is None:
@@ -273,7 +311,102 @@ class DeleteEdgesSpec:
     filter: Optional[Mapping[str, Any]] = None
 
 
-# ---- Bulk / Batch specs (restored) ------------------------------------------
+# ---- Transaction and Traversal specs ----------------------------------------
+
+@dataclass(frozen=True)
+class GraphTransaction:
+    """
+    Transaction context for atomic batch operations.
+
+    Attributes:
+        operations: List of batch operations to execute atomically
+        namespace: Optional namespace / graph for the transaction
+        timeout_ms: Optional transaction-level timeout
+    """
+    operations: List["BatchOperation"]
+    namespace: Optional[str] = None
+    timeout_ms: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class GraphTraversalSpec:
+    """
+    Specification for graph traversal operations.
+
+    Attributes:
+        start_nodes: List of node IDs to start traversal from
+        max_depth: Maximum traversal depth (default: 1)
+        direction: Traversal direction - "OUTGOING", "INCOMING", or "BOTH"
+        relationship_types: Optional filter for relationship types/labels
+        node_filters: Optional property filters for nodes to include
+        relationship_filters: Optional property filters for relationships to traverse
+        return_properties: Optional list of node/relationship properties to return
+        namespace: Optional namespace / graph for traversal
+
+    NOTE (clarification):
+        start_nodes are represented as strings for wire-level simplicity and
+        interoperability across backends. In typed code, GraphIDs can be passed
+        by converting to str (GraphID is NewType(str)). WireGraphHandler enforces
+        that these are non-empty strings.
+    """
+    start_nodes: List[str]
+    max_depth: int = 1
+    direction: str = "OUTGOING"
+    relationship_types: Optional[Tuple[str, ...]] = None
+    node_filters: Optional[Mapping[str, Any]] = None
+    relationship_filters: Optional[Mapping[str, Any]] = None
+    return_properties: Optional[Tuple[str, ...]] = None
+    namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # Validate start_nodes are non-empty strings (wire-safe)
+        for i, n in enumerate(self.start_nodes or []):
+            if not isinstance(n, str) or not n:
+                raise BadRequest(
+                    f"start_nodes[{i}] must be a non-empty string, got {type(n).__name__}",
+                    details={"index": i},
+                )
+
+        # Validate direction
+        if self.direction not in {"OUTGOING", "INCOMING", "BOTH"}:
+            raise BadRequest(
+                f"direction must be OUTGOING, INCOMING, or BOTH, got {self.direction}"
+            )
+        # Validate max_depth
+        if self.max_depth < 1:
+            raise BadRequest("max_depth must be at least 1")
+
+
+@dataclass
+class TraversalResult:
+    """
+    Result for graph traversal operations.
+
+    Attributes:
+        nodes: List of nodes discovered during traversal
+        relationships: List of relationships traversed
+        paths: List of complete paths (node-relationship-node sequences)
+        summary: Optional traversal metadata and statistics
+        namespace: Target namespace / graph
+    """
+    nodes: List[Node]
+    relationships: List[Edge]
+    paths: List[List[Union[Node, Edge]]]  # Alternating node-edge-node sequence
+    summary: Mapping[str, Any]
+    namespace: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.nodes is None:
+            object.__setattr__(self, "nodes", [])
+        if self.relationships is None:
+            object.__setattr__(self, "relationships", [])
+        if self.paths is None:
+            object.__setattr__(self, "paths", [])
+        if self.summary is None:
+            object.__setattr__(self, "summary", {})
+
+
+# ---- Bulk / Batch specs ------------------------------------------
 
 @dataclass(frozen=True)
 class BulkVerticesSpec:
@@ -308,6 +441,12 @@ class BulkVerticesResult:
     next_cursor: Optional[str]
     has_more: bool
 
+    def __post_init__(self) -> None:
+        # Keep behavior consistent with other __post_init__ patterns in this file.
+        # This ensures a stable, JSON-safe payload even if backend code returns None.
+        if self.nodes is None:
+            object.__setattr__(self, "nodes", [])
+
 
 @dataclass(frozen=True)
 class BatchOperation:
@@ -333,11 +472,22 @@ class BatchResult:
 
     Attributes:
         results: Per-operation results (success or error payloads).
+        success: Whether the entire batch succeeded
+        error: Error message if batch failed
+        transaction_id: Optional transaction identifier for atomic batches
     """
     results: List[Any]
+    success: bool = True
+    error: Optional[str] = None
+    transaction_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        if self.results is None:
+            # Keep style consistent with other __post_init__ patterns in this file.
+            object.__setattr__(self, "results", [])
 
 
-# ---- Schema Introspection (restored) ----------------------------------------
+# ---- Schema Introspection ----------------------------------------
 
 @dataclass
 class GraphSchema:
@@ -386,6 +536,14 @@ class QueryResult:
     dialect: Optional[str] = None
     namespace: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        # Defensive normalization to keep typed + wire outputs stable and JSON-safe.
+        # This avoids surprising None values propagating through routers and handlers.
+        if self.records is None:
+            object.__setattr__(self, "records", [])
+        if self.summary is None:
+            object.__setattr__(self, "summary", {})
+
 
 @dataclass
 class QueryChunk:
@@ -400,6 +558,11 @@ class QueryChunk:
     records: List[Any]
     is_final: bool = False
     summary: Optional[Mapping[str, Any]] = None
+
+    def __post_init__(self) -> None:
+        # Keep streaming frames consistent and wire-safe even if backend returns None.
+        if self.records is None:
+            object.__setattr__(self, "records", [])
 
 
 @dataclass
@@ -542,7 +705,7 @@ class OperationContext:
     deadline_ms: Optional[int] = None
     traceparent: Optional[str] = None
     tenant: Optional[str] = None
-    attrs: Mapping[str, Any] = None
+    attrs: Optional[Mapping[str, Any]] = None
 
     def __post_init__(self) -> None:
         if self.attrs is None:
@@ -612,6 +775,34 @@ class Cache(Protocol):
     async def get(self, key: str) -> Optional[Any]:
         ...
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
+        ...
+    async def invalidate_pattern(self, pattern: str) -> None:
+        """
+        Invalidate cached entries whose cache keys match the given pattern.
+
+        The pattern semantics (substring match, glob, prefix, etc.) are
+        implementation-defined, but should be documented per Cache impl.
+        """
+        ...
+
+    @property
+    def supports_ttl(self) -> bool:
+        """
+        Whether this cache implementation supports TTL semantics on `set`.
+
+        This mirrors the Embedding SDK cache contract and avoids brittle
+        isinstance()-based checks when caches are wrapped/proxied.
+        """
+        ...
+
+    @property
+    def supports_invalidate_pattern(self) -> bool:
+        """
+        Whether this cache implementation supports invalidate_pattern.
+
+        Some distributed caches may not support pattern invalidation, or may
+        implement invalidation as an asynchronous best-effort process.
+        """
         ...
 
 
@@ -684,13 +875,30 @@ class SimpleCircuitBreaker:
 class NoopCache:
     async def get(self, key: str) -> Optional[Any]:
         return None
+
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
         ...
+
+    async def invalidate_pattern(self, pattern: str) -> None:
+        # No-op by design
+        return None
+
+    @property
+    def supports_ttl(self) -> bool:
+        return False
+
+    @property
+    def supports_invalidate_pattern(self) -> bool:
+        return False
 
 
 class InMemoryTTLCache:
     """
     Small in-memory TTL cache for read paths (standalone mode only).
+
+    Not thread-safe, not process-safe, and not distributed. Intended for
+    single-process, best-effort development and test use only. Do NOT
+    share instances across multiple processes or threads in production.
     """
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[float, Any]] = {}
@@ -707,8 +915,31 @@ class InMemoryTTLCache:
         return val
 
     async def set(self, key: str, value: Any, ttl_s: int) -> None:
-        ttl = max(1, int(ttl_s))
+        # ttl_s==0 is treated as "do not cache" to allow deterministic opt-out.
+        ttl = int(ttl_s)
+        if ttl <= 0:
+            return
         self._store[key] = (time.monotonic() + ttl, value)
+
+    async def invalidate_pattern(self, pattern: str) -> None:
+        """
+        Simple substring-based invalidation for in-memory cache.
+        """
+        try:
+            keys_to_remove = [k for k in list(self._store.keys()) if pattern in k]
+            for key in keys_to_remove:
+                self._store.pop(key, None)
+        except Exception:
+            # Invalidating cache must never break callers
+            LOG.debug("InMemoryTTLCache.invalidate_pattern failed for pattern %s", pattern)
+
+    @property
+    def supports_ttl(self) -> bool:
+        return True
+
+    @property
+    def supports_invalidate_pattern(self) -> bool:
+        return True
 
 
 class NoopLimiter:
@@ -721,6 +952,12 @@ class NoopLimiter:
 class SimpleTokenBucketLimiter:
     """
     Simple token-bucket limiter; per-process; fail-open on internal error.
+
+    Not concurrency-safe across threads or processes; intended for
+    best-effort throttling in development and light production only.
+
+    Note: release() is a no-op to maintain consistency with LLM-side
+    TokenBucketLimiter semantics.
     """
     def __init__(self, rate_per_sec: int = 50, burst: int = 100) -> None:
         self._capacity = max(1, int(burst))
@@ -750,12 +987,8 @@ class SimpleTokenBucketLimiter:
             return  # fail-open
 
     def release(self) -> None:
-        try:
-            self._refill()
-            if self._tokens < self._capacity:
-                self._tokens += 1
-        except Exception:
-            return  # fail-open
+        # No-op to maintain consistency with LLM-side TokenBucketLimiter
+        return
 
 
 # =============================================================================
@@ -783,6 +1016,10 @@ class GraphCapabilities:
         supports_multi_tenant: Whether tenant-aware isolation is supported.
         supports_deadline: Whether ctx.deadline_ms is respected.
         max_batch_ops: Optional maximum number of ops per batch (adapter-defined).
+        supports_transaction: Whether atomic transactions are supported.
+        supports_traversal: Whether graph traversal operations are supported.
+        max_traversal_depth: Optional maximum traversal depth supported.
+        supports_path_queries: Whether path-based queries are supported.
     """
     server: str
     version: str
@@ -798,6 +1035,10 @@ class GraphCapabilities:
     supports_multi_tenant: bool = False
     supports_deadline: bool = True
     max_batch_ops: Optional[int] = None
+    supports_transaction: bool = False
+    supports_traversal: bool = False
+    max_traversal_depth: Optional[int] = None
+    supports_path_queries: bool = False
 
 
 # =============================================================================
@@ -893,6 +1134,60 @@ class GraphProtocolV1(Protocol):
     ) -> Mapping[str, Any]:
         ...
 
+    # ---- Transaction and Traversal operations -------------------------------
+
+    async def transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        """
+        Execute a batch of operations atomically as a transaction.
+
+        This provides ACID guarantees for the entire batch - either all
+        operations succeed or none are applied.
+
+        Args:
+            operations: List of batch operations to execute atomically
+            ctx: Operation context including deadline and tracing
+
+        Returns:
+            BatchResult with transaction-level success/failure status
+
+        Raises:
+            NotSupported: If transactions are not supported by the backend
+            BadRequest: If transaction operations are invalid
+            DeadlineExceeded: If transaction exceeds context deadline
+        """
+        ...
+
+    async def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        """
+        Perform graph traversal starting from specified nodes.
+
+        Traversal explores the graph structure by following relationships
+        from starting nodes up to a specified depth.
+
+        Args:
+            spec: Traversal specification including start nodes, depth, filters
+            ctx: Operation context including deadline and tracing
+
+        Returns:
+            TraversalResult containing discovered nodes, relationships, and paths
+
+        Raises:
+            NotSupported: If traversal operations are not supported
+            BadRequest: If traversal specification is invalid
+            DeadlineExceeded: If traversal exceeds context deadline
+        """
+        ...
+
 
 # =============================================================================
 # Base Instrumented Adapter (DRY gates via _with_gates)
@@ -910,7 +1205,11 @@ class BaseGraphAdapter(GraphProtocolV1):
         - Optional read-path caching in standalone mode.
         - Wire-agnostic; used by WireGraphHandler.
 
-    Backend implementers override `_do_*` methods only.
+    Standalone mode wires in lightweight, in-process helpers
+    (SimpleCircuitBreaker, InMemoryTTLCache, SimpleTokenBucketLimiter)
+    which are *not* thread-safe, process-safe, or distributed. For
+    serious production deployments, supply hardened implementations
+    via the constructor instead of relying on these defaults.
     """
 
     _component = "graph"
@@ -929,6 +1228,20 @@ class BaseGraphAdapter(GraphProtocolV1):
         cache_bulk_vertices_ttl_s: int = 30,
         cache_schema_ttl_s: int = 60,
         stream_deadline_check_every_n_chunks: int = 10,
+        auto_timestamp_writes: bool = False,
+        strict_batch_validation: bool = False,
+        batch_supported_ops: Optional[Iterable[str]] = None,
+        allow_self_loops: bool = True,
+        # Caching is a policy; to keep "thin" mode policy-free, default is:
+        #   - enabled in standalone
+        #   - disabled in thin
+        # Callers may explicitly override by setting enable_caching=True/False.
+        enable_caching: Optional[bool] = None,
+        # Wire unexpected error message policy:
+        #   - False (default): return stable, non-leaky "internal error" on wire
+        #   - True: surface str(e) on wire for unexpected exceptions (debug/conformance)
+        # SECURITY NOTE: Default preserves the original hardening policy.
+        expose_unhandled_error_messages_on_wire: bool = False,
     ) -> None:
         self._metrics: MetricsSink = metrics or NoopMetrics()
 
@@ -936,6 +1249,9 @@ class BaseGraphAdapter(GraphProtocolV1):
         if m not in {"thin", "standalone"}:
             m = "thin"
         self._mode = m
+
+        # Persist wire policy flag; used by _error_to_wire implementation.
+        self._expose_unhandled_error_messages_on_wire = bool(expose_unhandled_error_messages_on_wire)
 
         if self._mode == "standalone":
             if metrics is None:
@@ -950,11 +1266,55 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._cache = cache or NoopCache()
             self._limiter = limiter or NoopLimiter()
 
-        self._cache_query_ttl_s = max(1, int(cache_query_ttl_s))
-        self._cache_caps_ttl_s = max(1, int(cache_caps_ttl_s))
-        self._cache_bulk_vertices_ttl_s = max(1, int(cache_bulk_vertices_ttl_s))
-        self._cache_schema_ttl_s = max(1, int(cache_schema_ttl_s))
-        self._stream_deadline_check_every_n_chunks = max(1, int(stream_deadline_check_every_n_chunks))
+        # TTL=0 disables caching deterministically (embedding/LLM-aligned semantics).
+        self._cache_query_ttl_s = max(0, int(cache_query_ttl_s))
+        self._cache_caps_ttl_s = max(0, int(cache_caps_ttl_s))
+        self._cache_bulk_vertices_ttl_s = max(0, int(cache_bulk_vertices_ttl_s))
+        self._cache_schema_ttl_s = max(0, int(cache_schema_ttl_s))
+        self._stream_deadline_check_every_n_chunks = max(
+            1, int(stream_deadline_check_every_n_chunks)
+        )
+
+        # Behavior flags
+        self._auto_timestamp_writes = bool(auto_timestamp_writes)
+        self._strict_batch_validation = bool(strict_batch_validation)
+        self._allow_self_loops = bool(allow_self_loops)
+
+        # Cache policy flag: keep "thin" mode policy-free unless explicitly enabled.
+        if enable_caching is None:
+            self._enable_caching = (self._mode == "standalone")
+        else:
+            self._enable_caching = bool(enable_caching)
+
+        # Cache safety stats: base owns cache ops, so base owns cache hit/miss counters.
+        # These are useful for local debugging and can be exported via MetricsSink counters.
+        self._cache_stats = {"hits": 0, "misses": 0}
+
+        # Streaming stats: mirrors Embedding SDK patterns for completion vs abandonment.
+        self._stream_stats = {
+            "active_streams": 0,
+            "total_chunks": 0,
+            "abandoned_streams": 0,
+            "completed_streams": 0,
+        }
+
+        default_supported_ops = {
+            "query",
+            "upsert_nodes",
+            "upsert_edges",
+            "delete_nodes",
+            "delete_edges",
+            "bulk_vertices",
+            "get_schema",
+            "health",
+            "batch",
+            "transaction",
+            "traversal",
+        }
+        if batch_supported_ops is not None:
+            self._batch_supported_ops = set(batch_supported_ops)
+        else:
+            self._batch_supported_ops = default_supported_ops
 
     # ---- lifecycle helpers --------------------------------------------------
 
@@ -976,10 +1336,87 @@ class BaseGraphAdapter(GraphProtocolV1):
     # ---- internal helpers ---------------------------------------------------
 
     @staticmethod
+    def _safe_deepcopy(obj: Any) -> Any:
+        """
+        Best-effort deepcopy helper for cache safety.
+
+        Caches frequently store values by reference. Deep-copying on both
+        write and read prevents accidental cross-request mutation of cached
+        objects (a common correctness and data-leak footgun).
+        """
+        try:
+            return copy.deepcopy(obj)
+        except Exception:
+            # Deepcopy failure must never break caller path; return object as-is.
+            return obj
+
+    @staticmethod
     def _tenant_hash(tenant: Optional[str]) -> Optional[str]:
         if not tenant:
             return None
         return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:12]
+
+    @staticmethod
+    def _bucket_wait_ms(ms: float) -> str:
+        """
+        Low-cardinality buckets for limiter wait-time metrics.
+
+        Keeps SIEM/metrics cardinality bounded while still giving
+        operational signal for backpressure.
+        """
+        if ms < 1.0:
+            return "<1ms"
+        if ms < 10.0:
+            return "1-10ms"
+        if ms < 100.0:
+            return "10-100ms"
+        return ">=100ms"
+
+    @staticmethod
+    def _unwrap_result_mapping(maybe_result: Any) -> Any:
+        """
+        Best-effort unwrapping for batch operation results.
+
+        Adapters may return:
+          - typed dataclasses (UpsertResult/DeleteResult)
+          - plain dict payloads ({"upserted_count": ...})
+          - wire-like success envelopes ({"ok": True, "result": {...}})
+
+        This helper normalizes common wrappers to a mapping payload without
+        changing external schemas.
+        """
+        if isinstance(maybe_result, Mapping):
+            # Common wire envelope convention: {"ok": true, "result": {...}}
+            if maybe_result.get("ok") is True and isinstance(maybe_result.get("result"), Mapping):
+                return maybe_result["result"]
+        return maybe_result
+
+    def _cache_enabled(self) -> bool:
+        """
+        Determine whether caching is enabled for this adapter instance.
+
+        Caching is a policy:
+          - Disabled by default in "thin" mode for composability.
+          - Enabled by default in "standalone" mode for convenience.
+          - Overridable via enable_caching constructor flag.
+        """
+        return bool(self._enable_caching)
+
+    def _cache_can_read_write(self) -> bool:
+        """
+        Determine whether cache supports TTL-based read/write usage.
+
+        We treat cache usage as strictly TTL-based, mirroring the Embedding SDK.
+        """
+        return bool(self._cache_enabled() and getattr(self._cache, "supports_ttl", False))
+
+    def _cache_can_invalidate(self) -> bool:
+        """
+        Determine whether cache supports invalidate_pattern.
+
+        Invalidation is best-effort and must never break the main operation path.
+        """
+        return bool(self._cache_enabled() and getattr(self._cache, "supports_invalidate_pattern", False))
 
     def _record(
         self,
@@ -997,7 +1434,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             if ctx:
                 th = self._tenant_hash(ctx.tenant)
                 if th:
-                    x.setdefault("tenant", th)
+                    x.setdefault("tenant_hash", th)
             self._metrics.observe(
                 component=self._component,
                 op=op,
@@ -1006,6 +1443,14 @@ class BaseGraphAdapter(GraphProtocolV1):
                 code=code,
                 extra=x or None,
             )
+            if not ok:
+                # Align with embedding-style error counter while remaining SIEM-safe.
+                self._metrics.counter(
+                    component=self._component,
+                    name="errors_total",
+                    value=1,
+                    extra={"op": op, "code": code},
+                )
         except Exception:
             # never let metrics break caller
             pass
@@ -1022,10 +1467,54 @@ class BaseGraphAdapter(GraphProtocolV1):
         awaitable: Awaitable[Any],
         ctx: Optional[OperationContext],
     ) -> Any:
-        try:
-            return await self._deadline.wrap(awaitable, ctx)
-        except asyncio.TimeoutError as e:
-            raise DeadlineExceeded("operation timed out", details={"remaining_ms": 0}) from e
+        """
+        Apply the configured DeadlinePolicy.
+
+        Note: DeadlinePolicy implementations are expected to raise
+        DeadlineExceeded (GraphAdapterError) on deadline expiry rather than
+        bubbling asyncio.TimeoutError. This method does not translate
+        TimeoutError to avoid duplicate translation and to keep behavior
+        centralized in DeadlinePolicy.
+        """
+        return await self._deadline.wrap(awaitable, ctx)
+
+    def _extract_namespace_from_spec(self, spec: Any) -> Optional[str]:
+        """
+        Extract namespace from various spec types.
+
+        Returns None for operations that don't target a specific namespace
+        to avoid unnecessary cache invalidation.
+        """
+        if hasattr(spec, "namespace"):
+            return getattr(spec, "namespace")
+        return None
+
+    def _effective_namespaces_for_nodes(self, spec: UpsertNodesSpec) -> List[str]:
+        """
+        Determine all namespaces impacted by an upsert_nodes call.
+
+        Spec-level namespace is an override; per-node namespace wins when set.
+        This avoids under-invalidation when callers mix namespaces per batch.
+        """
+        ns: set[str] = set()
+        for n in spec.nodes or []:
+            eff = n.namespace or spec.namespace
+            if eff:
+                ns.add(eff)
+        return list(ns)
+
+    def _effective_namespaces_for_edges(self, spec: UpsertEdgesSpec) -> List[str]:
+        """
+        Determine all namespaces impacted by an upsert_edges call.
+
+        Spec-level namespace is an override; per-edge namespace wins when set.
+        """
+        ns: set[str] = set()
+        for e in spec.edges or []:
+            eff = e.namespace or spec.namespace
+            if eff:
+                ns.add(eff)
+        return list(ns)
 
     def _make_cache_key(
         self,
@@ -1039,19 +1528,38 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         Includes:
             - operation
-            - stable repr of spec/asdict(spec)
-            - tenant hash (if present) to avoid cross-tenant bleed.
+            - stable JSON-serialized representation of spec/asdict(spec)
+            - tenant hash (if present) to avoid cross-tenant bleed
+            - namespace tag (if present) to support targeted invalidation
+
+        Uses type-prefixed hashing (j:/p:) to prevent collisions between
+        different types that serialize to identical JSON.
         """
         if hasattr(spec, "__dataclass_fields__"):
             raw = asdict(spec)
         else:
             raw = spec
-        base = f"graph:{op}:{repr(raw)}"
+
+        payload: Dict[str, Any] = {"op": op, "spec": raw}
+
+        tenant_hash = None
         if ctx and ctx.tenant:
-            th = self._tenant_hash(ctx.tenant)
-            if th:
-                base += f":tenant:{th}"
-        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+            tenant_hash = self._tenant_hash(ctx.tenant)
+            if tenant_hash:
+                payload["tenant"] = tenant_hash
+
+        namespace = self._extract_namespace_from_spec(spec)
+        ns_tag = namespace or "none"
+
+        try:
+            serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+            base_hash = hashlib.sha256(f"j:{serialized}".encode()).hexdigest()
+        except TypeError:
+            base_hash = hashlib.sha256(f"p:{repr(payload)}".encode()).hexdigest()
+
+        t_tag = tenant_hash or "none"
+        # Human-readable prefix to allow pattern-based invalidation
+        return f"ns={ns_tag}|t={t_tag}|{base_hash}"
 
     @staticmethod
     def _validate_properties_map(properties: Mapping[str, Any]) -> None:
@@ -1072,8 +1580,82 @@ class BaseGraphAdapter(GraphProtocolV1):
     def _validate_edge(self, edge: Edge) -> None:
         if not isinstance(edge.label, str) or not edge.label:
             raise BadRequest("edge.label must be a non-empty string")
+        if not edge.src or not isinstance(edge.src, str):
+            raise BadRequest("edge.src must be a non-empty string")
+        if not edge.dst or not isinstance(edge.dst, str):
+            raise BadRequest("edge.dst must be a non-empty string")
+
+        if not self._allow_self_loops and edge.src == edge.dst:
+            raise BadRequest("Self-loops are not allowed by this adapter")
+
         if edge.properties is not None:
             self._validate_properties_map(edge.properties)
+
+    async def _invalidate_namespace_cache(self, namespace: Optional[str]) -> None:
+        """
+        Invalidate cache entries for a namespace (best-effort).
+
+        If namespace is None, no invalidation is performed to avoid
+        unnecessarily clearing caches for non-namespaced operations.
+        """
+        if namespace is None:
+            return
+        if not self._cache_can_invalidate():
+            # Pattern invalidation is optional and may not exist on some cache backends.
+            return
+
+        try:
+            pattern = f"ns={namespace}|"
+            await self._cache.invalidate_pattern(pattern)
+        except Exception:
+            # Never let cache invalidation break the main operation
+            LOG.debug("Cache invalidation failed for namespace %s", namespace)
+
+    def _batch_op_succeeded(self, op: BatchOperation, batch_result: BatchResult, idx: int) -> bool:
+        """
+        Determine if a specific batch operation succeeded.
+
+        This inspects the batch result to see if the operation at the given
+        index actually modified data, allowing for smarter cache invalidation.
+
+        Supports both typed dataclass results and mapping/dict payloads
+        to maximize adapter interoperability.
+        """
+        if idx >= len(batch_result.results):
+            return False
+
+        result = self._unwrap_result_mapping(batch_result.results[idx])
+
+        # For write operations, check if they actually succeeded
+        if op.op in {"upsert_nodes", "upsert_edges"}:
+            if isinstance(result, UpsertResult):
+                return result.upserted_count > 0
+            if isinstance(result, Mapping):
+                try:
+                    return int(result.get("upserted_count", 0)) > 0
+                except Exception:
+                    return False
+        elif op.op in {"delete_nodes", "delete_edges"}:
+            if isinstance(result, DeleteResult):
+                return result.deleted_count > 0
+            if isinstance(result, Mapping):
+                try:
+                    return int(result.get("deleted_count", 0)) > 0
+                except Exception:
+                    return False
+
+        # For query operations or unknown result types, assume no cache invalidation needed
+        return False
+
+    def _extract_namespace_from_batch_op(self, op: BatchOperation) -> Optional[str]:
+        """
+        Extract namespace from a batch operation.
+
+        Returns None if no namespace is specified to avoid unnecessary
+        cache invalidation for non-namespaced operations.
+        """
+        args = op.args or {}
+        return args.get("namespace")
 
     # ---- DRY gate wrappers --------------------------------------------------
 
@@ -1096,12 +1678,37 @@ class BaseGraphAdapter(GraphProtocolV1):
         self._fail_if_deadline_expired(ctx)
 
         if not self._breaker.allow():
+            # Emit explicit breaker-open counter (low cardinality)
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
+
             e = Unavailable("circuit open")
             t0 = time.monotonic()
             self._record(op, t0, False, code=e.code, ctx=ctx, **metric_extra)
             raise e
 
+        # Measure limiter wait time for observability (low-cardinality buckets)
+        wait_t0 = time.monotonic()
         await self._limiter.acquire()
+        wait_ms = (time.monotonic() - wait_t0) * 1000.0
+        if wait_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(wait_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         try:
             result = await self._apply_deadline(call(), ctx)
@@ -1113,7 +1720,8 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._breaker.on_error(e)
             raise
         except Exception as e:
-            self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
+            # Standardize on "UnhandledException" for cross-SDK metrics alignment
+            self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
             self._breaker.on_error(e)
             raise
         finally:
@@ -1132,38 +1740,111 @@ class BaseGraphAdapter(GraphProtocolV1):
         - preflight deadline, breaker, limiter
         - periodic deadline checks
         - metrics on completion or error
+        - chunk-level throughput metrics (chunks and records)
+        - proper resource cleanup for abandoned streams
         """
         metric_extra = dict(metric_extra or {})
         self._fail_if_deadline_expired(ctx)
 
         if not self._breaker.allow():
+            # Emit explicit breaker-open counter (low cardinality)
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="breaker_open_total",
+                    value=1,
+                    extra={"op": op},
+                )
+            except Exception:
+                pass
             raise Unavailable("circuit open")
 
+        # Measure limiter wait time for observability (low-cardinality buckets)
+        wait_t0 = time.monotonic()
         await self._limiter.acquire()
+        wait_ms = (time.monotonic() - wait_t0) * 1000.0
+        if wait_ms > 0:
+            try:
+                self._metrics.counter(
+                    component=self._component,
+                    name="limiter_wait_buckets_total",
+                    value=1,
+                    extra={"op": op, "bucket": self._bucket_wait_ms(wait_ms)},
+                )
+            except Exception:
+                pass
+
         t0 = time.monotonic()
         check_n = self._stream_deadline_check_every_n_chunks
 
         async def _gen() -> AsyncIterator[QueryChunk]:
             chunk_count = 0
+            completed = False
+            agen: Optional[AsyncIterator[QueryChunk]] = None
             try:
+                self._stream_stats["active_streams"] += 1
                 agen = agen_factory()
                 async for chunk in agen:
                     chunk_count += 1
+                    self._stream_stats["total_chunks"] += 1
+
+                    # chunk-level throughput metrics (best-effort, non-fatal)
+                    try:
+                        self._metrics.counter(
+                            component=self._component,
+                            name="stream_chunks_total",
+                            value=1,
+                            extra={"op": op},
+                        )
+                        self._metrics.counter(
+                            component=self._component,
+                            name="stream_records_total",
+                            value=len(chunk.records),
+                            extra={"op": op},
+                        )
+                    except Exception:
+                        pass
+
                     if chunk_count % check_n == 0:
                         self._fail_if_deadline_expired(ctx)
                     yield chunk
+
+                completed = True
+                self._stream_stats["completed_streams"] += 1
                 self._record(op, t0, True, ctx=ctx, **metric_extra)
                 self._breaker.on_success()
+            except asyncio.CancelledError as e:
+                # Consumer cancellation / disconnect: record and re-raise.
+                self._record(op, t0, False, code="CancelledError", ctx=ctx, **metric_extra)
+                if not completed and chunk_count > 0:
+                    self._stream_stats["abandoned_streams"] += 1
+                self._breaker.on_error(e)
+                raise
             except GraphAdapterError as e:
                 self._record(op, t0, False, code=e.code or type(e).__name__, ctx=ctx, **metric_extra)
+                if not completed and chunk_count > 0:
+                    self._stream_stats["abandoned_streams"] += 1
                 self._breaker.on_error(e)
                 raise
             except Exception as e:
-                self._record(op, t0, False, code="UNAVAILABLE", ctx=ctx, **metric_extra)
+                # Standardize on "UnhandledException" for cross-SDK metrics alignment
+                self._record(op, t0, False, code="UnhandledException", ctx=ctx, **metric_extra)
+                if not completed and chunk_count > 0:
+                    self._stream_stats["abandoned_streams"] += 1
                 self._breaker.on_error(e)
                 raise
             finally:
+                self._stream_stats["active_streams"] -= 1
                 self._limiter.release()
+                # Ensure underlying stream resources are cleaned up (best-effort).
+                if agen is not None:
+                    close_fn = getattr(agen, "aclose", None)
+                    if callable(close_fn):
+                        try:
+                            # Shield cleanup so cancellation doesn't prevent closing sockets/streams.
+                            await asyncio.shield(close_fn())
+                        except Exception:
+                            pass
 
         return _gen()
 
@@ -1174,13 +1855,21 @@ class BaseGraphAdapter(GraphProtocolV1):
         Return adapter capabilities.
 
         Standalone mode: may be cached briefly to reduce overhead.
+        Uses pluggable cache interface (not tied to InMemoryTTLCache).
+
+        NOTE (clarification):
+            - Caching is enabled only when `_cache_enabled()` is True and
+              cache.supports_ttl is True. This avoids brittle isinstance() checks
+              and prevents caching from accidentally activating in thin mode.
         """
         t0 = time.monotonic()
         try:
-            if isinstance(self._cache, InMemoryTTLCache):
-                key = "graph:capabilities"
+            # Use pluggable cache interface
+            if self._cache_can_read_write() and self._cache_caps_ttl_s > 0:
+                key = self._make_cache_key(op="capabilities", spec="all", ctx=None)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
@@ -1188,12 +1877,28 @@ class BaseGraphAdapter(GraphProtocolV1):
                         extra={"op": "capabilities"},
                     )
                     self._record("capabilities", t0, True)
-                    return cached
+                    return self._safe_deepcopy(cached)
+                else:
+                    self._cache_stats["misses"] += 1
+                    try:
+                        self._metrics.counter(
+                            component=self._component,
+                            name="cache_misses",
+                            value=1,
+                            extra={"op": "capabilities"},
+                        )
+                    except Exception:
+                        pass
 
             caps = await self._apply_deadline(self._do_capabilities(), ctx=None)
 
-            if isinstance(self._cache, InMemoryTTLCache):
-                await self._cache.set("graph:capabilities", caps, ttl_s=self._cache_caps_ttl_s)
+            if self._cache_can_read_write() and self._cache_caps_ttl_s > 0:
+                key = self._make_cache_key(op="capabilities", spec="all", ctx=None)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(caps), ttl_s=self._cache_caps_ttl_s)
+                except Exception:
+                    pass
 
             self._record("capabilities", t0, True)
             return caps
@@ -1201,7 +1906,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record("capabilities", t0, False, code=e.code or type(e).__name__)
             raise
         except Exception as e:
-            self._record("capabilities", t0, False, code="UNAVAILABLE")
+            self._record("capabilities", t0, False, code="UnhandledException")
             raise Unavailable("capabilities fetch failed") from e
 
     async def query(
@@ -1218,33 +1923,56 @@ class BaseGraphAdapter(GraphProtocolV1):
               is set, it MUST be a member.
             - If dialect is None, adapter may treat text as backend-native.
         """
-        if not isinstance(spec.text, str) or not spec.text.strip():
-            raise BadRequest("query.text must be a non-empty string")
-
-        caps = await self.capabilities()
-        if spec.dialect and caps.supported_query_dialects:
-            if spec.dialect not in caps.supported_query_dialects:
-                raise NotSupported(
-                    f"dialect '{spec.dialect}' not supported",
-                    details={"supported_query_dialects": caps.supported_query_dialects},
-                )
-
         async def _call() -> QueryResult:
-            # standalone: cache on read-only, non-streaming queries
-            if isinstance(self._cache, InMemoryTTLCache) and not spec.stream:
+            # Validate query spec (inside gate wrapper for metrics)
+            if not isinstance(spec.text, str) or not spec.text.strip():
+                raise BadRequest("query.text must be a non-empty string")
+
+            # HARDENING: validate query params are JSON-serializable to prevent wire-time failures.
+            if spec.params is not None:
+                self._validate_properties_map(spec.params)
+
+            caps = await self.capabilities()
+            if spec.dialect and caps.supported_query_dialects:
+                if spec.dialect not in caps.supported_query_dialects:
+                    raise NotSupported(
+                        f"dialect '{spec.dialect}' not supported",
+                        details={"supported_query_dialects": caps.supported_query_dialects},
+                    )
+
+            # Use pluggable cache interface for read-only, non-streaming queries
+            if self._cache_can_read_write() and not spec.stream and self._cache_query_ttl_s > 0:
                 key = self._make_cache_key(op="query", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "query"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "query"},
+                    )
+                except Exception:
+                    pass
+
                 res = await self._do_query(spec, ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_query_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_query_ttl_s)
+                except Exception:
+                    pass
                 return res
+
             return await self._do_query(spec, ctx=ctx)
 
         return await self._with_gates_unary(
@@ -1254,7 +1982,7 @@ class BaseGraphAdapter(GraphProtocolV1):
             metric_extra={"dialect": spec.dialect or "none"},
         )
 
-    async def stream_query(
+    def stream_query(
         self,
         spec: GraphQuerySpec,
         *,
@@ -1265,29 +1993,37 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         For large result sets; preferred over `query` when supported.
         """
-        if not isinstance(spec.text, str) or not spec.text.strip():
-            raise BadRequest("query.text must be a non-empty string")
+        async def _stream_impl() -> AsyncIterator[QueryChunk]:
+            if not isinstance(spec.text, str) or not spec.text.strip():
+                raise BadRequest("query.text must be a non-empty string")
 
-        caps = await self.capabilities()
-        if not caps.supports_stream_query:
-            raise NotSupported("stream_query is not supported by this adapter")
-        if spec.dialect and caps.supported_query_dialects:
-            if spec.dialect not in caps.supported_query_dialects:
-                raise NotSupported(
-                    f"dialect '{spec.dialect}' not supported",
-                    details={"supported_query_dialects": caps.supported_query_dialects},
-                )
+            # HARDENING: validate query params are JSON-serializable to prevent wire-time failures.
+            if spec.params is not None:
+                self._validate_properties_map(spec.params)
 
-        async def agen_factory() -> AsyncIterator[QueryChunk]:
-            async for chunk in self._do_stream_query(spec, ctx=ctx):
+            caps = await self.capabilities()
+            if not caps.supports_stream_query:
+                raise NotSupported("stream_query is not supported by this adapter")
+            if spec.dialect and caps.supported_query_dialects:
+                if spec.dialect not in caps.supported_query_dialects:
+                    raise NotSupported(
+                        f"dialect '{spec.dialect}' not supported",
+                        details={"supported_query_dialects": caps.supported_query_dialects},
+                    )
+
+            async def agen_factory() -> AsyncIterator[QueryChunk]:
+                async for chunk in self._do_stream_query(spec, ctx=ctx):
+                    yield chunk
+
+            async for chunk in await self._with_gates_stream(
+                op="stream_query",
+                ctx=ctx,
+                agen_factory=lambda: agen_factory(),
+                metric_extra={"dialect": spec.dialect or "none"},
+            ):
                 yield chunk
 
-        return await self._with_gates_stream(
-            op="stream_query",
-            ctx=ctx,
-            agen_factory=lambda: agen_factory(),
-            metric_extra={"dialect": spec.dialect or "none"},
-        )
+        return _stream_impl()
 
     async def upsert_nodes(
         self,
@@ -1295,14 +2031,50 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
-        """Batch upsert nodes with validation and gates."""
+        """Batch upsert nodes with validation, gates, and optional timestamp management."""
         if not spec.nodes:
             raise BadRequest("nodes must not be empty")
+        # Validate that properties are JSON-serializable (hard requirement)
         for n in spec.nodes:
-            self._validate_node(n)
+            if n.properties is not None:
+                self._validate_properties_map(n.properties)
 
         async def _call() -> UpsertResult:
-            return await self._do_upsert_nodes(spec, ctx=ctx)
+            if self._auto_timestamp_writes:
+                now_ms = int(time.time() * 1000)
+                nodes_with_timestamps: List[Node] = []
+
+                for node in spec.nodes:
+                    if node.created_at is None or node.updated_at is None:
+                        nodes_with_timestamps.append(
+                            Node(
+                                id=node.id,
+                                labels=node.labels,
+                                properties=node.properties,
+                                namespace=node.namespace,
+                                created_at=node.created_at or now_ms,
+                                updated_at=now_ms,  # Always update
+                            )
+                        )
+                    else:
+                        nodes_with_timestamps.append(node)
+
+                result = await self._do_upsert_nodes(
+                    UpsertNodesSpec(
+                        nodes=nodes_with_timestamps,
+                        namespace=spec.namespace,
+                    ),
+                    ctx=ctx,
+                )
+            else:
+                result = await self._do_upsert_nodes(spec, ctx=ctx)
+
+            # HARDENING: invalidate all impacted namespaces (per-node namespace wins).
+            if result.upserted_count > 0:
+                for ns in self._effective_namespaces_for_nodes(spec):
+                    await self._invalidate_namespace_cache(ns)
+
+            return result
 
         return await self._with_gates_unary(
             op="upsert_nodes",
@@ -1317,14 +2089,50 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
-        """Batch upsert edges with validation and gates."""
+        """Batch upsert edges with validation, gates, and optional timestamp management."""
         if not spec.edges:
             raise BadRequest("edges must not be empty")
         for e in spec.edges:
             self._validate_edge(e)
 
         async def _call() -> UpsertResult:
-            return await self._do_upsert_edges(spec, ctx=ctx)
+            if self._auto_timestamp_writes:
+                now_ms = int(time.time() * 1000)
+                edges_with_timestamps: List[Edge] = []
+
+                for edge in spec.edges:
+                    if edge.created_at is None or edge.updated_at is None:
+                        edges_with_timestamps.append(
+                            Edge(
+                                id=edge.id,
+                                src=edge.src,
+                                dst=edge.dst,
+                                label=edge.label,
+                                properties=edge.properties,
+                                namespace=edge.namespace,
+                                created_at=edge.created_at or now_ms,
+                                updated_at=now_ms,  # Always update
+                            )
+                        )
+                    else:
+                        edges_with_timestamps.append(edge)
+
+                result = await self._do_upsert_edges(
+                    UpsertEdgesSpec(
+                        edges=edges_with_timestamps,
+                        namespace=spec.namespace,
+                    ),
+                    ctx=ctx,
+                )
+            else:
+                result = await self._do_upsert_edges(spec, ctx=ctx)
+
+            # HARDENING: invalidate all impacted namespaces (per-edge namespace wins).
+            if result.upserted_count > 0:
+                for ns in self._effective_namespaces_for_edges(spec):
+                    await self._invalidate_namespace_cache(ns)
+
+            return result
 
         return await self._with_gates_unary(
             op="upsert_edges",
@@ -1346,7 +2154,14 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.filter)
 
         async def _call() -> DeleteResult:
-            return await self._do_delete_nodes(spec, ctx=ctx)
+            result = await self._do_delete_nodes(spec, ctx=ctx)
+
+            # Invalidate relevant caches only if deletes succeeded and we have a namespace
+            if result.deleted_count > 0:
+                namespace = self._extract_namespace_from_spec(spec)
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="delete_nodes",
@@ -1368,7 +2183,14 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.filter)
 
         async def _call() -> DeleteResult:
-            return await self._do_delete_edges(spec, ctx=ctx)
+            result = await self._do_delete_edges(spec, ctx=ctx)
+
+            # Invalidate relevant caches only if deletes succeeded and we have a namespace
+            if result.deleted_count > 0:
+                namespace = self._extract_namespace_from_spec(spec)
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
 
         return await self._with_gates_unary(
             op="delete_edges",
@@ -1387,6 +2209,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         Scan/list vertices in bulk with optional pagination.
 
         Only available if capabilities.supports_bulk_vertices is True.
+        Uses pluggable cache interface.
         """
         caps = await self.capabilities()
         if not caps.supports_bulk_vertices:
@@ -1397,25 +2220,44 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._validate_properties_map(spec.filter)
 
         async def _call() -> BulkVerticesResult:
-            # optional cache for purely read-only scans (first page, no filter)
+            # Use pluggable cache interface for read-only scans
             if (
-                isinstance(self._cache, InMemoryTTLCache)
+                self._cache_can_read_write()
+                and self._cache_bulk_vertices_ttl_s > 0
                 and spec.cursor is None
                 and spec.filter is None
             ):
                 key = self._make_cache_key(op="bulk_vertices", spec=spec, ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "bulk_vertices"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "bulk_vertices"},
+                    )
+                except Exception:
+                    pass
+
                 res = await self._do_bulk_vertices(spec, ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_bulk_vertices_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_bulk_vertices_ttl_s)
+                except Exception:
+                    pass
                 return res
+
             return await self._do_bulk_vertices(spec, ctx=ctx)
 
         return await self._with_gates_unary(
@@ -1438,6 +2280,7 @@ class BaseGraphAdapter(GraphProtocolV1):
         Execute a batch of graph operations.
 
         Semantics are adapter-defined; intended for reducing round-trips.
+        Includes optional strict operation-specific validation and smart cache invalidation.
         """
         caps = await self.capabilities()
         if not caps.supports_batch:
@@ -1445,8 +2288,94 @@ class BaseGraphAdapter(GraphProtocolV1):
         if not ops:
             raise BadRequest("ops must not be empty")
 
+        if caps.max_batch_ops is not None and len(ops) > caps.max_batch_ops:
+            raise BadRequest(
+                f"batch ops count {len(ops)} exceeds maximum of {caps.max_batch_ops}",
+                details={"max_batch_ops": caps.max_batch_ops},
+            )
+
+        supported_ops = self._batch_supported_ops
+
+        # Track batch composition for granular metrics
+        nodes_upserted = 0
+        edges_upserted = 0
+        nodes_deleted = 0
+        edges_deleted = 0
+
+        # Enhanced operation-specific validation (opt-in strictness)
+        for idx, op_spec in enumerate(ops):
+            if not isinstance(op_spec.op, str) or not op_spec.op:
+                raise BadRequest(
+                    "each BatchOperation.op must be a non-empty string",
+                    details={"index": idx},
+                )
+            if not isinstance(op_spec.args, Mapping):
+                raise BadRequest(
+                    "each BatchOperation.args must be a mapping",
+                    details={"index": idx, "type": type(op_spec.args).__name__},
+                )
+
+            # Calculate granular metrics
+            if op_spec.op == "upsert_nodes":
+                nodes_upserted += len(op_spec.args.get("nodes", []))
+            elif op_spec.op == "upsert_edges":
+                edges_upserted += len(op_spec.args.get("edges", []))
+            elif op_spec.op == "delete_nodes":
+                nodes_deleted += len(op_spec.args.get("ids", []))
+            elif op_spec.op == "delete_edges":
+                edges_deleted += len(op_spec.args.get("ids", []))
+
+            if self._strict_batch_validation:
+                if op_spec.op not in supported_ops:
+                    raise BadRequest(
+                        f"unsupported batch operation '{op_spec.op}'",
+                        details={"index": idx, "supported_ops": list(supported_ops)},
+                    )
+
+                # Operation-specific schema validation (only for known ops)
+                if op_spec.op == "upsert_nodes" and "nodes" not in op_spec.args:
+                    raise BadRequest(
+                        "upsert_nodes requires 'nodes' array",
+                        details={"index": idx},
+                    )
+                if op_spec.op == "upsert_edges" and "edges" not in op_spec.args:
+                    raise BadRequest(
+                        "upsert_edges requires 'edges' array",
+                        details={"index": idx},
+                    )
+                if op_spec.op in {"delete_nodes", "delete_edges"} and "ids" not in op_spec.args:
+                    raise BadRequest(
+                        f"{op_spec.op} requires 'ids' array",
+                        details={"index": idx},
+                    )
+
         async def _call() -> BatchResult:
-            return await self._do_batch(ops, ctx=ctx)
+            result = await self._do_batch(ops, ctx=ctx)
+
+            # Smart cache invalidation: only invalidate namespaces where writes actually succeeded
+            namespaces_to_invalidate = set()
+            for idx, op in enumerate(ops):
+                if op.op in {"upsert_nodes", "upsert_edges", "delete_nodes", "delete_edges"}:
+                    if self._batch_op_succeeded(op, result, idx):
+                        namespace = self._extract_namespace_from_batch_op(op)
+                        if namespace is not None:
+                            namespaces_to_invalidate.add(namespace)
+
+            # Invalidate each affected namespace
+            for namespace in namespaces_to_invalidate:
+                await self._invalidate_namespace_cache(namespace)
+
+            return result
+
+        # Emit granular batch metrics
+        if nodes_upserted > 0:
+            self._metrics.counter(component=self._component, name="batch_nodes_upserted", value=nodes_upserted)
+        if edges_upserted > 0:
+            self._metrics.counter(component=self._component, name="batch_edges_upserted", value=edges_upserted)
+        if nodes_deleted > 0:
+            self._metrics.counter(component=self._component, name="batch_nodes_deleted", value=nodes_deleted)
+        if edges_deleted > 0:
+            self._metrics.counter(component=self._component, name="batch_edges_deleted", value=edges_deleted)
 
         return await self._with_gates_unary(
             op="batch",
@@ -1465,28 +2394,46 @@ class BaseGraphAdapter(GraphProtocolV1):
 
         Behavior:
             - If capabilities.supports_schema is False -> NotSupported.
-            - In standalone mode, result may be cached briefly.
+            - Uses pluggable cache interface.
         """
         caps = await self.capabilities()
         if not caps.supports_schema:
             raise NotSupported("get_schema is not supported by this adapter")
 
         async def _call() -> GraphSchema:
-            if isinstance(self._cache, InMemoryTTLCache):
+            # Use pluggable cache interface
+            if self._cache_can_read_write() and self._cache_schema_ttl_s > 0:
                 key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
                 cached = await self._cache.get(key)
                 if cached:
+                    self._cache_stats["hits"] += 1
                     self._metrics.counter(
                         component=self._component,
                         name="cache_hits",
                         value=1,
                         extra={"op": "get_schema"},
                     )
-                    return cached
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "get_schema"},
+                    )
+                except Exception:
+                    pass
+
             res = await self._do_get_schema(ctx=ctx)
-            if isinstance(self._cache, InMemoryTTLCache):
+            if self._cache_can_read_write() and self._cache_schema_ttl_s > 0:
                 key = self._make_cache_key(op="schema", spec="all", ctx=ctx)
-                await self._cache.set(key, res, ttl_s=self._cache_schema_ttl_s)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_schema_ttl_s)
+                except Exception:
+                    pass
             return res
 
         return await self._with_gates_unary(
@@ -1500,7 +2447,13 @@ class BaseGraphAdapter(GraphProtocolV1):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> Mapping[str, Any]:
-        """Health check with deadline + metrics; no cache."""
+        """
+        Health check with deadline + metrics; no cache.
+
+        Returns a normalized, SIEM-safe summary view derived from the
+        backend's raw health mapping; backends may expose additional
+        fields but they are not surfaced here.
+        """
         self._fail_if_deadline_expired(ctx)
         t0 = time.monotonic()
         try:
@@ -1524,8 +2477,134 @@ class BaseGraphAdapter(GraphProtocolV1):
             self._record("health", t0, False, code=e.code or type(e).__name__, ctx=ctx)
             raise
         except Exception as e:
-            self._record("health", t0, False, code="UNAVAILABLE", ctx=ctx)
+            self._record("health", t0, False, code="UnhandledException", ctx=ctx)
             raise Unavailable("health check failed") from e
+
+    # ---- Transaction and Traversal operations -------------------------------
+
+    async def transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        caps = await self.capabilities()
+        if not caps.supports_transaction:
+            raise NotSupported("transactions are not supported by this adapter")
+
+        if not operations:
+            raise BadRequest("transaction operations must not be empty")
+
+        if caps.max_batch_ops is not None and len(operations) > caps.max_batch_ops:
+            raise BadRequest(
+                f"transaction ops count {len(operations)} exceeds maximum of {caps.max_batch_ops}",
+                details={"max_batch_ops": caps.max_batch_ops},
+            )
+
+        for idx, op in enumerate(operations):
+            if not isinstance(op.op, str) or not op.op:
+                raise BadRequest(
+                    "each BatchOperation.op must be a non-empty string",
+                    details={"index": idx},
+                )
+            if not isinstance(op.args, Mapping):
+                raise BadRequest(
+                    "each BatchOperation.args must be a mapping",
+                    details={"index": idx, "type": type(op.args).__name__},
+                )
+
+        async def _call() -> BatchResult:
+            result = await self._do_transaction(operations, ctx=ctx)
+
+            if result.success:
+                namespaces_to_invalidate = set()
+                for idx, op in enumerate(operations):
+                    if op.op in {"upsert_nodes", "upsert_edges", "delete_nodes", "delete_edges"}:
+                        if self._batch_op_succeeded(op, result, idx):
+                            namespace = self._extract_namespace_from_batch_op(op)
+                            if namespace is not None:
+                                namespaces_to_invalidate.add(namespace)
+                for namespace in namespaces_to_invalidate:
+                    await self._invalidate_namespace_cache(namespace)
+
+            return result
+
+        return await self._with_gates_unary(
+            op="transaction",
+            ctx=ctx,
+            call=_call,
+            metric_extra={"ops": len(operations)},
+        )
+
+    async def traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        caps = await self.capabilities()
+        if not caps.supports_traversal:
+            raise NotSupported("traversal operations are not supported by this adapter")
+
+        if not spec.start_nodes:
+            raise BadRequest("traversal requires at least one start node")
+
+        if caps.max_traversal_depth is not None and spec.max_depth > caps.max_traversal_depth:
+            raise BadRequest(
+                f"traversal depth {spec.max_depth} exceeds maximum of {caps.max_traversal_depth}",
+                details={"max_traversal_depth": caps.max_traversal_depth},
+            )
+
+        if spec.node_filters is not None:
+            self._validate_properties_map(spec.node_filters)
+        if spec.relationship_filters is not None:
+            self._validate_properties_map(spec.relationship_filters)
+
+        async def _call() -> TraversalResult:
+            if self._cache_can_read_write() and self._cache_query_ttl_s > 0:
+                key = self._make_cache_key(op="traversal", spec=spec, ctx=ctx)
+                cached = await self._cache.get(key)
+                if cached:
+                    self._cache_stats["hits"] += 1
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_hits",
+                        value=1,
+                        extra={"op": "traversal"},
+                    )
+                    return self._safe_deepcopy(cached)
+
+                self._cache_stats["misses"] += 1
+                try:
+                    self._metrics.counter(
+                        component=self._component,
+                        name="cache_misses",
+                        value=1,
+                        extra={"op": "traversal"},
+                    )
+                except Exception:
+                    pass
+
+                res = await self._do_traversal(spec, ctx=ctx)
+                # Cache write is best-effort and mutation-safe.
+                try:
+                    await self._cache.set(key, self._safe_deepcopy(res), ttl_s=self._cache_query_ttl_s)
+                except Exception:
+                    pass
+                return res
+
+            return await self._do_traversal(spec, ctx=ctx)
+
+        return await self._with_gates_unary(
+            op="traversal",
+            ctx=ctx,
+            call=_call,
+            metric_extra={
+                "start_nodes": len(spec.start_nodes),
+                "max_depth": spec.max_depth,
+                "direction": spec.direction,
+            },
+        )
 
     # --- backend hooks -------------------------------------------------------
 
@@ -1610,6 +2689,22 @@ class BaseGraphAdapter(GraphProtocolV1):
     ) -> Mapping[str, Any]:
         raise NotImplementedError
 
+    async def _do_transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
+        raise NotSupported("transactions are not implemented by this adapter")
+
+    async def _do_traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
+        raise NotSupported("traversal operations are not implemented by this adapter")
+
 
 # =============================================================================
 # Wire-Level Helpers (canonical envelopes)
@@ -1631,9 +2726,19 @@ def _ctx_from_wire(ctx_dict: Mapping[str, Any]) -> OperationContext:
     )
 
 
-def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
+def _error_to_wire(e: Exception, ms: float, *, expose_unhandled_message: bool = False) -> Dict[str, Any]:
     """
     Map GraphAdapterError (or unexpected Exception) to canonical error envelope.
+
+    SECURITY HARDENING:
+        For unexpected exceptions, return a stable, non-leaky message and
+        SIEM-safe details. This preserves the wire schema while avoiding
+        accidental disclosure of sensitive backend internals.
+
+    NOTE (clarification):
+        For some environments (debug / conformance testing), callers may set
+        expose_unhandled_message=True to surface str(e) on the wire for
+        unexpected exceptions. The default remains hardened.
     """
     if isinstance(e, GraphAdapterError):
         return {
@@ -1645,13 +2750,16 @@ def _error_to_wire(e: Exception, ms: float) -> Dict[str, Any]:
             "details": e.details or None,
             "ms": ms,
         }
+
+    # Unexpected exception policy: hardened by default; optionally expose message.
+    message = str(e) if expose_unhandled_message else "internal error"
     return {
         "ok": False,
-        "code": "UNAVAILABLE",
+        "code": "UNAVAILABLE",  # Wire-level code remains UNAVAILABLE
         "error": type(e).__name__,
-        "message": str(e) or "internal error",
+        "message": message,
         "retry_after_ms": None,
-        "details": None,
+        "details": {"error_type": type(e).__name__},
         "ms": ms,
     }
 
@@ -1676,10 +2784,12 @@ def _success_to_wire(result: Any, ms: float) -> Dict[str, Any]:
 def _chunk_to_wire(chunk: QueryChunk, ms: float) -> Dict[str, Any]:
     """
     Map QueryChunk to streaming envelope.
+
+    Streaming frames use code="STREAMING" to align across SDKs.
     """
     return {
         "ok": True,
-        "code": "OK",
+        "code": "STREAMING",
         "ms": ms,
         "chunk": asdict(chunk),
     }
@@ -1694,6 +2804,113 @@ class WireGraphHandler:
 
     def __init__(self, adapter: GraphProtocolV1):
         self._adapter = adapter
+
+    @staticmethod
+    def _require_ctx_args(envelope: Mapping[str, Any]) -> Tuple[Mapping[str, Any], Mapping[str, Any]]:
+        """
+        Enforce canonical envelope strictness:
+            - 'ctx' MUST be present and MUST be an object
+            - 'args' MUST be present and MUST be an object
+
+        This keeps the wire contract unambiguous and matches the canonical envelope semantics.
+        """
+        if "ctx" not in envelope:
+            raise BadRequest("missing required 'ctx'")
+        if "args" not in envelope:
+            raise BadRequest("missing required 'args'")
+
+        ctx_raw = envelope.get("ctx")
+        args_raw = envelope.get("args")
+
+        if not isinstance(ctx_raw, Mapping):
+            raise BadRequest("'ctx' must be an object", details={"field": "ctx", "type": type(ctx_raw).__name__})
+        if not isinstance(args_raw, Mapping):
+            raise BadRequest("'args' must be an object", details={"field": "args", "type": type(args_raw).__name__})
+
+        return ctx_raw, args_raw
+
+    @staticmethod
+    def _require_mapping_list(name: str, value: Any) -> List[Mapping[str, Any]]:
+        """
+        Defensive parsing helper for wire lists (list of objects).
+        """
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BadRequest(f"{name} must be a list", details={"field": name, "type": type(value).__name__})
+        out: List[Mapping[str, Any]] = []
+        for i, item in enumerate(value):
+            if not isinstance(item, Mapping):
+                raise BadRequest(
+                    f"{name}[{i}] must be an object",
+                    details={"field": f"{name}[{i}]", "type": type(item).__name__},
+                )
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _require_string_list(name: str, value: Any) -> List[str]:
+        """Strictly require a list of strings for wire ID lists."""
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise BadRequest(f"{name} must be a list", details={"field": name, "type": type(value).__name__})
+        out: List[str] = []
+        for i, item in enumerate(value):
+            if not isinstance(item, str):
+                raise BadRequest(
+                    f"{name}[{i}] must be a string",
+                    details={"field": f"{name}[{i}]", "type": type(item).__name__},
+                )
+            out.append(item)
+        return out
+
+    @staticmethod
+    def _coerce_node_dict(raw: Mapping[str, Any], idx: int) -> Dict[str, Any]:
+        """
+        Coerce and validate a wire node dict for typed construction.
+
+        - Ensures id exists and is a string.
+        - Coerces id to GraphID for typed consistency.
+        """
+        d = dict(raw)
+        if "id" not in d:
+            raise BadRequest("nodes[*].id is required", details={"index": idx, "field": "nodes.id"})
+        if not isinstance(d["id"], str) or not d["id"]:
+            raise BadRequest(
+                "nodes[*].id must be a non-empty string",
+                details={"index": idx, "field": "nodes.id", "type": type(d.get("id")).__name__},
+            )
+        d["id"] = GraphID(d["id"])
+        return d
+
+    @staticmethod
+    def _coerce_edge_dict(raw: Mapping[str, Any], idx: int) -> Dict[str, Any]:
+        """
+        Coerce and validate a wire edge dict for typed construction.
+
+        - Ensures id/src/dst/label exist and are correct types.
+        - Coerces id/src/dst to GraphID for typed consistency.
+        """
+        d = dict(raw)
+        for field in ("id", "src", "dst", "label"):
+            if field not in d:
+                raise BadRequest(
+                    f"edges[*].{field} is required",
+                    details={"index": idx, "field": f"edges.{field}"},
+                )
+        if not isinstance(d["id"], str) or not d["id"]:
+            raise BadRequest("edges[*].id must be a non-empty string", details={"index": idx, "field": "edges.id"})
+        if not isinstance(d["src"], str) or not d["src"]:
+            raise BadRequest("edges[*].src must be a non-empty string", details={"index": idx, "field": "edges.src"})
+        if not isinstance(d["dst"], str) or not d["dst"]:
+            raise BadRequest("edges[*].dst must be a non-empty string", details={"index": idx, "field": "edges.dst"})
+        if not isinstance(d["label"], str) or not d["label"]:
+            raise BadRequest("edges[*].label must be a non-empty string", details={"index": idx, "field": "edges.label"})
+        d["id"] = GraphID(d["id"])
+        d["src"] = GraphID(d["src"])
+        d["dst"] = GraphID(d["dst"])
+        return d
 
     async def handle(self, envelope: Mapping[str, Any]) -> Dict[str, Any]:
         """
@@ -1710,6 +2927,8 @@ class WireGraphHandler:
             - graph.batch
             - graph.get_schema
             - graph.health
+            - graph.transaction
+            - graph.traversal
 
         Streaming:
             - graph.stream_query via handle_stream(...)
@@ -1720,72 +2939,101 @@ class WireGraphHandler:
             if not isinstance(op, str):
                 raise BadRequest("missing or invalid 'op'")
 
-            ctx = _ctx_from_wire(envelope.get("ctx") or {})
-            args = envelope.get("args") or {}
+            ctx_raw, args = self._require_ctx_args(envelope)
+            ctx = _ctx_from_wire(ctx_raw)
 
             if op == "graph.capabilities":
                 res = await self._adapter.capabilities()
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.query":
-                spec = GraphQuerySpec(**args)
+                try:
+                    spec = GraphQuerySpec(**dict(args))
+                except (TypeError, ValueError) as spec_err:
+                    raise BadRequest(f"Invalid query spec: {spec_err}") from spec_err
                 res = await self._adapter.query(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.upsert_nodes":
-                nodes = [Node(**n) for n in args.get("nodes", [])]
+                nodes_raw = self._require_mapping_list("nodes", args.get("nodes"))
+                nodes = [Node(**self._coerce_node_dict(n, i)) for i, n in enumerate(nodes_raw)]
                 spec = UpsertNodesSpec(nodes=nodes, namespace=args.get("namespace"))
                 res = await self._adapter.upsert_nodes(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.upsert_edges":
-                edges = [Edge(**e) for e in args.get("edges", [])]
+                edges_raw = self._require_mapping_list("edges", args.get("edges"))
+                edges = [Edge(**self._coerce_edge_dict(e, i)) for i, e in enumerate(edges_raw)]
                 spec = UpsertEdgesSpec(edges=edges, namespace=args.get("namespace"))
                 res = await self._adapter.upsert_edges(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.delete_nodes":
-                ids = [GraphID(i) for i in args.get("ids", [])]
+                ids = [GraphID(i) for i in self._require_string_list("ids", args.get("ids"))]
                 spec = DeleteNodesSpec(
                     ids=ids,
                     namespace=args.get("namespace"),
                     filter=args.get("filter"),
                 )
                 res = await self._adapter.delete_nodes(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.delete_edges":
-                ids = [GraphID(i) for i in args.get("ids", [])]
+                ids = [GraphID(i) for i in self._require_string_list("ids", args.get("ids"))]
                 spec = DeleteEdgesSpec(
                     ids=ids,
                     namespace=args.get("namespace"),
                     filter=args.get("filter"),
                 )
                 res = await self._adapter.delete_edges(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.bulk_vertices":
-                spec = BulkVerticesSpec(**args)
+                try:
+                    spec = BulkVerticesSpec(**dict(args))
+                except (TypeError, ValueError) as spec_err:
+                    raise BadRequest(f"Invalid bulk_vertices spec: {spec_err}") from spec_err
                 res = await self._adapter.bulk_vertices(spec, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.batch":
-                ops = [BatchOperation(**o) for o in args.get("ops", [])]
+                ops_raw = self._require_mapping_list("ops", args.get("ops"))
+                ops = [BatchOperation(**dict(o)) for o in ops_raw]
                 res = await self._adapter.batch(ops, ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.get_schema":
                 res = await self._adapter.get_schema(ctx=ctx)
-                return _success_to_wire(asdict(res), (time.monotonic() - t0) * 1000.0)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
             if op == "graph.health":
                 res = await self._adapter.health(ctx=ctx)
                 return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
 
+            if op == "graph.transaction":
+                ops_raw = self._require_mapping_list("operations", args.get("operations"))
+                ops = [BatchOperation(**dict(o)) for o in ops_raw]
+                res = await self._adapter.transaction(ops, ctx=ctx)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
+
+            if op == "graph.traversal":
+                try:
+                    spec = GraphTraversalSpec(**dict(args))
+                except (TypeError, ValueError) as spec_err:
+                    raise BadRequest(f"Invalid traversal spec: {spec_err}") from spec_err
+                res = await self._adapter.traversal(spec, ctx=ctx)
+                return _success_to_wire(res, (time.monotonic() - t0) * 1000.0)
+
             raise NotSupported(f"unknown or non-unary operation '{op}'")
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
-            return _error_to_wire(e, ms)
+            # Best-effort: if adapter is BaseGraphAdapter, honor its wire message policy flag.
+            expose = False
+            try:
+                expose = bool(getattr(self._adapter, "_expose_unhandled_error_messages_on_wire", False))
+            except Exception:
+                expose = False
+            return _error_to_wire(e, ms, expose_unhandled_message=expose)
 
     async def handle_stream(self, envelope: Mapping[str, Any]) -> AsyncIterator[Dict[str, Any]]:
         """
@@ -1799,9 +3047,16 @@ class WireGraphHandler:
             yield _error_to_wire(BadRequest("op must be 'graph.stream_query'"), 0.0)
             return
 
-        ctx = _ctx_from_wire(envelope.get("ctx") or {})
-        args = envelope.get("args") or {}
-        spec = GraphQuerySpec(**args)
+        try:
+            ctx_raw, args = self._require_ctx_args(envelope)
+            ctx = _ctx_from_wire(ctx_raw)
+            try:
+                spec = GraphQuerySpec(**dict(args))
+            except (TypeError, ValueError) as spec_err:
+                raise BadRequest(f"Invalid query spec: {spec_err}") from spec_err
+        except Exception as e:
+            yield _error_to_wire(e, 0.0)
+            return
 
         try:
             agen = self._adapter.stream_query(spec, ctx=ctx)
@@ -1810,7 +3065,12 @@ class WireGraphHandler:
                 yield _chunk_to_wire(chunk, ms)
         except Exception as e:
             ms = (time.monotonic() - t0) * 1000.0
-            yield _error_to_wire(e, ms)
+            expose = False
+            try:
+                expose = bool(getattr(self._adapter, "_expose_unhandled_error_messages_on_wire", False))
+            except Exception:
+                expose = False
+            yield _error_to_wire(e, ms, expose_unhandled_message=expose)
 
 
 __all__ = [
@@ -1824,6 +3084,9 @@ __all__ = [
     "UpsertEdgesSpec",
     "DeleteNodesSpec",
     "DeleteEdgesSpec",
+    "GraphTransaction",
+    "GraphTraversalSpec",
+    "TraversalResult",
     "BulkVerticesSpec",
     "BulkVerticesResult",
     "BatchOperation",

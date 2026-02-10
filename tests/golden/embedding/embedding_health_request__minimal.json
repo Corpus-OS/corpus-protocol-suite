@@ -1,0 +1,8 @@
+{
+  "op": "embedding.health",
+  "ctx": {
+    "request_id": "t_embedding_health_min",
+    "tenant": "test"
+  },
+  "args": {}
+}

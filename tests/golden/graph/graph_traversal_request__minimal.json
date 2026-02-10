@@ -1,0 +1,12 @@
+{
+  "op": "graph.traversal",
+  "ctx": {
+    "request_id": "t_graph_traversal_min",
+    "tenant": "test"
+  },
+  "args": {
+    "start_nodes": [
+      "node_1"
+    ]
+  }
+}

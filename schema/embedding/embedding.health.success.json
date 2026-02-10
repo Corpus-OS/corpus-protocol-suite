@@ -1,16 +1,40 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.health.success.json",
-  "title": "Embedding Health",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.health.success.json",
+  "title": "Embedding Health Success",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["ok", "status"],
-  "properties": {
-    "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
-    "reason": { "type": "string", "maxLength": 512 },
-    "server": { "type": "string", "maxLength": 128 },
-    "version": { "type": "string", "maxLength": 64 }
-  },
-  "$comment": "Gateways: status ok/degraded → HTTP 200; down → HTTP 503."
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "server": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            },
+            "models": {
+              "type": "object",
+              "additionalProperties": true
+            }
+          },
+          "required": [
+            "ok",
+            "server",
+            "version",
+            "models"
+          ],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
 }

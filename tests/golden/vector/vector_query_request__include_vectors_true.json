@@ -1,0 +1,18 @@
+{
+  "op": "vector.query",
+  "ctx": {
+    "request_id": "t_vector_query_include_vectors",
+    "tenant": "test"
+  },
+  "args": {
+    "vector": [
+      0.9,
+      0.8,
+      0.7
+    ],
+    "top_k": 2,
+    "namespace": "default",
+    "include_metadata": false,
+    "include_vectors": true
+  }
+}

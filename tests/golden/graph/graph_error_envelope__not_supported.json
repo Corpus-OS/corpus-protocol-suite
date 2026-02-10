@@ -1,0 +1,11 @@
+{
+  "ok": false,
+  "code": "NOT_SUPPORTED",
+  "error": "NotSupportedError",
+  "message": "Requested feature not supported",
+  "retry_after_ms": null,
+  "details": {
+    "feature": "sparql"
+  },
+  "ms": 2.6
+}

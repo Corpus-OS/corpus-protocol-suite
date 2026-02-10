@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 14.9,
+  "result": {
+    "deleted_count": 1,
+    "failed_count": 1,
+    "failures": [
+      {
+        "id": "vec_missing",
+        "error": "NotFoundError",
+        "detail": "Vector id not found"
+      }
+    ]
+  }
+}

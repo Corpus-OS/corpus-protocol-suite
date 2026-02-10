@@ -1,17 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.health.success.json",
-  "title": "vector.health result",
-  "description": "Graded health status for vector component.",
+  "$id": "https://corpusos.com/schemas/vector/vector.health.success.json",
+  "title": "Vector Health Success",
   "type": "object",
-  "additionalProperties": false,
-  "properties": {
-    "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
-    "reason": { "type": ["string", "null"], "maxLength": 2000 },
-    "server": { "type": ["string", "null"] },
-    "version": { "type": ["string", "null"] }
-  },
-  "required": ["ok", "status"],
-  "$comment": "Gateways: status ok/degraded → HTTP 200; down → HTTP 503."
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "$ref": "https://corpusos.com/schemas/vector/vector.types.health_result.json"
+        }
+      }
+    }
+  ]
 }

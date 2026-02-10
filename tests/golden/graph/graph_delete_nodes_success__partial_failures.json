@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 14.6,
+  "result": {
+    "deleted_count": 1,
+    "failed_count": 1,
+    "failures": [
+      {
+        "index": 0,
+        "error": "NodeNotFoundError",
+        "message": "Node not found"
+      }
+    ]
+  }
+}

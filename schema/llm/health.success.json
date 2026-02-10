@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.health.success.json",
+  "title": "LLM Health Success",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "server": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "server",
+            "version"
+          ],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}

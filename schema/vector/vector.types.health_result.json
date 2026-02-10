@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.health_result.json",
+  "title": "Vector Health Result",
+  "type": "object",
+  "properties": {
+    "ok": {
+      "type": "boolean"
+    },
+    "server": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "namespaces": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "ok",
+    "server",
+    "version",
+    "namespaces"
+  ],
+  "additionalProperties": true
+}

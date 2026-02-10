@@ -1,0 +1,14 @@
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "t_graph_query_dialect_params",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "MATCH (n) WHERE n.id = $id RETURN n",
+    "dialect": "cypher",
+    "params": {
+      "id": "node_1"
+    }
+  }
+}

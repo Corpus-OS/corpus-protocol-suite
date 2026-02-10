@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.delete_namespace.request.json",
+  "title": "Vector Delete Namespace Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/vector/vector.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "vector.delete_namespace"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "namespace": {
+              "type": "string",
+              "minLength": 1,
+              "pattern": ".*\\S.*"
+            }
+          },
+          "required": [
+            "namespace"
+          ],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
+}

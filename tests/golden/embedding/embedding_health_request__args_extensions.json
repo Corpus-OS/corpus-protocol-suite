@@ -1,0 +1,13 @@
+{
+  "op": "embedding.health",
+  "ctx": {
+    "request_id": "t_embedding_health_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "verbose": true,
+    "x-probe": {
+      "deep": false
+    }
+  }
+}

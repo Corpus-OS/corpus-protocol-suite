@@ -1,5 +1,28 @@
-# IMPLEMENTATION.md  
-✅ Corpus Protocol (v1.0) — Adapter Implementation Guide (Runtime Behavior)
+# IMPLEMENTATION
+
+**Table of Contents**
+- [🚀 Hello World Adapter (30-second start)](#-hello-world-adapter-30-second-start)
+- [1. Purpose & Scope](#1-purpose--scope)
+- [2. System Layout (What You Implement vs What You Get)](#2-system-layout-what-you-implement-vs-what-you-get)
+- [3. Context & Identity (OperationContext)](#3-context--identity-operationcontext)
+- [4. Error Taxonomy & Mapping](#4-error-taxonomy--mapping)
+- [5. Modes: thin vs standalone](#5-modes-thin-vs-standalone)
+- [6. Deadlines & Cancellation](#6-deadlines--cancellation)
+- [7. Component Runtime Semantics](#7-component-runtime-semantics)
+- [8. Caching & Key Design](#8-caching--key-design)
+- [9. Metrics & Observability](#9-metrics--observability)
+- [10. Wire Handlers & Canonical Envelopes](#10-wire-handlers--canonical-envelopes)
+- [11. Streaming Rules (LLM & Graph)](#11-streaming-rules-llm--graph)
+- [12. Conformance Tests & Mocks (High-Level)](#12-conformance-tests--mocks-high-level)
+- [13. Environment, Configuration, and Modes](#13-environment-configuration-and-modes)
+- [14. Partial Failures & Batch Behavior](#14-partial-failures--batch-behavior)
+- [15. Extending Adapters Safely & Common Pitfalls](#15-extending-adapters-safely--common-pitfalls)
+- [16. Debugging Conformance Failures](#16-debugging-conformance-failures)
+- [17. Implementation Checklists](#17-implementation-checklists)
+
+---
+
+Corpus Protocol (v1.0) — Adapter Implementation Guide (Runtime Behavior)
 
 > **Scope:** How to implement **real adapters** against the Corpus Protocol base SDKs  
 > **Components:** **LLM • Embedding • Vector • Graph**  

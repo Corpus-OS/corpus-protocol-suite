@@ -1,0 +1,21 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_nullable_sampling",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream something."
+      }
+    ],
+    "max_tokens": null,
+    "temperature": null,
+    "top_p": null,
+    "frequency_penalty": null,
+    "presence_penalty": null,
+    "stop_sequences": null
+  }
+}

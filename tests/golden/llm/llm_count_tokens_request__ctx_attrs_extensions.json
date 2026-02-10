@@ -1,0 +1,14 @@
+{
+  "op": "llm.count_tokens",
+  "ctx": {
+    "request_id": "t_llm_count_tokens_ctx_attrs",
+    "tenant": "test",
+    "attrs": {
+      "x-client": "golden-tests",
+      "x-purpose": "token-count"
+    }
+  },
+  "args": {
+    "text": "hello world"
+  }
+}

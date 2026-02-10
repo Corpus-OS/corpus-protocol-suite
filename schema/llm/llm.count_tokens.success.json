@@ -1,22 +1,18 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.count_tokens.success.json",
-  "title": "llm.count_tokens Result",
+  "$id": "https://corpusos.com/schemas/llm/llm.count_tokens.success.json",
+  "title": "LLM Count Tokens Success",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["count"],
-  "properties": {
-    "count": { "type": "integer", "minimum": 0 },
-    "model": { "type": "string", "maxLength": 128 },
-    "breakdown": {
-      "type": "object",
-      "additionalProperties": false,
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json"
+    },
+    {
       "properties": {
-        "system": { "type": "integer", "minimum": 0 },
-        "user": { "type": "integer", "minimum": 0 },
-        "assistant": { "type": "integer", "minimum": 0 },
-        "tool": { "type": "integer", "minimum": 0 }
+        "result": {
+          "type": "integer"
+        }
       }
     }
-  }
+  ]
 }

@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 17.1,
+  "result": {
+    "text": "No tool calls needed.",
+    "model": "test-model-1",
+    "model_family": "test-family",
+    "usage": {
+      "prompt_tokens": 6,
+      "completion_tokens": 4,
+      "total_tokens": 10
+    },
+    "finish_reason": "stop",
+    "tool_calls": []
+  }
+}

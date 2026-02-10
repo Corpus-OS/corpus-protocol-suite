@@ -1,12 +1,27 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.types.warning.json",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.warning.json",
   "title": "Graph Warning",
+  "description": "Non-fatal warning information returned alongside results.",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["code", "message"],
   "properties": {
-    "code": { "type": "string", "pattern": "^[A-Z0-9_]{1,64}$" },
-    "message": { "type": "string", "minLength": 1, "maxLength": 2000 }
-  }
+    "code": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "details": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "code",
+    "message"
+  ],
+  "additionalProperties": true
 }

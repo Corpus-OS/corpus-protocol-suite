@@ -8,86 +8,99 @@ Covers:
   • All feature flags are boolean
   • Model enumeration is valid (non-empty tuple of strings)
   • Logical consistency between capabilities and adapter behavior
+  • Idempotency across multiple calls
 """
 import pytest
-from corpus_sdk.examples.llm.mock_llm_adapter import MockLLMAdapter
 from corpus_sdk.llm.llm_base import (
     LLMCapabilities,
     OperationContext,
     NotSupported,
+    BadRequest,
 )
-from corpus_sdk.examples.common.ctx import make_ctx
 
 pytestmark = pytest.mark.asyncio
 
+# Constants for capabilities validation
+MAX_REASONABLE_CONTEXT_LENGTH = 10_000_000  # 10M tokens upper bound
+MIN_CONTEXT_LENGTH = 1                      # Minimum context length
+MIN_SUPPORTED_MODELS = 1                    # Must support at least 1 model
 
-async def test_capabilities_shape_and_required_fields():
+
+async def test_capabilities_capabilities_shape_and_required_fields(adapter):
     """Quick smoke test of essential capabilities fields."""
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
-    assert isinstance(caps, LLMCapabilities)
-    assert caps.server == "mock"
-    assert caps.model_family == "mock"
-    assert caps.max_context_length > 0
-    assert caps.supports_streaming is True
-    assert isinstance(caps.supported_models, tuple)
-    assert len(caps.supported_models) >= 1
+
+    assert isinstance(caps, LLMCapabilities), "Should return LLMCapabilities instance"
+    assert caps.server and isinstance(caps.server, str), "Server should be non-empty string"
+    assert caps.model_family and isinstance(caps.model_family, str), "Model family should be non-empty string"
+    assert caps.max_context_length > 0, "Max context length should be positive"
+    assert isinstance(caps.supports_streaming, bool), "supports_streaming should be boolean"
+    assert isinstance(caps.supported_models, tuple), "supported_models should be tuple"
+    assert len(caps.supported_models) >= MIN_SUPPORTED_MODELS, (
+        f"Should support at least {MIN_SUPPORTED_MODELS} model"
+    )
 
 
-async def test_capabilities_returns_correct_type():
+async def test_capabilities_returns_correct_type(adapter):
     """
     SPECIFICATION.md §8.4 — Capabilities Discovery
 
     Capabilities MUST return an LLMCapabilities dataclass instance.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
-    assert isinstance(caps, LLMCapabilities), \
-        "capabilities() must return LLMCapabilities instance"
+    assert isinstance(caps, LLMCapabilities), "capabilities() must return LLMCapabilities instance"
 
 
-async def test_capabilities_identity_fields():
+async def test_capabilities_identity_fields(adapter):
     """
     Identity fields (server, version, model_family) MUST be non-empty strings.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
-    assert isinstance(caps.server, str) and len(caps.server) > 0, \
-        "server must be a non-empty string"
-    assert isinstance(caps.version, str) and len(caps.version) > 0, \
-        "version must be a non-empty string"
-    assert isinstance(caps.model_family, str) and len(caps.model_family) > 0, \
-        "model_family must be a non-empty string"
+    # Server validation
+    assert isinstance(caps.server, str), "server must be a string"
+    assert len(caps.server.strip()) > 0, "server must be non-empty string"
+    assert not caps.server.isspace(), "server must not be only whitespace"
+
+    # Version validation
+    assert isinstance(caps.version, str), "version must be a string"
+    assert len(caps.version.strip()) > 0, "version must be non-empty string"
+    assert not caps.version.isspace(), "version must not be only whitespace"
+
+    # Model family validation
+    assert isinstance(caps.model_family, str), "model_family must be a string"
+    assert len(caps.model_family.strip()) > 0, "model_family must be non-empty string"
+    assert not caps.model_family.isspace(), "model_family must not be only whitespace"
 
 
-async def test_capabilities_resource_limits():
+async def test_capabilities_resource_limits(adapter):
     """
     Resource limits MUST be positive integers within reasonable bounds.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
-    assert isinstance(caps.max_context_length, int), \
-        "max_context_length must be an integer"
-    assert caps.max_context_length > 0, \
-        "max_context_length must be positive"
-    assert caps.max_context_length <= 10_000_000, \
-        "max_context_length should be reasonable (≤10M tokens)"
+    assert isinstance(caps.max_context_length, int), "max_context_length must be an integer"
+    assert caps.max_context_length >= MIN_CONTEXT_LENGTH, (
+        f"max_context_length must be at least {MIN_CONTEXT_LENGTH}"
+    )
+    assert caps.max_context_length <= MAX_REASONABLE_CONTEXT_LENGTH, (
+        f"max_context_length should be reasonable (≤{MAX_REASONABLE_CONTEXT_LENGTH:,} tokens)"
+    )
 
 
-async def test_capabilities_feature_flags_are_boolean():
+async def test_capabilities_feature_flags_are_boolean(adapter):
     """
     All feature flags MUST be boolean values (not truthy/falsy objects).
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
     flags = {
         "supports_streaming": caps.supports_streaming,
         "supports_roles": caps.supports_roles,
         "supports_json_output": caps.supports_json_output,
+        "supports_tools": caps.supports_tools,
         "supports_parallel_tool_calls": caps.supports_parallel_tool_calls,
+        "supports_tool_choice": caps.supports_tool_choice,
         "idempotent_writes": caps.idempotent_writes,
         "supports_multi_tenant": caps.supports_multi_tenant,
         "supports_system_message": caps.supports_system_message,
@@ -96,95 +109,101 @@ async def test_capabilities_feature_flags_are_boolean():
     }
 
     for name, value in flags.items():
-        assert isinstance(value, bool), \
-            f"{name} must be a boolean, got {type(value).__name__}"
+        assert isinstance(value, bool), f"{name} must be a boolean, got {type(value).__name__} ({value})"
 
 
-async def test_capabilities_supported_models_structure():
+async def test_capabilities_supported_models_structure(adapter):
     """
     supported_models MUST be a non-empty tuple of non-empty strings.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
-    assert isinstance(caps.supported_models, tuple), \
-        "supported_models must be a tuple"
-    assert len(caps.supported_models) >= 1, \
-        "Must support at least one model"
+    assert isinstance(caps.supported_models, tuple), "supported_models must be a tuple, not list or other sequence"
+    assert len(caps.supported_models) >= MIN_SUPPORTED_MODELS, (
+        f"Must support at least {MIN_SUPPORTED_MODELS} model"
+    )
 
     for i, model in enumerate(caps.supported_models):
-        assert isinstance(model, str), \
-            f"Model at index {i} must be a string, got {type(model).__name__}"
-        assert len(model) > 0, \
-            f"Model at index {i} must be non-empty"
+        assert isinstance(model, str), f"Model at index {i} must be a string, got {type(model).__name__}"
+        assert len(model.strip()) > 0, f"Model at index {i} must be non-empty string"
+        assert not model.isspace(), f"Model at index {i} must not be only whitespace"
 
 
-async def test_capabilities_consistency_with_count_tokens():
+async def test_capabilities_consistency_with_count_tokens(adapter):
     """
-    If supports_count_tokens is False, count_tokens() SHOULD raise NotSupported.
-    If True, count_tokens() MUST work.
+    Capability↔behavior alignment:
+      - If supports_count_tokens is False, count_tokens() MUST raise NotSupported.
+      - If True, count_tokens() MUST return a non-negative integer.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test", request_id="test-caps-001")
+    ctx = OperationContext(tenant="test", request_id="test-caps-001")
 
     if caps.supports_count_tokens:
-        count = await adapter.count_tokens("test text", ctx=ctx)
-        assert isinstance(count, int) and count >= 0, \
-            "count_tokens should return non-negative integer"
+        count = await adapter.count_tokens("test text for counting", model=caps.supported_models[0], ctx=ctx)
+        assert isinstance(count, int), "count_tokens should return integer when supported"
+        assert count >= 0, "count_tokens should return non-negative integer"
     else:
-        # If not supported, real adapters SHOULD raise NotSupported.
-        # MockLLMAdapter always supports it.
-        pass
+        with pytest.raises(NotSupported):
+            await adapter.count_tokens("test text for counting", model=caps.supported_models[0], ctx=ctx)
 
 
-async def test_capabilities_consistency_with_streaming():
+async def test_capabilities_consistency_with_streaming(adapter):
     """
-    If supports_streaming is False, stream() SHOULD raise NotSupported.
-    If True, stream() MUST work.
+    Capability↔behavior alignment:
+      - If supports_streaming is False, stream() MUST raise NotSupported.
+      - If True, stream() MUST yield at least one chunk and terminate.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
-    ctx = make_ctx(OperationContext, tenant="test", request_id="test-caps-002")
+    ctx = OperationContext(tenant="test", request_id="test-caps-002")
 
     if caps.supports_streaming:
         chunks = []
         async for chunk in adapter.stream(
-            messages=[{"role": "user", "content": "test"}],
+            messages=[{"role": "user", "content": "test streaming consistency"}],
+            model=caps.supported_models[0],
             ctx=ctx,
         ):
             chunks.append(chunk)
-            if len(chunks) >= 3:
+            if len(chunks) >= 5:
                 break
-        assert len(chunks) > 0, "stream() should yield at least one chunk"
+
+        assert len(chunks) > 0, "stream() should yield chunks when supported"
+        for chunk in chunks:
+            assert hasattr(chunk, "text"), "Stream chunks should have text attribute"
+            assert hasattr(chunk, "is_final"), "Stream chunks should have is_final attribute"
     else:
-        # Real adapters SHOULD raise NotSupported in this branch.
-        # MockLLMAdapter supports streaming.
-        pass
+        with pytest.raises(NotSupported):
+            agen = adapter.stream(
+                messages=[{"role": "user", "content": "test streaming consistency"}],
+                model=caps.supported_models[0],
+                ctx=ctx,
+            )
+            async for _ in agen:
+                pass
 
 
-async def test_capabilities_all_fields_present():
+async def test_capabilities_all_fields_present(adapter):
     """
     Comprehensive check that all expected fields are present and valid.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
     caps = await adapter.capabilities()
 
-    # Identity
-    assert hasattr(caps, "server") and caps.server
-    assert hasattr(caps, "version") and caps.version
-    assert hasattr(caps, "model_family") and caps.model_family
+    required_fields = ["server", "version", "model_family"]
+    for field in required_fields:
+        assert hasattr(caps, field), f"Missing required field: {field}"
+        value = getattr(caps, field)
+        assert isinstance(value, str) and value.strip(), f"{field} must be non-empty string"
 
-    # Limits
-    assert hasattr(caps, "max_context_length")
-    assert caps.max_context_length > 0
+    assert hasattr(caps, "max_context_length"), "Missing max_context_length"
+    assert isinstance(caps.max_context_length, int) and caps.max_context_length > 0
 
-    # Feature flags
     feature_flags = [
         "supports_streaming",
         "supports_roles",
         "supports_json_output",
+        "supports_tools",
         "supports_parallel_tool_calls",
+        "supports_tool_choice",
         "idempotent_writes",
         "supports_multi_tenant",
         "supports_system_message",
@@ -193,27 +212,139 @@ async def test_capabilities_all_fields_present():
     ]
     for flag in feature_flags:
         assert hasattr(caps, flag), f"Missing feature flag: {flag}"
-        assert isinstance(getattr(caps, flag), bool), \
-            f"{flag} must be boolean"
+        assert isinstance(getattr(caps, flag), bool), (
+            f"{flag} must be boolean, got {type(getattr(caps, flag)).__name__}"
+        )
 
-    # Models
-    assert hasattr(caps, "supported_models")
-    assert isinstance(caps.supported_models, tuple)
-    assert len(caps.supported_models) > 0
+    assert hasattr(caps, "max_tool_calls_per_turn"), "Missing max_tool_calls_per_turn"
+    if caps.max_tool_calls_per_turn is not None:
+        assert isinstance(caps.max_tool_calls_per_turn, int), "max_tool_calls_per_turn must be int when present"
+        assert caps.max_tool_calls_per_turn >= 1, "max_tool_calls_per_turn must be >= 1 when present"
+
+    assert hasattr(caps, "supported_models"), "Missing supported_models"
+    assert isinstance(caps.supported_models, tuple), "supported_models must be tuple"
+    assert len(caps.supported_models) >= 1, "Must support at least one model"
 
 
-async def test_capabilities_idempotency():
+async def test_capabilities_idempotency(adapter):
     """
     Multiple calls to capabilities() SHOULD return consistent results.
     """
-    adapter = MockLLMAdapter(failure_rate=0.0)
-
     caps1 = await adapter.capabilities()
     caps2 = await adapter.capabilities()
+    caps3 = await adapter.capabilities()
 
-    assert caps1.server == caps2.server
-    assert caps1.version == caps2.version
-    assert caps1.model_family == caps2.model_family
-    assert caps1.max_context_length == caps2.max_context_length
-    assert caps1.supports_streaming == caps2.supports_streaming
-    assert caps1.supported_models == caps2.supported_models
+    assert caps1.server == caps2.server == caps3.server, "Server should be consistent"
+    assert caps1.version == caps2.version == caps3.version, "Version should be consistent"
+    assert caps1.model_family == caps2.model_family == caps3.model_family, "Model family should be consistent"
+    assert caps1.max_context_length == caps2.max_context_length == caps3.max_context_length, "Max context length should be consistent"
+
+    feature_flags = [
+        "supports_streaming",
+        "supports_roles",
+        "supports_json_output",
+        "supports_tools",
+        "supports_parallel_tool_calls",
+        "supports_tool_choice",
+        "idempotent_writes",
+        "supports_multi_tenant",
+        "supports_system_message",
+        "supports_deadline",
+        "supports_count_tokens",
+    ]
+    for flag in feature_flags:
+        val1 = getattr(caps1, flag)
+        val2 = getattr(caps2, flag)
+        val3 = getattr(caps3, flag)
+        assert val1 == val2 == val3, f"Feature flag {flag} should be consistent"
+
+    assert caps1.supported_models == caps2.supported_models == caps3.supported_models, "Supported models should be consistent"
+
+
+async def test_capabilities_reasonable_model_names(adapter):
+    """
+    Model names should be reasonable identifiers (not garbage).
+    """
+    caps = await adapter.capabilities()
+    for model in caps.supported_models:
+        assert len(model) <= 100, f"Model name too long: {model}"
+        assert not model.startswith(" "), f"Model name should not start with space: '{model}'"
+        assert not model.endswith(" "), f"Model name should not end with space: '{model}'"
+        assert any(c.isalnum() for c in model), f"Model name should contain alphanumeric chars: {model}"
+
+
+async def test_capabilities_no_duplicate_models(adapter):
+    """
+    Supported models list should not contain duplicates.
+    """
+    caps = await adapter.capabilities()
+    unique_models = set(caps.supported_models)
+    if len(unique_models) != len(caps.supported_models):
+        from collections import Counter
+        duplicates = [m for m, c in Counter(caps.supported_models).items() if c > 1]
+        pytest.fail(f"Supported models contain duplicates: {duplicates}")
+
+
+async def test_capabilities_model_gate_enforced_when_supported_models_listed(adapter):
+    """
+    If capabilities enumerate supported_models, passing an unknown model MUST raise BadRequest.
+    """
+    caps = await adapter.capabilities()
+    if not caps.supported_models:
+        pytest.fail("supported_models must be a non-empty tuple for conformance")
+
+    ctx = OperationContext(tenant="test", request_id="test-model-gate-001")
+    with pytest.raises(BadRequest):
+        await adapter.complete(
+            messages=[{"role": "user", "content": "hello"}],
+            model="__no_such_model__",
+            ctx=ctx,
+        )
+
+
+async def test_capabilities_tools_consistency_with_complete(adapter):
+    """
+    Capability↔behavior alignment for tool calling.
+    """
+    caps = await adapter.capabilities()
+    ctx = OperationContext(tenant="test", request_id="test-tools-gate-001")
+
+    tools = [{"type": "function", "function": {"name": "echo", "parameters": {"type": "object"}}}]
+
+    if caps.supports_tools:
+        res = await adapter.complete(
+            messages=[{"role": "user", "content": "call: please echo"}],
+            model=caps.supported_models[0],
+            tools=tools,
+            tool_choice="auto",
+            ctx=ctx,
+        )
+        assert hasattr(res, "finish_reason") and isinstance(res.finish_reason, str)
+    else:
+        with pytest.raises(NotSupported):
+            await adapter.complete(
+                messages=[{"role": "user", "content": "call: please echo"}],
+                model=caps.supported_models[0],
+                tools=tools,
+                tool_choice="auto",
+                ctx=ctx,
+            )
+
+
+async def test_capabilities_tools_flags_and_limits_valid(adapter):
+    """
+    Validate tool-related capability flags and limits for shape and internal consistency.
+    """
+    caps = await adapter.capabilities()
+
+    assert isinstance(caps.supports_tools, bool)
+    assert isinstance(caps.supports_tool_choice, bool)
+    assert isinstance(caps.supports_parallel_tool_calls, bool)
+
+    if caps.supports_tool_choice:
+        assert caps.supports_tools is True, "supports_tool_choice implies supports_tools"
+
+    if caps.max_tool_calls_per_turn is not None:
+        assert isinstance(caps.max_tool_calls_per_turn, int)
+        assert caps.max_tool_calls_per_turn >= 1
+        assert caps.supports_tools is True, "max_tool_calls_per_turn implies supports_tools"

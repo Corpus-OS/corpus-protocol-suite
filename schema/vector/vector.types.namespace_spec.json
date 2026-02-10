@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.namespace_spec.json",
+  "title": "Namespace Specification",
+  "type": "object",
+  "properties": {
+    "namespace": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "dimensions": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "distance_metric": {
+      "type": "string",
+      "enum": [
+        "cosine",
+        "euclidean",
+        "dotproduct"
+      ],
+      "default": "cosine"
+    }
+  },
+  "required": [
+    "namespace",
+    "dimensions"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+{
+  "op": "vector.create_namespace",
+  "ctx": {
+    "request_id": "t_vector_create_ns_dotproduct",
+    "tenant": "test"
+  },
+  "args": {
+    "namespace": "tenant_b",
+    "dimensions": 768,
+    "distance_metric": "dotproduct"
+  }
+}

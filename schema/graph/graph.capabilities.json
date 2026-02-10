@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.json",
+  "title": "Graph Capabilities",
+  "type": "object",
+  "properties": {
+    "server": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "string",
+      "const": "graph/v1.0"
+    },
+    "supports_stream_query": {
+      "type": "boolean",
+      "default": true
+    },
+    "supported_query_dialects": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "supports_namespaces": {
+      "type": "boolean",
+      "default": true
+    },
+    "supports_property_filters": {
+      "type": "boolean",
+      "default": true
+    },
+    "supports_bulk_vertices": {
+      "type": "boolean",
+      "default": false
+    },
+    "supports_batch": {
+      "type": "boolean",
+      "default": false
+    },
+    "supports_schema": {
+      "type": "boolean",
+      "default": false
+    },
+    "idempotent_writes": {
+      "type": "boolean",
+      "default": false
+    },
+    "supports_multi_tenant": {
+      "type": "boolean",
+      "default": false
+    },
+    "supports_deadline": {
+      "type": "boolean",
+      "default": true
+    },
+    "max_batch_ops": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "supports_transaction": {
+      "type": "boolean",
+      "default": false
+    },
+    "supports_traversal": {
+      "type": "boolean",
+      "default": false
+    },
+    "max_traversal_depth": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "supports_path_queries": {
+      "type": "boolean",
+      "default": false
+    }
+  },
+  "required": [
+    "server",
+    "version",
+    "protocol"
+  ],
+  "additionalProperties": false
+}

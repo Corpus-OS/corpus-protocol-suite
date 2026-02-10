@@ -1,0 +1,43 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 28.2,
+  "result": [
+    {
+      "matches": [],
+      "query_vector": [
+        0.1,
+        0.2,
+        0.3
+      ],
+      "namespace": "default",
+      "total_matches": 0
+    },
+    {
+      "matches": [
+        {
+          "vector": {
+            "id": "vec_9",
+            "vector": [
+              0.9,
+              0.8,
+              0.7
+            ],
+            "metadata": null,
+            "namespace": "default",
+            "text": null
+          },
+          "score": 0.66,
+          "distance": 0.34
+        }
+      ],
+      "query_vector": [
+        0.9,
+        0.8,
+        0.7
+      ],
+      "namespace": "default",
+      "total_matches": 1
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "op": "graph.batch",
+  "ctx": {
+    "request_id": "t_graph_batch_min",
+    "tenant": "test"
+  },
+  "args": {
+    "ops": [
+      {
+        "op": "graph.upsert_nodes",
+        "args": {
+          "nodes": [
+            {
+              "id": "node_10",
+              "properties": {}
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

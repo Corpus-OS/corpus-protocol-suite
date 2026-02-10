@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.capabilities.json",
+  "title": "LLM Capabilities",
+  "type": "object",
+  "properties": {
+    "server": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "model_family": {
+      "type": "string"
+    },
+    "max_context_length": {
+      "type": "integer"
+    },
+    "protocol": {
+      "type": "string",
+      "const": "llm/v1.0"
+    },
+    "supports_streaming": {
+      "type": "boolean"
+    },
+    "supports_roles": {
+      "type": "boolean"
+    },
+    "supports_json_output": {
+      "type": "boolean"
+    },
+    "supports_tools": {
+      "type": "boolean"
+    },
+    "supports_parallel_tool_calls": {
+      "type": "boolean"
+    },
+    "supports_tool_choice": {
+      "type": "boolean"
+    },
+    "max_tool_calls_per_turn": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "idempotent_writes": {
+      "type": "boolean"
+    },
+    "supports_multi_tenant": {
+      "type": "boolean"
+    },
+    "supports_system_message": {
+      "type": "boolean"
+    },
+    "supports_deadline": {
+      "type": "boolean"
+    },
+    "supports_count_tokens": {
+      "type": "boolean"
+    },
+    "supported_models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "required": [
+    "server",
+    "version",
+    "model_family",
+    "max_context_length",
+    "protocol"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,17 @@
+{
+  "op": "graph.capabilities",
+  "ctx": {
+    "request_id": "t_graph_caps_ctx_attrs",
+    "tenant": "test",
+    "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+    "attrs": {
+      "x-client": "golden-tests",
+      "x-run": "ci",
+      "feature_flags": {
+        "x-fast-path": true
+      }
+    },
+    "x-extra-field": "ctx pass-through allowed"
+  },
+  "args": {}
+}

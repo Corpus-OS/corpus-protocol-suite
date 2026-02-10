@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.delete_result.json",
+  "title": "Vector Delete Result",
+  "type": "object",
+  "properties": {
+    "deleted_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "failed_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "failures": {
+      "type": "array",
+      "items": {}
+    }
+  },
+  "required": [
+    "deleted_count",
+    "failed_count",
+    "failures"
+  ],
+  "additionalProperties": false
+}
