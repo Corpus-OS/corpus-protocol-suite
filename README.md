@@ -60,7 +60,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 - **Vendor lock-in** — Applications tightly coupled to specific backend choices
 - **Operational complexity** — Inconsistent monitoring and debugging across services
 
-**CORPUS SDK provides:**
+**Corpus OS provides:**
 
 - **Stable, runtime-checkable protocols** across all four domains
 - **Normalized errors** with retry hints and machine-actionable scopes
@@ -69,11 +69,11 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 - **Two modes** — compose under your own router (`thin`) or use lightweight built-in infra (`standalone`)
 - **Wire-first design** — canonical JSON envelopes implementable in any language, with this SDK as reference
 
-Corpus OS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP. Use those for orchestration, agents, tools, and RAG pipelines. Use Corpus OS to standardize the **infrastructure layer underneath them**. Your app teams keep their frameworks. Your platform team gets one protocol, one error taxonomy, and one observability model across everything.
+Corpus OS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP. Use those for agent-specific orchestration, agents, tools, and RAG pipelines. Use Corpus OS to standardize the **infrastructure layer underneath them**. Your app teams keep their frameworks. Your platform team gets one protocol, one error taxonomy, and one observability model across everything.
 
 ---
 
-## How CORPUS Compares
+## How Corpus OS Compares
 
 | Aspect | LangChain / LlamaIndex | OpenRouter | MCP | **Corpus OS** |
 |---|---|---|---|---|
