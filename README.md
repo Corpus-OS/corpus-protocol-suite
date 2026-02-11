@@ -86,7 +86,7 @@ Corpus OS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, C
 
 ### Who is this for?
 
-- **App developers** — Keep using your framework of choice. Talk to all backends through Corpus OS protocols. Swap providers or frameworks without rewriting error handling.
+- **App developers** — Keep using your framework of choice. Talk to all backends through Corpus OS protocols. Swap providers or frameworks without rewriting integration code.
 - **Framework maintainers** — Implement one CORPUS adapter per protocol. Instantly support any conformant backend.
 - **Backend vendors** — Implement `llm/v1`, `embedding/v1`, `vector/v1`, or `graph/v1` once, run the conformance suite, and your service works with every framework.
 - **Platform / infra teams** — Unified observability: normalized error codes, deadlines, and metrics. One set of dashboards and SLOs across all AI traffic.
