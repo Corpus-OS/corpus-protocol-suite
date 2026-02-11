@@ -3316,7 +3316,7 @@ All adapters MUST map provider errors to the canonical taxonomy defined in **ERR
 - [ ] Tenant hashing applied in all telemetry
 - [ ] Deadline propagation with safety buffer
 - [ ] SIEM-safe requirements enforced
-- [ ] Capabilities reported truthfully (protocol field is recommended except for Embedding where it's REQUIRED)
+- [ ] Capabilities reported truthfully (protocol field is REQUIRED for all protocols)
 - [ ] Wire envelopes follow standardization
 - [ ] Streaming semantics followed
 - [ ] All request envelopes include `op`, `ctx`, `args` keys
