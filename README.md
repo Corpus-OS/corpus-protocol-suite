@@ -15,7 +15,7 @@ Reference implementation of the **Corpus OS Protocol and SDK** — a **wire-firs
 │  Your App / Agents / RAG Pipelines                                   │
 │  (LangChain · LlamaIndex · Semantic Kernel · CrewAI · AutoGen · MCP) │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Corpus OS Protocol Suite (this SDK)                                 │
+│  Corpus OS Protocol and SDK.                                         │
 │  One protocol · One error taxonomy · One metrics model               │
 ├──────────┬──────────────┬────────────┬───────────────────────────────┤
 │ LLM/v1   │ Embedding/v1 │ Vector/v1  │ Graph/v1                      │
