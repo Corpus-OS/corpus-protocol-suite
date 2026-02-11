@@ -1,14 +1,6 @@
 # Graph Framework Adapters Conformance Test Coverage
 
-**Quick Stats**
-- 📊 **Total Tests:** 573/573 passing (100%)
-- ⚡ **Execution Time:** 13.97s (24.4ms/test avg)
-- 🎯 **Frameworks:** 5 (AutoGen, CrewAI, LangChain, LlamaIndex, Semantic Kernel)
-- 🏆 **Certification:** Platinum (100%)
-
----
-
-**Table of Contents**
+## Table of Contents
 - [Overview](#overview)
 - [Conformance Summary](#conformance-summary)
 - [Test Files](#test-files)
@@ -29,47 +21,42 @@ This suite constitutes the **official Graph Framework Adapters V1.0 Reference Co
 **Adapter Version:** Graph Framework Adapters V1.0  
 **Protocol Version:** Graph Protocol V1.0  
 **Status:** Stable / Production-Ready  
-**Last Updated:** 2026-01-30  
-**Test Location:** `tests/frameworks/graph/`
+**Last Updated:** 2026-02-10  
+**Test Location:** `tests/frameworks/graph/`  
+**Performance:** 13.97s total (24.4ms/test average)
 
 ## Conformance Summary
 
-**Overall Coverage: 573/573 tests (100%) ✅**
+**Overall Coverage: 574/574 tests (100%) ✅**
 
-| Test File | Tests | Coverage |
-|-----------|-------|----------|
-| `test_autogen_graph_adapter.py` | 55 | 100% ✅ |
-| `test_contract_context_and_error_context.py` | 90 (18×5) | 100% ✅ |
-| `test_contract_interface_conformance.py` | 65 (13×5) | 100% ✅ |
-| `test_contract_shapes_and_batching.py` | 60 (12×5) | 100% ✅ |
-| `test_crewai_graph_adapter.py` | 45 | 100% ✅ |
-| `test_graph_registry_self_check.py` | 28 | 100% ✅ |
-| `test_langchain_graph_adapter.py` | 53 | 100% ✅ |
-| `test_llamaindex_graph_adapter.py` | 58 | 100% ✅ |
-| `test_semantickernel_graph_adapter.py` | 54 | 100% ✅ |
-| `test_with_mock_backends.py` | 65 (13×5) | 100% ✅ |
+📊 **Total Tests:** 574/574 passing (100%)  
+⚡ **Execution Time:** 13.97s (24.4ms/test avg)  
+🏆 **Certification:** Platinum (100%)
 
-**Test Distribution:**
+| Category | Tests | Coverage | Status |
+|----------|-------|-----------|---------|
+| **Parametrized Contract Tests** | 280 | 100% ✅ | Production Ready |
+| **Framework-Specific Tests** | 294 | 100% ✅ | Production Ready |
+| **Total** | **574/574** | **100% ✅** | **🏆 Platinum Certified** |
 
-| Category | Tests | Description |
-|----------|-------|-------------|
-| **Parametrized Contract Tests** | 280 | Shared tests run across all 5 frameworks |
-| **Framework-Specific Tests** | 293 | Unique tests per framework + registry |
-| **Total** | **573** | All tests passing |
+### Performance Characteristics
+- **Test Execution:** 13.97 seconds total runtime
+- **Average Per Test:** 24.4 milliseconds
+- **Cache Efficiency:** 0 cache hits, 574 misses (cache size: 574)
+- **Parallel Ready:** Optimized for parallel execution with `pytest -n auto`
 
-**Parametrized Contract Breakdown:**
-- Context & Error Handling: 90 tests (18 functions × 5 frameworks)
-- Interface Conformance: 65 tests (13 functions × 5 frameworks)
-- Shapes & Batching: 60 tests (12 functions × 5 frameworks)
-- Mock Backend Edge Cases: 65 tests (13 functions × 5 frameworks)
+### Test Infrastructure
+- **Mock Adapter:** `tests.mock.mock_graph_adapter:MockGraphAdapter` - Deterministic mock for Graph operations
+- **Testing Framework:** pytest 9.0.2 with comprehensive plugin support
+- **Environment:** Python 3.10.19 on Darwin
+- **Strict Mode:** Off (permissive testing)
 
-**Framework-Specific Breakdown:**
-- AutoGen: 55 tests
-- CrewAI: 45 tests
-- LangChain: 53 tests
-- LlamaIndex: 58 tests
-- Semantic Kernel: 54 tests
-- Registry Self-Check: 28 tests
+## **Graph Framework Adapters Certification**
+
+- 🏆 **Platinum:** 574/574 tests (100% comprehensive conformance)
+- 🥇 **Gold:** 574 tests (100% protocol mastery)
+- 🥈 **Silver:** 460+ tests (80%+ integration-ready)
+- 🔬 **Development:** 287+ tests (50%+ early development)
 
 ---
 
@@ -169,7 +156,7 @@ Mock backend edge case validation across all 5 frameworks:
 
 ---
 
-### Framework-Specific Tests (293 tests)
+### Framework-Specific Tests (294 tests)
 
 These tests are **unique to each framework**, validating framework-specific features and integration patterns.
 
@@ -298,10 +285,10 @@ Semantic Kernel-specific graph adapter tests covering kernel context translation
 * `test_astream_query_accepts_direct_async_iterator` — Flexible async streaming
 * `test_upsert_edges_validates_and_is_side_effect_free_and_async_too` — Immutable validation
 
-#### `test_graph_registry_self_check.py` (28 tests)
+#### `test_graph_registry_self_check.py` (29 tests)
 
 **Specification:** Graph Registry Validation  
-**Status:** ✅ Complete (28 tests)
+**Status:** ✅ Complete (29 tests)
 
 Registry integrity and descriptor validation tests with framework parametrization.
 
@@ -310,7 +297,7 @@ Registry integrity and descriptor validation tests with framework parametrizatio
 - Descriptor validation: 9 tests
 - Async/Streaming support: 4 tests
 - Method availability (parametrized): 15 tests (3×5 frameworks)
-- Edge case handling: 5 tests
+- Edge case handling: 6 tests
 
 **Notable Tests:**
 * `test_graph_registry_keys_match_descriptor_name` — Registry key consistency
@@ -331,7 +318,7 @@ Registry integrity and descriptor validation tests with framework parametrizatio
 | **LangChain** | 53 unique tests | + 56 shared | **109 tests** |
 | **LlamaIndex** | 58 unique tests | + 56 shared | **114 tests** |
 | **Semantic Kernel** | 54 unique tests | + 56 shared | **110 tests** |
-| **Registry** | 28 integrity tests | N/A | **28 tests** |
+| **Registry** | 29 integrity tests | N/A | **29 tests** |
 
 **Understanding the Numbers:**
 - **Framework-Specific**: Tests unique to that framework
@@ -348,8 +335,8 @@ Registry integrity and descriptor validation tests with framework parametrizatio
 | LangChain | 53 | ~24ms |
 | LlamaIndex | 58 | ~23ms |
 | Semantic Kernel | 54 | ~24ms |
-| Registry | 28 | ~18ms |
-| **Overall** | **573** | **24.4ms** |
+| Registry | 29 | ~18ms |
+| **Overall** | **574** | **24.4ms** |
 
 ---
 
@@ -362,7 +349,7 @@ CORPUS_ADAPTER=tests.mock.mock_graph_adapter:MockGraphAdapter \
   pytest tests/frameworks/graph/ -v
 ```
 
-**Expected output:** `573 passed in ~14s`
+**Expected output:** `574 passed in ~14s`
 
 ### By framework
 
@@ -387,7 +374,7 @@ CORPUS_ADAPTER=tests.mock.mock_graph_adapter:MockGraphAdapter \
 CORPUS_ADAPTER=tests.mock.mock_graph_adapter:MockGraphAdapter \
   pytest tests/frameworks/graph/test_semantickernel_graph_adapter.py -v
 
-# Registry (28 integrity tests)
+# Registry (29 integrity tests)
 CORPUS_ADAPTER=tests.mock.mock_graph_adapter:MockGraphAdapter \
   pytest tests/frameworks/graph/test_graph_registry_self_check.py -v
 ```
@@ -533,12 +520,12 @@ Use this when implementing or validating a new **Graph framework adapter**.
 
 ```text
 ✅ Graph Framework Adapters V1.0 - 100% Conformant
-   573/573 tests passing (10 test files, 5 frameworks)
+   574/574 tests passing (10 test files, 5 frameworks)
 
-   Framework-Specific Tests: 293/293 (100%)
+   Framework-Specific Tests: 294/294 (100%)
    ✅ AutoGen:          55/55  ✅ CrewAI:           45/45
    ✅ LangChain:        53/53  ✅ LlamaIndex:       58/58
-   ✅ Semantic Kernel:  54/54  ✅ Registry:         28/28
+   ✅ Semantic Kernel:  54/54  ✅ Registry:         29/29
 
    Parametrized Contract Tests: 280/280 (100%)
    ✅ Context & Error:       90/90  (18×5 frameworks)
@@ -558,17 +545,18 @@ Use this when implementing or validating a new **Graph framework adapter**.
 
 ## **Graph Framework Adapters Conformance**
 
+
 **Certification Levels:**
-- 🏆 **Platinum:** 573/573 tests (100%) - All frameworks, all tests passing
-- 🥇 **Gold:** 458+ tests (80%+) - Most functionality validated
-- 🥈 **Silver:** 287+ tests (50%+) - Core functionality validated
-- 🔬 **Development:** <50% - Early development, not production-ready
+- 🏆 **Platinum:** 574/574 tests (100%) - All frameworks, all tests passing
+- 🥇 **Gold:** 574/574 tests (100%) - All frameworks, all tests passing
+- 🥈 **Silver:** 460+ tests (80%+) - Core functionality validated
+- 🔬 **Development:** 287+ tests (50%+) - Early development, not production-ready
 
 **Certification Requirements:**
-- **Platinum:** Pass all 573 tests with zero failures
-- **Gold:** Pass ≥458 tests (all parametrized + ≥60% framework-specific)
-- **Silver:** Pass ≥287 tests (all parametrized + ≥10% framework-specific)
-- **Development:** Pass <50% of tests
+- **🏆 Platinum:** Pass all 574 tests with zero failures
+- **🥇 Gold:** Pass all 574 tests with zero failures  
+- **🥈 Silver:** Pass ≥460 tests (80%+)
+- **🔬 Development:** Pass ≥287 tests (50%+)
 
 ---
 
@@ -633,7 +621,7 @@ pytest tests/frameworks/graph/ --collect-only | grep "<Module"
 pytest tests/frameworks/graph/ -v | grep "passed"
 
 # Expected output
-# 573 passed in ~14s
+# 574 passed in ~14s
 ```
 
 ### Performance Benchmarking
@@ -652,9 +640,11 @@ pytest tests/frameworks/graph/ --profile
 
 ---
 
-**Last Updated:** 2026-01-30  
+**Last Updated:** 2026-02-10  
 **Maintained By:** Corpus SDK Team  
 **Status:** 100% V1.0 Conformant - Production Ready - Platinum Certification 🏆  
-**Test Count:** 573/573 tests (100%)  
+**Test Count:** 574/574 tests (100%)  
 **Execution Time:** 13.97s (24.4ms/test average)  
 **Framework Coverage:** 5/5 frameworks (AutoGen, CrewAI, LangChain, LlamaIndex, Semantic Kernel)
+
+---
