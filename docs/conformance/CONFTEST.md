@@ -2,6 +2,25 @@
 
 This `conftest.py` file provides the test configuration and fixtures for the CORPUS Protocol Conformance Framework. It integrates all components of the certification system and enables the unified testing of protocol adapters and frameworks.
 
+## Quick Start
+
+To run the CORPUS conformance tests with the default mock adapter:
+
+```bash
+# Install dependencies (if not already installed)
+pip install pytest pysqlite3-binary
+
+# Run all tests
+pytest tests/ -v
+
+# Test a specific protocol
+pytest tests/llm -v
+
+# Test with your own adapter
+export CORPUS_ADAPTER=my_project.adapters:MyLLMAdapter
+pytest tests/llm -v
+```
+
 ## Overview
 
 The `conftest.py` is a pytest configuration file that:
@@ -40,36 +59,31 @@ except ImportError:
 ```
 
 **Minimum Requirements**:
-- **Python**: 3.8+ (type hints suggest Python 3.8+ compatibility)
+- **Python**: 3.8+ (based on type hints and dataclass usage in the file)
 - **SQLite**: ≥3.35.0 (or `pysqlite3-binary` package)
 - **pytest**: 7.0+ (based on plugin API usage)
 
-**JSON Schema Requirements** (`schema_registry.py`):
+**JSON Schema Requirements** (implied by protocol configurations):
 - **jsonschema**: Draft 2020-12 support required
 - **Schema $id format**: Must be valid URI (http/https/urn/tag)
 
 ### Protocol Version ↔ Test Suite Mapping
-From `wire_cases.py`:
-```python
-# Protocol + schema versioning
-PROTOCOL_VERSION = "1.0"
-SCHEMA_VERSION_SEGMENT = f"v{PROTOCOL_VERSION.split('.')[0]}"  # "v1"
+From protocol configurations in `conftest.py`:
 
-# Note: Schemas are stored WITHOUT version subdirectory
-# e.g., /schemas/llm/llm.envelope.request.json (not /schemas/llm/v1/...)
-```
-
-**Version Mapping**:
-- **Protocol V1.0** → All test suites (`llm`, `vector`, `graph`, `embedding`, frameworks)
-- **Wire Format V1** → `tests/live/` conformance tests
-- **Schema Draft 2020-12** → `tests/schema/` validation tests
+**Protocol Versions Supported**:
+- **LLM Protocol V1.0** → `tests/llm/` and `tests/frameworks/llm/`
+- **Vector Protocol V1.0** → `tests/vector/` and `tests/frameworks/vector/`
+- **Graph Protocol V1.0** → `tests/graph/` and `tests/frameworks/graph/`
+- **Embedding Protocol V1.0** → `tests/embedding/` and `tests/frameworks/embedding/`
+- **Wire Request Suite** → `tests/live/` (tests all wire envelopes)
+- **Schema Conformance Suite** → `tests/schema/` (validates all schemas)
 
 ### Breaking Changes History
 From protocol configurations in `conftest.py`:
-- **All protocols**: Require Draft 2020-12 JSON Schema compliance
-- **Wire envelope**: Must include `op`, `ctx.request_id`, `args` (validated in `wire_validators.py`)
-- **Context fields**: `deadline_ms` must be 1-3,600,000 ms (1 hour)
-- **Schema $id**: Must be unique across all schemas (enforced by `schema_registry.py`)
+- **All protocols**: Require proper wire envelope structure with `op`, `ctx`, `args`
+- **Context fields**: `ctx.deadline_ms` must be integer|null with minimum 0
+- **Schema validation**: All wire envelopes must validate against JSON Schemas
+- **Error handling**: Must follow specific error patterns per protocol
 
 ## Environment Variables
 
@@ -85,8 +99,6 @@ From protocol configurations in `conftest.py`:
 - **`CORPUS_REPORT_JSON`** - Write JSON summary to this path
 - **`CORPUS_REPORT_DIR`** - Write summary.json to this directory
 - **`CORPUS_PLAIN_OUTPUT`** - Disable emoji output for CI environments
-- **`CORPUS_SCHEMAS_ROOT`** - Override schemas directory location
-- **`CORPUS_SCHEMA_BASE_URL`** - Override schema $id base URL
 
 ## Command Line Options
 
@@ -111,28 +123,24 @@ pytest tests/frameworks/embedding -v
 # Test specific components
 pytest tests/live -v  # Wire conformance tests
 pytest tests/schema -v  # Schema validation tests
-pytest tests/golden -v  # Golden sample tests
 
 # Custom adapter via command line
 pytest tests/llm -v --adapter=my_project.adapters:MyLLMAdapter
 
-# Skip schema validation for faster iteration
-pytest tests/live -v --skip-schema
-
-# Verbose output for debugging
-pytest tests/llm -v --conformance-verbose
-
 # Filter by marker
 pytest -m "llm" -v  # Only LLM protocol tests
-pytest -m "vector and not batch" -v  # Vector tests excluding batch operations
-pytest -m "core" -v  # Core operations only
-pytest -m "streaming" -v  # Streaming operations only
+pytest -m "vector" -v  # Only vector protocol tests
+pytest -m "graph" -v  # Only graph protocol tests
+pytest -m "embedding" -v  # Only embedding protocol tests
+pytest -m "wire" -v  # Only wire conformance tests
+pytest -m "schema" -v  # Only schema validation tests
 pytest -m "not slow" -v  # Skip slow tests
+pytest -m "conformance" -v  # All protocol conformance tests
 ```
 
 ## Available Markers
 
-The following pytest markers are defined for filtered test execution:
+The following pytest markers are defined in `conftest.py`:
 
 - **`llm`** - LLM Protocol V1.0 conformance tests
 - **`vector`** - Vector Protocol V1.0 conformance tests  
@@ -144,7 +152,6 @@ The following pytest markers are defined for filtered test execution:
 - **`graph_frameworks`** - Graph framework adapter conformance tests
 - **`wire`** - Wire Request Conformance tests (`tests/live/`)
 - **`schema`** - Schema conformance validation tests
-- **`golden`** - Golden wire message validation tests
 - **`slow`** - Tests that take longer to run (skip with `-m 'not slow'`)
 - **`conformance`** - All protocol conformance tests
 
@@ -170,37 +177,6 @@ def test_llm_completion(adapter):
 3. Instantiates with `CORPUS_ENDPOINT` if provided, otherwise uses no-arg constructor
 4. Provides the same instance to all tests in the session for efficiency
 
-### `test_config` (session-scoped)
-
-Provides the `ConformanceTestConfig` for wire conformance tests:
-
-```python
-def test_wire_validation(test_config):
-    assert test_config.enable_metrics == True
-    assert test_config.skip_schema_validation == False
-```
-
-### `session_metrics` (session-scoped)
-
-Provides `ValidationMetrics` for aggregate reporting:
-
-```python
-def test_metrics_collection(session_metrics):
-    # Metrics are automatically recorded by test_wire_conformance.py
-    assert session_metrics.total_runs > 0
-```
-
-### `case_registry` (session-scoped)
-
-Provides access to the wire request case registry:
-
-```python
-def test_case_coverage(case_registry):
-    cases = case_registry.filter(component="llm")
-    assert len(cases) > 0
-    assert "llm_complete" in case_registry
-```
-
 ## Certification Framework
 
 The plugin automatically provides certification scoring with these tiers:
@@ -216,20 +192,59 @@ The plugin automatically provides certification scoring with these tiers:
 - **Default mode**: Skipped/xfailed tests excluded from denominator
 - **Strict mode** (`CORPUS_STRICT=1`): All collected tests count toward score
 
-### Example Output
+### Example Outputs
+
+**Platinum Certification Success**:
 ```
 ================================================================================
 CORPUS PROTOCOL SUITE - PLATINUM CERTIFIED
 🔌 Adapter: tests.mock.mock_llm_adapter:MockLLMAdapter | CORPUS_ENDPOINT: not set | ⚖️ Strict: off
 
 Protocol & Framework Conformance Status (scored / collected):
-  ✅ PASS LLM Protocol V1.0: Gold (111/111 scored; 120 collected)
-  ✅ PASS Vector Protocol V1.0: Gold (73/73 scored; 80 collected)
-  ✅ PASS Graph Protocol V1.0: Gold (68/68 scored; 75 collected)
-  ✅ PASS Embedding Protocol V1.0: Gold (75/75 scored; 82 collected)
+  ✅ PASS LLM Protocol V1.0: Gold (132/132 scored; 145 collected)
+  ✅ PASS Vector Protocol V1.0: Gold (108/108 scored; 120 collected)
+  ✅ PASS Graph Protocol V1.0: Gold (99/99 scored; 110 collected)
+  ✅ PASS Embedding Protocol V1.0: Gold (135/135 scored; 150 collected)
 
 🎯 Status: Ready for production deployment
 ⏱️ Completed in 42.3s
+```
+
+**Gold Certification (Partial Success)**:
+```
+================================================================================
+CORPUS PROTOCOL SUITE - GOLD CERTIFIED
+🔌 Adapter: tests.mock.mock_llm_adapter:MockLLMAdapter | CORPUS_ENDPOINT: not set | ⚖️ Strict: off
+
+Protocol & Framework Conformance Status (scored / collected):
+  ✅ PASS LLM Protocol V1.0: Gold (132/132 scored; 145 collected)
+  ⚠️ WARN Vector Protocol V1.0: Silver (86/108 scored; 120 collected; 22 to Gold)
+  ⚠️ WARN Graph Protocol V1.0: Development (60/99 scored; 110 collected; 20 to Silver)
+  ✅ PASS Embedding Protocol V1.0: Gold (135/135 scored; 150 collected)
+
+🎯 Focus on protocols below Gold to reach Platinum (100% scored pass).
+ℹ️ Not Platinum because: 22 failed, 1 error, 39 skipped
+⏱️ Completed in 42.3s
+```
+
+**Failure Analysis**:
+```
+================================================================================
+❌ CORPUS PROTOCOL CONFORMANCE ANALYSIS
+🔌 Adapter: tests.mock.mock_llm_adapter:MockLLMAdapter | CORPUS_ENDPOINT: not set | ⚖️ Strict: off
+ℹ️ Not Platinum because: 15 failed, 2 error, 3 xpassed
+
+Found 20 issue(s) across protocols.
+
+--------------------------------------------------
+🟥 FAILURES & ERRORS
+LLM Protocol V1.0:
+  ❌ Failure Wire Contract & Routing: 2 issue(s)
+      Specification: §4.1 Wire-First Canonical Form
+      Test: test_wire_envelope_validation
+      Quick fix: Ensure all wire envelopes include required fields with correct types
+      Detected: Wire envelope missing required fields per §4.1
+...
 ```
 
 ## Writing Tests
@@ -294,84 +309,79 @@ pytest tests/llm -v
 
 ## Getting Unstuck: Common Errors & Solutions
 
+### Troubleshooting Flowchart
+
+```
+Test Failures → Check Certification Output → Identify Protocol → Review Error Guidance
+      ↓                                         ↓                       ↓
+Adapter Issues                           Protocol Issues          Specification Issues
+      ↓                                         ↓                       ↓
+Check CORPUS_ADAPTER                    Check spec sections      Review error patterns
+Check constructor signature             Review test categories   Check examples
+Check endpoint configuration           Validate wire envelopes   See § references
+```
+
 ### 1. **Adapter Instantiation Errors**
 
-**Error Message** (from `conftest.py`):
-```python
-class AdapterValidationError(RuntimeError):
-    pass
-
-# Common instantiation patterns checked:
-# 1. Adapter(endpoint=...)  # CORPUS_ENDPOINT environment variable
-# 2. Adapter(base_url=...)
-# 3. Adapter(url=...)
-# 4. Adapter()  # No-arg constructor
+**Error Messages from `conftest.py`**:
+```
+AdapterValidationError: Failed to instantiate adapter 'module:ClassName' with endpoint.
+AdapterValidationError: Failed to instantiate adapter 'module:ClassName' without arguments.
 ```
 
 **Quick Fixes**:
 ```python
-# If you see: "Failed to instantiate adapter 'module:ClassName'"
-# Check your adapter constructor signature:
+# If using CORPUS_ENDPOINT, ensure your adapter accepts it:
 class MyAdapter:
     def __init__(self, endpoint=None):  # ✓ Accepts endpoint parameter
         pass
     
-    # OR implement no-arg constructor:
+    # OR for no endpoint:
     def __init__(self):  # ✓ No arguments required
         pass
 ```
 
-### 2. **Schema Validation Errors**
+### 2. **Wire Validation Failures**
 
-**Common Patterns** (from `wire_validators.py`):
-```python
-# Error: "Schema validation failed"
-# Usually means envelope doesn't match JSON Schema
+**Common Patterns** (based on protocol configurations):
+- Missing required fields in wire envelope (`op`, `ctx`, `args`)
+- Invalid field types (`deadline_ms` must be integer|null)
+- Schema validation failures against JSON Schema
 
-# Check these common issues:
-# 1. Missing required fields: {"op", "ctx", "args"}
-# 2. Invalid field types: "deadline_ms" must be integer
-# 3. Out of range: "deadline_ms" must be 1-3,600,000
-```
-
-**Debug Mode**:
+**Debug with**:
 ```bash
-# Enable verbose schema errors
-export CORPUS_VERBOSE_FAILURES=1
-pytest tests/live -v
+# See exact validation failure
+pytest tests/live/test_wire_conformance.py::test_wire_request_envelope -v
 
-# Skip schema validation temporarily
-export CORPUS_SKIP_SCHEMA_VALIDATION=1
-pytest tests/live -v
+# Run specific protocol tests
+pytest tests/llm -v --tb=short
 ```
 
 ### 3. **Test Categorization Issues**
 
 **From `conftest.py` categorization logic**:
 ```python
-# Tests appearing under "Other (non-CORPUS conformance tests)"?
-# Directory patterns used for categorization:
+# Tests categorized by directory pattern:
 # - tests/llm/ → "llm" protocol
 # - tests/vector/ → "vector" protocol  
 # - tests/frameworks/llm/ → "llm_frameworks"
 # - tests/live/ → "wire" protocol
+# - tests/schema/ → "schema" protocol
 ```
 
-**Solution**: Place tests in correct directory or update path in test file.
+**Solution**: Place tests in correct directory according to protocol.
 
-### 4. **JSON Schema Loading Errors**
+### 4. **Certification Level Not Reached**
 
-**From `schema_registry.py` error patterns**:
-```python
-# Error: "Schema not found: https://corpusos.com/schemas/llm/..."
-# Solutions:
-# 1. Set CORPUS_SCHEMAS_ROOT environment variable
-# 2. Check schema files exist in schemas/ directory
-# 3. Verify $id matches filename pattern
+**Common Issues**:
+- **Failed tests**: Always block Platinum certification
+- **XPassed tests**: Unexpected passes block certification (stale xfail markers)
+- **Strict mode**: Skipped and xfailed tests also block Platinum when `CORPUS_STRICT=1`
 
-# Error: "Duplicate $id detected"
-# Each schema must have unique $id field
-```
+**Solutions**:
+1. Fix failing tests first
+2. Remove or update xfail markers for xpassed tests
+3. Consider running in non-strict mode during development: `CORPUS_STRICT=0`
 
 ### 5. **Performance Issues**
 
@@ -379,38 +389,107 @@ pytest tests/live -v
 ```
 🔧 Performance: 1423 cache hits, 87 misses (cache size: 256)
 ```
-**Low hit rate?** Enable verbose mode to see categorization patterns.
 
-### 6. **Wire Validation Failures**
+**Low hit rate?** Tests might not be following naming conventions. Check test paths match protocol directories.
 
-**Common error patterns** (from `wire_validators.py`):
+### 6. **Error Guidance References**
+
+Each protocol has detailed error guidance in `conftest.py`:
 ```python
-# ValidationError: 'ctx.request_id' length must be 1-128
-# ValidationError: 'args.messages' must be array
-# ValidationError: Vector dimensions must be 1-65536
+error_guidance={
+    "wire_contract": {
+        "test_wire_envelope_validation": {
+            "error_patterns": {
+                "missing_required_fields": "Wire envelope missing required fields per §4.1",
+                "invalid_field_types": "Field types don't match canonical form requirements",
+            },
+            "quick_fix": "Ensure all wire envelopes include required fields with correct types",
+            "examples": "See §4.1 for wire envelope format and field requirements",
+        }
+    },
+    # ... more guidance per protocol and category
+}
 ```
 
-**Debug with**:
-```bash
-# See exact validation failure
-pytest tests/live/test_wire_conformance.py::test_wire_request_envelope -v
+## CI/CD Integration Examples
 
-# Check specific case
-pytest tests/live/test_wire_conformance.py -k "test_wire_request_envelope[llm_complete]" -v
+### GitHub Actions
+```yaml
+name: CORPUS Conformance Tests
+on: [push, pull_request]
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - name: Install dependencies
+        run: pip install pytest pysqlite3-binary
+      - name: Run conformance tests
+        env:
+          CORPUS_ADAPTER: ${{ secrets.CORPUS_ADAPTER }}
+          CORPUS_STRICT: '1'
+          CORPUS_REPORT_JSON: test-results/summary.json
+        run: pytest tests/ -v --junitxml=test-results/results.xml
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: test-results/
 ```
 
-### 7. **Community Resources Pattern**
+### GitLab CI
+```yaml
+stages:
+  - test
 
-**From codebase organization**:
-- **Issue tracking**: Check test file headers for `# SPDX-License-Identifier: Apache-2.0`
-- **Code references**: Each protocol has spec section mapping in `conftest.py`
-- **Error guidance**: Each test category has `error_guidance` with spec references
+conformance:
+  stage: test
+  image: python:3.10
+  before_script:
+    - pip install pytest pysqlite3-binary
+  script:
+    - export CORPUS_ADAPTER=$CORPUS_ADAPTER
+    - export CORPUS_STRICT=1
+    - export CORPUS_REPORT_JSON=summary.json
+    - pytest tests/ -v --junitxml=report.xml
+  artifacts:
+    paths:
+      - summary.json
+      - report.xml
+    reports:
+      junit: report.xml
+```
 
-**Debug workflow**:
-1. Run with `--conformance-verbose` flag
-2. Check JSON report for protocol-level failures
-3. Review `error_guidance` in `conftest.py` for specific test category
-4. Refer to spec sections listed in terminal output
+### Jenkins Pipeline
+```groovy
+pipeline {
+    agent any
+    environment {
+        CORPUS_ADAPTER = credentials('corpus-adapter')
+        CORPUS_STRICT = '1'
+    }
+    stages {
+        stage('Test') {
+            steps {
+                sh '''
+                    python -m pip install pytest pysqlite3-binary
+                    pytest tests/ -v --junitxml=test-results.xml
+                '''
+            }
+            post {
+                always {
+                    junit 'test-results.xml'
+                    archiveArtifacts 'summary.json'
+                }
+            }
+        }
+    }
+}
+```
 
 ## JSON Report Output
 
@@ -426,11 +505,21 @@ When `CORPUS_REPORT_JSON` or `CORPUS_REPORT_DIR` is set, a JSON summary is writt
   "protocols": {
     "llm": {
       "display_name": "LLM Protocol V1.0",
-      "reference_levels": {"gold": 111, "silver": 89, "development": 56},
-      "outcomes": {"passed": 111, "failed": 0, "error": 0, "skipped": 9, "xfailed": 0, "xpassed": 0},
+      "reference_levels": {"gold": 132, "silver": 106, "development": 66},
+      "outcomes": {"passed": 132, "failed": 0, "error": 0, "skipped": 13, "xfailed": 0, "xpassed": 0},
+      "collected_total": 145,
+      "scored_total": 132,
+      "scored_passed": 132,
+      "level": "Gold",
+      "tests_needed_to_next_level": 0
+    },
+    "vector": {
+      "display_name": "Vector Protocol V1.0",
+      "reference_levels": {"gold": 108, "silver": 87, "development": 54},
+      "outcomes": {"passed": 108, "failed": 0, "error": 0, "skipped": 12, "xfailed": 0, "xpassed": 0},
       "collected_total": 120,
-      "scored_total": 111,
-      "scored_passed": 111,
+      "scored_total": 108,
+      "scored_passed": 108,
       "level": "Gold",
       "tests_needed_to_next_level": 0
     }
@@ -438,7 +527,7 @@ When `CORPUS_REPORT_JSON` or `CORPUS_REPORT_DIR` is set, a JSON summary is writt
   "platinum_certified": true,
   "why_not_platinum": {
     "blocked": false,
-    "totals": {"failed": 0, "error": 0, "skipped": 36, "xfailed": 0, "xpassed": 0},
+    "totals": {"failed": 0, "error": 0, "skipped": 25, "xfailed": 0, "xpassed": 0},
     "strict": false,
     "reasons": []
   }
@@ -454,15 +543,16 @@ When `CORPUS_REPORT_JSON` or `CORPUS_REPORT_DIR` is set, a JSON summary is writt
 5. **Export JSON reports** - For CI/CD integration and compliance tracking
 6. **Use strict mode in CI** - Set `CORPUS_STRICT=1` in production pipelines
 7. **Implement all required methods** - Adapters should implement all `build_*_envelope` methods for their protocol
+8. **Review error guidance** - Check the `error_guidance` section in `conftest.py` for specific test failures
 
 ## Architecture Integration
 
 This `conftest.py` integrates with the complete CORPUS conformance framework:
 
-- **Schema Registry** (`schema_registry.py`) - JSON Schema validation
-- **Wire Validators** (`wire_validators.py`) - Structural and semantic validation
-- **Wire Cases** (`wire_cases.py`) - Canonical test case registry
-- **Conformance Tests** (`test_wire_conformance.py`) - Wire envelope validation
+- **Protocol Registry** - Central configuration for all 11 protocol suites
+- **Test Categorizer** - Automatically categorizes tests by protocol and category
+- **Certification Plugin** - Provides Platinum/Gold/Silver/Development scoring
+- **Adapter System** - Dynamic loading and validation of adapter implementations
 
 Together, they provide a comprehensive certification system for CORPUS Protocol implementations.
 
