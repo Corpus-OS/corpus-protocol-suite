@@ -13,7 +13,7 @@ Reference implementation of the **CORPUS Protocol Suite** — a **wire-first, ve
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Your App / Agents / RAG Pipelines                                   │
-│  (LangChain · LlamaIndex · Semantic Kernel · CrewAI · AutoGen · MCP)│
+│  (LangChain · LlamaIndex · Semantic Kernel · CrewAI · AutoGen · MCP) │
 ├──────────────────────────────────────────────────────────────────────┤
 │  CORPUS Protocol Suite (this SDK)                                    │
 │  One protocol · One error taxonomy · One metrics model               │
