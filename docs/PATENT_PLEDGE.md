@@ -1,8 +1,8 @@
 ## Defensive Patent Pledge 
 
-> **Document Version:** 1.3  
-> **Effective Date:** December 23, 2025  
-> **Last Updated:** January 1, 2026  
+> **Document Version:** 1.0  
+> **Effective Date:** February 10, 2026  
+> **Last Updated:** February 10, 2026  
 > **Company:** Interoperable Intelligence Inc.
 
 To encourage broad adoption and innovation around the Corpus Protocol Suite, **Interoperable Intelligence Inc.** makes the following **protocol-focused defensive patent pledge**.
@@ -65,7 +65,7 @@ The following are **not** covered by this pledge, even if your system uses Corpu
   - Tenant-scoped circuit breakers and state machines
   - Backpressure strategies, queue management, and health monitors
 - **Optional features, optimizations, and extensions**, including:
-  - Extensions beyond the Core specifications in `docs/spec/core/`
+  - Extensions beyond the Core specifications in `docs/spec/`
   - Proprietary orchestration, ensemble optimization, ranking, or scheduling algorithms
   - Transport-level optimizations, caching strategies, and performance tuning that are not strictly required for Core protocol conformance
 - **Any technology where a technically feasible, non-infringing alternative implementation exists** while still complying with the Core protocol specifications
@@ -82,7 +82,7 @@ The following are **not** covered by this pledge, even if your system uses Corpu
 
 To provide additional certainty for protocol implementers:
 
-- Implementation logic **copied from or reasonably derived from** an officially designated **Core wire-level reference implementation** (for example, a `corpus-core-ref` package or repository) that we explicitly mark as such in `docs/spec/core/` or associated documentation,  
+- Implementation logic **copied from or reasonably derived from** an officially designated **Core wire-level reference implementation** (for example, a `corpus-core-ref` package or repository) that we explicitly mark as such in `docs/spec/` or associated documentation,  
 - **and** used solely to implement the **Core Corpus Protocol wire and schema specifications**,  
 
 will be treated as **Covered Activity** under this pledge, to the extent that such logic would otherwise infringe our Essential Protocol Claims.
@@ -90,7 +90,7 @@ will be treated as **Covered Activity** under this pledge, to the extent that su
 This **safe harbor does _not_ extend to**:
 
 - Any routing, orchestration, conformance, cost-normalization, or optimization components, even if they appear in the same repository or codebase; or  
-- Any implementation logic that goes beyond what is necessary to implement the Core wire and schema requirements as defined in `docs/spec/core/`.
+- Any implementation logic that goes beyond what is necessary to implement the Core wire and schema requirements as defined in `docs/spec/`.
 
 ---
 
@@ -100,7 +100,7 @@ This **safe harbor does _not_ extend to**:
 
 Subject to the conditions below, this pledge applies to:
 
-- Individuals and organizations that implement the **Core Corpus Protocol** as specified in `docs/spec/core/` (or successors), and  
+- Individuals and organizations that implement the **Core Corpus Protocol** as specified in `docs/spec/` (or successors), and  
 - Distribute or use those implementations in compliance with an **Apache-2.0–compatible license**, and  
 - Refrain from hostile patent behavior relating to the protocol or its conformant implementers.
 
@@ -188,7 +188,7 @@ This pledge is **binding on Interoperable Intelligence Inc. and its successors a
 For purposes of this pledge:
 
 - **“Implementing”**  
-  Creating software that adheres to the **mandatory** requirements of the **Core Corpus Protocol wire and schema specifications** as published in `docs/spec/core/` and their authorized successors.
+  Creating software that adheres to the **mandatory** requirements of the **Core Corpus Protocol wire and schema specifications** as published in `docs/spec/` and their authorized successors.
 
 - **“Essential Protocol Claims”**  
   Patent claims that are necessarily infringed by **any** conformant implementation of the **Core Corpus Protocol wire and schema specifications**, where **no technically feasible alternative** (as defined below) exists to implement the mandatory Core protocol requirements without infringing.
@@ -209,16 +209,16 @@ For purposes of this pledge:
   - Claims related to protocol implementation and interoperability.
 
 - **“Corpus Protocol specifications”**  
-  The officially designated and versioned documents published by Interoperable Intelligence Inc. in `docs/spec/`, including a clearly identified **Core** subset in `docs/spec/core/`.
+  The officially designated and versioned documents published by Interoperable Intelligence Inc. in `docs/spec/`, including a clearly identified **Core** subset in `docs/spec/`.
 
 - **“Core Corpus Protocol” / “Core specifications”**  
-  The subset of the Corpus Protocol specifications in `docs/spec/core/` that we designate as mandatory for Core wire and schema interoperability, as opposed to optional extensions, experimental drafts, or proprietary/commercial specifications that may appear elsewhere in `docs/spec/`.
+  The subset of the Corpus Protocol specifications in `docs/spec/` that we designate as mandatory for Core wire and schema interoperability, as opposed to optional extensions, experimental drafts, or proprietary/commercial specifications that may appear elsewhere in `docs/spec/`.
 
 - **“Related to protocol implementation”**  
   Patent claims covering protocol interfaces, message formats, wire-level behaviors, and interoperability patterns that are **directly required** for conformant Core Corpus Protocol implementation.
 
 - **“Conformant implementation”**  
-  An implementation that satisfies all **mandatory** Core protocol requirements in `docs/spec/core/`, without requiring optional extensions or proprietary behaviors.
+  An implementation that satisfies all **mandatory** Core protocol requirements in `docs/spec/`, without requiring optional extensions or proprietary behaviors.
 
 - **“Non-Essential Claims”**  
   Patent claims that:
@@ -283,7 +283,7 @@ For heightened certainty, parties may request a **signed patent non-assertion co
 > You build an open-source adapter for a new vector database that implements the `vector/v1` **Core wire specification**, without copying or reimplementing our proprietary router/conformance systems.
 
 > ✅ **Protected — Internal Use**  
-> Your company creates an internal edge service that speaks the Core Corpus Protocol (as defined in `docs/spec/core/`) to talk to upstream systems, but uses your own internal business logic beyond that. The **protocol interoperability layer** is protected.
+> Your company creates an internal edge service that speaks the Core Corpus Protocol (as defined in `docs/spec/`) to talk to upstream systems, but uses your own internal business logic beyond that. The **protocol interoperability layer** is protected.
 
 > ✅ **Protected — Commercial Gateway**  
 > A startup builds a commercial API gateway using the **Core Corpus Protocol** wire messages, while adding its own proprietary authentication, billing, or routing logic. The Core protocol implementation is protected; its proprietary logic is outside the pledge but also outside our Essential Protocol Claims.
@@ -295,7 +295,7 @@ For heightened certainty, parties may request a **signed patent non-assertion co
 > You implement the Core Corpus Protocol **plus** an ensemble routing algorithm that infringes our **orchestration/router patents**. The Core protocol portion is covered; the orchestration technology is **not**.
 
 > ⚠️ **Not Protected — Optional Extension**  
-> You implement an **optional extension** not in `docs/spec/core/`, and it infringes our patent on a particular conformance engine or cost-normalization logic. This pledge does **not** cover that extension.
+> You implement an **optional extension** not in `docs/spec/`, and it infringes our patent on a particular conformance engine or cost-normalization logic. This pledge does **not** cover that extension.
 
 > ⚠️ **Not Protected — Pledge Suspended**  
 > You sue Interoperable Intelligence Inc. for patent infringement, or  
@@ -313,8 +313,8 @@ For heightened certainty, parties may request a **signed patent non-assertion co
 
 For clarification or to request a signed non-assertion covenant, contact:
 
-- Email: `legal@interoperable.ai` or `legal@corpus.io`  
-- Web: `https://corpus.io/patents`
+- Email: `legal@corpusos.com`   
+- Web: `https://corpusos.com`
 
 For questions about whether specific patent claims or implementations are covered by this pledge, please contact our legal team with details of your use case.
 
