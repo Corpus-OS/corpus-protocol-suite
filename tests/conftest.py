@@ -503,7 +503,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "schema": ProtocolConfig(
         name="schema",
         display_name="CORPUS Schema Conformance Suite",
-        conformance_levels={"gold": 199, "silver": 160, "development": 100},
+        conformance_levels={"gold": 210, "silver": 168, "development": 105},
         test_categories={
             "schema_loading": "Schema Loading & IDs",
             "file_organization": "File Organization",

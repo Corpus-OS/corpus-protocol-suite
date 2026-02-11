@@ -53,7 +53,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCHEMAS_DIR = (ROOT / "schemas") if (ROOT / "schemas").exists() else (ROOT / "schema")
 
 # Components we expect under schema(s)/ (SCHEMA.md also defines ndjson union schema)
-COMPONENTS = {"common", "llm", "vector", "embedding", "graph", "ndjson"}
+COMPONENTS = {"common", "llm", "vector", "embedding", "graph"}
 
 
 # --------------------------------------------------------------------------------------

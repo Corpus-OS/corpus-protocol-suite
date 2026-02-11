@@ -3,5 +3,10 @@
   "$id": "https://corpusos.com/schemas/llm/llm.envelope.request.json",
   "title": "LLM Envelope Request (alias)",
   "description": "Alias to common request envelope to keep component-local $refs stable.",
-  "$ref": "https://corpusos.com/schemas/common/envelope.request.json"
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.request.json"
+    }
+  ]
 }
