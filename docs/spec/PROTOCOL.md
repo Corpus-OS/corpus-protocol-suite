@@ -130,6 +130,66 @@ Corpus Protocol → Adapter → Provider API
 - Tenant isolation and security
 - Metrics emission and observability
 
+### 1.6 Cross-Document Schema References
+
+This section documents normative JSON Schema definitions in SCHEMA.md that define wire format constraints for protocol semantics described in this document.
+
+#### 1.6.1 Type Schema Definitions
+
+| Type | PROTOCOLS.md Section | SCHEMA.md Section | Notes |
+|------|---------------------|-------------------|-------|
+| `TokenUsage` | §3.7 | §4.1.3.3 | Includes mathematical invariant constraint |
+| `EmbedSpec` | §18.1 | §4.3.3.2 | Includes stream field validation constraint |
+| `VectorQuerySpec` | §14.3 | §4.2.3.5 | Defines filter expression flexibility |
+| `BatchOp` | §6.3 | §4.4.3.7 | Defines operation naming convention |
+| `OperationContext` | §2.1 | Common schema | Cross-protocol context structure |
+| `Message` | §10.1 | §4.1.3.2 | LLM message and tool call types |
+| `Vector` | §14.1 | §4.2.3.2 | Vector storage and metadata structure |
+| `Node` | §6.1 | §4.4.3.2 | Graph node with properties and labels |
+| `Edge` | §6.2 | §4.4.3.3 | Graph edge with relationship semantics |
+
+#### 1.6.2 Operation Request Schemas
+
+| Operation | PROTOCOLS.md Section | SCHEMA.md Section | Notes |
+|-----------|---------------------|-------------------|-------|
+| `vector.upsert` | §15.4 | §4.2.2.7 | Namespace precedence rule applies |
+| `vector.query` | §15.2 | §4.2.2.3 | Filter expression flexibility |
+| `graph.upsert_nodes` | §7.2 | §4.4.2.7 | Namespace precedence rule applies |
+| `graph.upsert_edges` | §7.3 | §4.4.2.9 | Namespace precedence rule applies |
+| `graph.batch` | §7.9 | §4.4.2.17 | Operation naming convention applies |
+| `graph.transaction` | §7.10 | §4.4.2.23 | Operation naming convention applies |
+| `embedding.embed` | §19.2 | §4.3.2.2 | Stream field validation applies |
+| `llm.complete` | §11.2 | §4.1.2.3 | Token usage invariant in results |
+| `llm.stream` | §11.3 | §4.1.2.5 | Streaming envelope semantics |
+
+#### 1.6.3 Operation Success Schemas
+
+| Operation | PROTOCOLS.md Section | SCHEMA.md Section | Notes |
+|-----------|---------------------|-------------------|-------|
+| `*.capabilities` | Various | §4.x.2.1-2 | Protocol field REQUIRED in all |
+| `*.health` | Various | §4.x.2.y | Schema openness varies by protocol |
+| `llm.complete` | §11.2 | §4.1.2.4 | Token usage invariant enforced |
+| `vector.query` | §15.2 | §4.2.2.4 | VectorMatch includes score and distance |
+| `graph.batch` | §7.9 | §4.4.2.18 | GraphBatchResult structure |
+
+#### 1.6.4 Envelope Schema Definitions
+
+All protocol envelopes (request, success, error, streaming) are normatively defined in SCHEMA.md §3 and §4. PROTOCOLS.md §2.4 describes their usage semantics and wire-level standardization requirements.
+
+**Key References:**
+- Request envelopes: SCHEMA.md §3.1, PROTOCOLS.md §2.4
+- Success envelopes: SCHEMA.md §3.2, PROTOCOLS.md §2.4
+- Error envelopes: SCHEMA.md §3.3, PROTOCOLS.md §2.4
+- Streaming envelopes: SCHEMA.md §3.4, PROTOCOLS.md §2.7
+
+#### 1.6.5 Semantic Constraints Reference
+
+For semantic constraints that cannot be expressed in JSON Schema, see SCHEMA.md §1.4. These include token usage invariants, namespace precedence rules, operation naming conventions, and stream field validation.
+
+#### 1.6.6 Maintenance Note
+
+When defining new protocol operations or types, ensure corresponding schema definitions exist in SCHEMA.md and are referenced in this section. Schema definitions are authoritative for wire format; this document is authoritative for operational semantics.
+
 ## 2. Common Foundation (All Adapters)
 
 ### 2.1 OperationContext
