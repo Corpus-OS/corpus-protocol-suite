@@ -26,7 +26,7 @@ Reference implementation of the **Corpus OS Protocol and SDK** — a **wire-firs
 
 **Keep your frameworks. Standardize your infrastructure.**
 
-> **Open-Core Model**: The Corpus OS Protocol Suite and this SDK are **fully open source** (Apache-2.0). CORPUS Router and official production adapters are **commercial**, optional, and built on the same public protocols. Using this SDK does **not** lock you into CORPUS Router.
+> **Open-Core Model**: The Corpus OS Protocol Suite and SDK are **fully open source** (Apache-2.0). CORPUS Router and official production adapters are **commercial**, optional, and built on the same public protocols. Using this SDK does **not** lock you into CORPUS Router.
 
 ---
 
