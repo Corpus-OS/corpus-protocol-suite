@@ -69,13 +69,13 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 - **Two modes** — compose under your own router (`thin`) or use lightweight built-in infra (`standalone`)
 - **Wire-first design** — canonical JSON envelopes implementable in any language, with this SDK as reference
 
-CORPUS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP. Use those for orchestration, agents, tools, and RAG pipelines. Use CORPUS to standardize the **infrastructure layer underneath them**. Your app teams keep their frameworks. Your platform team gets one protocol, one error taxonomy, and one observability model across everything.
+Corpus OS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, CrewAI, AutoGen, or MCP. Use those for orchestration, agents, tools, and RAG pipelines. Use Corpus OS to standardize the **infrastructure layer underneath them**. Your app teams keep their frameworks. Your platform team gets one protocol, one error taxonomy, and one observability model across everything.
 
 ---
 
 ## How CORPUS Compares
 
-| Aspect | LangChain / LlamaIndex | OpenRouter | MCP | **CORPUS SDK** |
+| Aspect | LangChain / LlamaIndex | OpenRouter | MCP | **Corpus OS** |
 |---|---|---|---|---|
 | **Scope** | Application framework | LLM unification | Tools & data sources | **AI infrastructure protocols** |
 | **Domains** | LLM + Tools | LLM only | Tools + Data | **LLM + Vector + Graph + Embedding** |
@@ -86,18 +86,18 @@ CORPUS is **not** a replacement for LangChain, LlamaIndex, Semantic Kernel, Crew
 
 ### Who is this for?
 
-- **App developers** — Keep using your framework of choice. Talk to all backends through CORPUS protocols. Swap providers without rewriting error handling.
+- **App developers** — Keep using your framework of choice. Talk to all backends through Corpus OS protocols. Swap providers without rewriting error handling.
 - **Framework maintainers** — Implement one CORPUS adapter per protocol. Instantly support any conformant backend.
 - **Backend vendors** — Implement `llm/v1`, `embedding/v1`, `vector/v1`, or `graph/v1` once, run the conformance suite, and your service works with every framework.
 - **Platform / infra teams** — Unified observability: normalized error codes, deadlines, and metrics. One set of dashboards and SLOs across all AI traffic.
-- **MCP users** — The CORPUS MCP server exposes protocols as standard MCP tools. Any MCP client can call into your infra with consistent behavior.
+- **MCP users** — The Corpus OS MCP server exposes protocols as standard MCP tools. Any MCP client can call into your infra with consistent behavior.
 
 ### Integration Patterns
 
 | Pattern | How It Works | What You Get |
 |---|---|---|
-| Framework → CORPUS → Providers | Framework uses CORPUS as client | Unified errors/metrics across providers |
-| CORPUS → Framework-as-adapter → Providers | Framework wrapped as CORPUS adapter | Reuse existing chains/indices as "providers" |
+| Framework → Corpus OS → Providers | Framework uses Corpus OS as client | Unified errors/metrics across providers |
+| Corpus OS → Framework-as-adapter → Providers | Framework wrapped as Corpus OS adapter | Reuse existing chains/indices as "providers" |
 | Mixed | Both of the above | Gradual migration, no big-bang rewrites |
 
 Large teams typically run all three patterns at once.
@@ -106,7 +106,7 @@ Large teams typically run all three patterns at once.
 
 ## When Not to Use CORPUS
 
-You probably don't need CORPUS if:
+You probably don't need Corpus OS if:
 
 - **Single-provider and happy** — One backend, fine with their SDK and breaking changes.
 - **No governance pressure** — No per-tenant isolation, budgets, audit trails, or data residency.
@@ -322,7 +322,7 @@ Full implementations with batch operations, streaming, and multi-cloud scenarios
 - **Protocol vs Base** — Protocols define required behavior. Bases implement validation, deadlines, observability, and error normalization. You implement `_do_*` hooks.
 - **OperationContext** — Carries `request_id`, `idempotency_key`, `deadline_ms`, `traceparent`, `tenant`, and cache hints across all operations.
 - **Wire Protocol** — Canonical envelopes (`op`, `ctx`, `args`) and response shapes (`ok`, `code`, `result`) defined in [`docs/spec/PROTOCOL.md`](docs/spec/PROTOCOL.md).
-- **CORPUS-Compatible** — Implementations that honor the envelopes, reserved `op` strings, and error taxonomy. Validated by the conformance suite.
+- **Corpus OS-Compatible** — Implementations that honor the envelopes, reserved `op` strings, and error taxonomy. Validated by the conformance suite.
 
 ---
 
@@ -505,4 +505,4 @@ Community questions: [GitHub Discussions](https://github.com/corpus/corpus-sdk/d
 
 ---
 
-**Built by the CORPUS team** — wire-level AI infrastructure you integrate once and stop thinking about.
+**Built by the Corpus OS team** — wire-level AI infrastructure you integrate once and stop thinking about.
