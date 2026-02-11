@@ -60,11 +60,12 @@ This suite constitutes the **official Graph Protocol V1.0 Reference Conformance 
 - **Environment:** Python 3.10.19 on Darwin
 - **Strict Mode:** Off (permissive testing)
 
-### Certification Levels
-- 🏆 **Platinum:** 99/99 tests (100%) with comprehensive coverage
-- 🥇 **Gold:** 79+ tests (80%+ coverage)
-- 🥈 **Silver:** 59+ tests (60%+ coverage)
-- 🔬 **Development:** 49+ tests (50%+ coverage)
+## **Graph Protocol Certification**
+
+- 🏆 **Platinum:** 99/99 tests (100% comprehensive conformance)
+- 🥇 **Gold:** 99 tests (100% protocol mastery)
+- 🥈 **Silver:** 80+ tests (80%+ integration-ready)
+- 🔬 **Development:** 50+ tests (50%+ early development)
 
 ---
 
