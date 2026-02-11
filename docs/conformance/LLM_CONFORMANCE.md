@@ -19,7 +19,7 @@ This suite constitutes the **official LLM Protocol V1.0 Reference Conformance Te
 
 **Protocol Version:** LLM Protocol V1.0  
 **Status:** Stable / Production-Ready  
-**Last Updated:** 2026-01-19  
+**Last Updated:** 2026-02-10  
 **Test Location:** `tests/llm/`  
 **Performance:** 3.96s total (30ms/test average)
 
@@ -662,7 +662,7 @@ Specification Coverage: 100% of §8 requirements
 Test Files: 11 comprehensive modules
 ```
 
-**Last Updated:** 2026-01-19  
+**Last Updated:** 2026-02-10  
 **Maintained By:** Corpus SDK Team  
 **Test Suite:** `tests/llm/` (11 test files)  
 **Specification Version:** V1.0.0 §8  
