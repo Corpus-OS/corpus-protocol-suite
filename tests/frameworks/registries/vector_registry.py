@@ -424,7 +424,7 @@ VECTOR_FRAMEWORKS: Dict[str, VectorFrameworkDescriptor] = {
     # ------------------------------------------------------------------ #
     "semantic_kernel": VectorFrameworkDescriptor(
         name="semantic_kernel",
-        adapter_module="corpus_sdk.vector.framework_adapters.semanctic_kernel",
+        adapter_module="corpus_sdk.vector.framework_adapters.semantic_kernel",
         adapter_class="CorpusSemanticKernelVectorClient",
         adapter_init_kwarg="adapter",
         capabilities_method="capabilities",
