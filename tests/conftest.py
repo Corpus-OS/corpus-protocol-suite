@@ -583,67 +583,6 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
             },
         },
     ),
-    "golden": ProtocolConfig(
-        name="golden",
-        display_name="CORPUS Golden Wire Suite",
-        conformance_levels={"gold": 199, "silver": 160, "development": 100},
-        test_categories={
-            "core_validation": "Core Schema Validation",
-            "ndjson_stream": "NDJSON Stream Validation",
-            "cross_invariants": "Cross-Schema Invariants",
-            "version_format": "Schema Version & Format",
-            "drift_detection": "Drift Detection",
-            "performance_reliability": "Performance & Reliability",
-            "component_coverage": "Component Coverage",
-        },
-        spec_sections={
-            "core_validation": "Golden Samples Suite - Core Schema Validation",
-            "ndjson_stream": "Golden Samples Suite - NDJSON Stream Validation",
-            "cross_invariants": "Golden Samples Suite - Cross-Schema Invariants",
-            "version_format": "Schema Version & Format",
-            "drift_detection": "Golden Samples Suite - Drift Detection",
-            "performance_reliability": "Golden Samples Suite - Performance & Reliability",
-            "component_coverage": "Golden Samples Suite - Component Coverage",
-        },
-        error_guidance={
-            "core_validation": {
-                "test_golden_validates": {
-                    "error_patterns": {
-                        "schema_validation_failed": "Golden sample does not validate against its declared schema",
-                        "missing_schema_reference": "Golden file missing $schema reference",
-                    },
-                    "quick_fix": "Update golden sample to match schema or fix schema definition",
-                    "examples": "See SCHEMA_CONFORMANCE.md - Golden Samples Suite section",
-                }
-            },
-            "ndjson_stream": {
-                "test_llm_stream_ndjson_union_validates": {
-                    "error_patterns": {
-                        "invalid_frame_sequence": "Stream frames violate terminal condition rules",
-                        "missing_terminal_frame": (
-                            "Stream missing required terminal condition (final chunk with is_final=true "
-                            "or an error envelope)"
-                        ),
-                    },
-                    "quick_fix": (
-                        "Ensure streams have exactly one terminal condition (final chunk with is_final:true OR "
-                        "an error envelope) and no frames after the terminal condition."
-                    ),
-                    "examples": "See SCHEMA_CONFORMANCE.md - NDJSON Stream Validation",
-                }
-            },
-            "cross_invariants": {
-                "test_partial_success_math": {
-                    "error_patterns": {
-                        "count_mismatch": "successes + failures ≠ total items in partial success",
-                        "invalid_indexing": "Failure indices out of bounds",
-                    },
-                    "quick_fix": "Ensure partial success counts are mathematically consistent",
-                    "examples": "See SCHEMA_CONFORMANCE.md - Cross-Schema Invariants",
-                }
-            },
-        },
-    ),
     "embedding_frameworks": ProtocolConfig(
         name="embedding_frameworks",
         display_name="Embedding Framework Adapters V1.0",
@@ -1092,7 +1031,6 @@ class TestCategorizer:
             "graph": r"tests[\\/]graph[\\/]",
             "embedding": r"tests[\\/]embedding[\\/]",
             "schema": r"tests[\\/]schema[\\/]",
-            "golden": r"tests[\\/]golden[\\/]",
             "llm_frameworks": r"tests[\\/]frameworks[\\/]llm[\\/]",
             "vector_frameworks": r"tests[\\/]frameworks[\\/]vector[\\/]",
             "embedding_frameworks": r"tests[\\/]frameworks[\\/]embedding[\\/]",
@@ -1791,7 +1729,6 @@ def pytest_configure(config: pytest.Config) -> None:
         "graph_frameworks: Graph framework adapter conformance tests",
         "wire: Wire Request Conformance tests (tests/live)",
         "schema: Schema conformance validation tests",
-        "golden: Golden wire message validation tests",
         "slow: Tests that take longer to run (skip with -m 'not slow')",
         "conformance: All protocol conformance tests",
     ]
