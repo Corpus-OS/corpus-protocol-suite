@@ -56,7 +56,7 @@ Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. 
 **The problem:**
 
 - **Provider proliferation** — Dozens of incompatible APIs across AI infrastructure
-- **Duplicate integration** — Same error handling, observability, and resilience patterns rewritten per provider
+- **Duplicate integration** — Different error handling, observability, and resilience patterns rewritten per provider
 - **Vendor lock-in** — Applications tightly coupled to specific backend choices
 - **Operational complexity** — Inconsistent monitoring and debugging across services
 
