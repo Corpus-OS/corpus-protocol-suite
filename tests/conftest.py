@@ -872,7 +872,6 @@ PROTOCOLS: List[str] = [
     "graph_frameworks",
     "wire",
     "schema",
-    "golden",
 ]
 CONFIG_PROTOCOLS = set(PROTOCOLS_CONFIG.keys())
 if CONFIG_PROTOCOLS != set(PROTOCOLS):
