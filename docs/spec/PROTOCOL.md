@@ -2,6 +2,14 @@
  
 **protocols_version:** `1.0`  
 
+> This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
+
+> **Document Precedence:** When PROTOCOLS.md and SPECIFICATION.md disagree on **wire format or field names**, PROTOCOLS.md is authoritative. SPECIFICATION.md is descriptive and may contain language-specific reference bindings. If SCHEMA.md and PROTOCOLS.md ever disagree on a JSON field name or type, SCHEMA.md is authoritative and PROTOCOLS.md MUST be updated to match.
+
+> **Normative Source:** SCHEMA.md is the normative source of truth for JSON wire format shapes and validation. This document (PROTOCOLS.md) defines operational semantics, behavioral requirements, and implementation guidelines. Schema validation ensures wire format compliance, while this document defines how adapters should behave.
+
+> **Type Definition Convention:** Type definitions use a TypeScript-like pseudo-notation as descriptive IDL documentation for JSON structures. These are informational references; SCHEMA.md contains the normative JSON Schema definitions. Python, Go, etc. bindings are reference implementations.
+
 **Table of Contents**
 - [0. Document Metadata](#0-document-metadata)
 - [1. Introduction](#1-introduction)
@@ -47,14 +55,6 @@ Copyright © 2026 Interoperable Intelligence Inc.
 SPDX-License-Identifier: Apache-2.0
 
 ---
-
-> This document defines the unified protocol specification for all Corpus adapters. It establishes the normative behavior, types, and semantics for Graph, LLM, Vector, and Embedding protocols while maintaining cross-protocol consistency.
-
-> **Document Precedence:** When PROTOCOLS.md and SPECIFICATION.md disagree on **wire format or field names**, PROTOCOLS.md is authoritative. SPECIFICATION.md is descriptive and may contain language-specific reference bindings. If SCHEMA.md and PROTOCOLS.md ever disagree on a JSON field name or type, SCHEMA.md is authoritative and PROTOCOLS.md MUST be updated to match.
-
-> **Normative Source:** SCHEMA.md is the normative source of truth for JSON wire format shapes and validation. This document (PROTOCOLS.md) defines operational semantics, behavioral requirements, and implementation guidelines. Schema validation ensures wire format compliance, while this document defines how adapters should behave.
-
-> **Type Definition Convention:** Type definitions use a TypeScript-like pseudo-notation as descriptive IDL documentation for JSON structures. These are informational references; SCHEMA.md contains the normative JSON Schema definitions. Python, Go, etc. bindings are reference implementations.
 
 ## 0. Document Metadata
 
