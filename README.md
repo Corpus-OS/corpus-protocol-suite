@@ -8,7 +8,7 @@
 ![Graph Protocol](https://img.shields.io/badge/Graph%20Protocol-100%25%20Conformant-brightgreen)
 ![Embedding Protocol](https://img.shields.io/badge/Embedding%20Protocol-100%25%20Conformant-brightgreen)
 
-Reference implementation of the **Corpus OS Protocol Suite** — a **wire-first, vendor-neutral** SDK for interoperable AI frameworks and data backends across four domains: **LLM**, **Embedding**, **Vector**, and **Graph**.
+Reference implementation of the **Corpus OS Protocol and SDK** — a **wire-first, vendor-neutral** SDK for interoperable AI frameworks and data backends across four domains: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
