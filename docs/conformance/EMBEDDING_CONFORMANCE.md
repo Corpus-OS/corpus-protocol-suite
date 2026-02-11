@@ -60,11 +60,12 @@ This suite constitutes the **official Embedding Protocol V1.0 Reference Conforma
 - **Environment:** Python 3.10.19 on Darwin
 - **Strict Mode:** Off (permissive testing)
 
-### Certification Levels
-- 🏆 **Platinum:** 135/135 tests (100%) with comprehensive coverage
-- 🥇 **Gold:** 108+ tests (80%+ coverage)
-- 🥈 **Silver:** 81+ tests (60%+ coverage)
-- 🔬 **Development:** 67+ tests (50%+ coverage)
+## **Embedding Protocol Certification**
+
+- 🏆 **Platinum:** 135/135 tests (100% comprehensive conformance)
+- 🥇 **Gold:** 135 tests (100% protocol mastery)
+- 🥈 **Silver:** 108+ tests (80%+ integration-ready)
+- 🔬 **Development:** 68+ tests (50%+ early development)
 
 ---
 
