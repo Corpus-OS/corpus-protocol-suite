@@ -1,7 +1,7 @@
 # CORPUS SCHEMA GUIDE
 
 **schema_version:** `1.0.0`  
-**protocols_version:** `1.0`  
+**protocols_version:** `1.0.0`  
 **json_schema_draft:** `2020-12`
 
 > This document defines the schema architecture for the Corpus Protocol Suite. It establishes the normative JSON Schema definitions for all protocol operations, types, and wire formats while maintaining cross-protocol consistency and validation guarantees.
