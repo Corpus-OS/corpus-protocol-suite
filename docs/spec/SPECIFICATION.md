@@ -1454,7 +1454,7 @@ A `TransactionCoordinator` MAY provide best-effort multi-component workflows wit
 
 For non-atomic batch operations (e.g. `embed_batch`, vector `upsert`, graph `batch`):
 
-** Keep `code: "OK"` and encode partial vs full success inside result only (matching the existing BatchResult convention in PROTOCOLS.md).
+Keep `code: "OK"` and encode partial vs full success inside result only (matching the existing BatchResult convention in PROTOCOLS.md).
 
 > **Note:** Batch result field names vary by protocol (see PROTOCOLS.md §27.2):
 > - Embedding: `embeddings`, `total_texts`, `failed_texts`
