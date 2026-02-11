@@ -523,7 +523,7 @@ interface GraphCapabilities {
   version: string;                // REQUIRED
 
   // Schema-required:
-  protocol: "graph/v1.0";        //// REQUIRED (const)
+  protocol: "graph/v1.0";        // REQUIRED (const)
 
   supports_stream_query?: boolean;
   supported_query_dialects?: string[];
@@ -3672,9 +3672,9 @@ adapter = BaseLLMAdapter(mode="standalone")
 - **Embedding Types:** EmbedSpec, EmbedBatchSpec, EmbedResult, EmbeddingVector, EmbedBatchResult, EmbedChunk, EmbeddingStats, EmbeddingHealthStatus
 
 ### 30.3 Capabilities Index
-- **Graph Capabilities:** protocol (recommended), server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, supports_transaction, supports_traversal, supports_path_queries, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_traversal_depth
-- **LLM Capabilities:** protocol (recommended), server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_tools, supports_parallel_tool_calls, supports_tool_choice, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tool_calls_per_turn
-- **Vector Capabilities:** protocol (recommended), server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, supports_batch_queries, max_batch_size, max_top_k, max_filter_terms, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, text_storage_strategy, max_text_length
+- **Graph Capabilities:** protocol (REQUIRED), server, version, supported_query_dialects, supports_stream_query, supports_bulk_vertices, supports_batch, supports_schema, supports_transaction, supports_traversal, supports_path_queries, idempotent_writes, supports_deadline, supports_namespaces, supports_property_filters, supports_multi_tenant, max_batch_ops, max_traversal_depth
+- **LLM Capabilities:** protocol (REQUIRED), server, version, model_family, supported_models, max_context_length, supports_streaming, supports_roles, supports_system_message, supports_json_output, supports_tools, supports_parallel_tool_calls, supports_tool_choice, supports_deadline, supports_count_tokens, idempotent_writes, supports_multi_tenant, max_tool_calls_per_turn
+- **Vector Capabilities:** protocol (REQUIRED), server, version, max_dimensions, supported_metrics, supports_namespaces, supports_metadata_filtering, supports_batch_operations, supports_batch_queries, max_batch_size, max_top_k, max_filter_terms, supports_index_management, supports_deadline, idempotent_writes, supports_multi_tenant, text_storage_strategy, max_text_length
 - **Embedding Capabilities:** protocol (REQUIRED), server, version, supported_models, max_batch_size, max_text_length, max_dimensions, supports_normalization, supports_truncation, supports_token_counting, supports_streaming, supports_batch_embedding, supports_caching, supports_multi_tenant, supports_deadline, normalizes_at_source, idempotent_writes, truncation_mode
 
 ### 30.4 Error Codes Index
