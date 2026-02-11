@@ -1,10 +1,10 @@
 {
   "adapter": {
     "endpoint_set": false,
-    "spec": "tests.mock.mock_wire_adapter:WireAdapter"
+    "spec": "tests.mock.mock_llm_adapter:MockLLMAdapter"
   },
-  "duration_s": 0.4989502429962158,
-  "generated_at_epoch_s": 1770772157,
+  "duration_s": 2.223464250564575,
+  "generated_at_epoch_s": 1770778091,
   "platinum_certified": true,
   "policy": {
     "max_failures": null,
@@ -24,9 +24,9 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 38,
-        "gold": 75,
-        "silver": 60
+        "development": 68,
+        "gold": 135,
+        "silver": 108
       },
       "scored_passed": 0,
       "scored_total": 0,
@@ -45,30 +45,9 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 60,
-        "gold": 121,
-        "silver": 97
-      },
-      "scored_passed": 0,
-      "scored_total": 0,
-      "tests_needed_to_next_level": 0
-    },
-    "golden": {
-      "collected_total": 0,
-      "display_name": "CORPUS Golden Wire Suite",
-      "level": "No Tests Scored",
-      "outcomes": {
-        "error": 0,
-        "failed": 0,
-        "passed": 0,
-        "skipped": 0,
-        "xfailed": 0,
-        "xpassed": 0
-      },
-      "reference_levels": {
-        "development": 39,
-        "gold": 78,
-        "silver": 62
+        "development": 209,
+        "gold": 418,
+        "silver": 335
       },
       "scored_passed": 0,
       "scored_total": 0,
@@ -87,9 +66,9 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 34,
-        "gold": 68,
-        "silver": 54
+        "development": 50,
+        "gold": 99,
+        "silver": 80
       },
       "scored_passed": 0,
       "scored_total": 0,
@@ -108,9 +87,9 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 92,
-        "gold": 184,
-        "silver": 147
+        "development": 287,
+        "gold": 574,
+        "silver": 460
       },
       "scored_passed": 0,
       "scored_total": 0,
@@ -129,9 +108,9 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 56,
-        "gold": 111,
-        "silver": 89
+        "development": 66,
+        "gold": 132,
+        "silver": 106
       },
       "scored_passed": 0,
       "scored_total": 0,
@@ -150,33 +129,33 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 75,
-        "gold": 150,
-        "silver": 120
+        "development": 312,
+        "gold": 624,
+        "silver": 500
       },
       "scored_passed": 0,
       "scored_total": 0,
       "tests_needed_to_next_level": 0
     },
     "schema": {
-      "collected_total": 0,
+      "collected_total": 210,
       "display_name": "CORPUS Schema Conformance Suite",
-      "level": "No Tests Scored",
+      "level": "Gold",
       "outcomes": {
         "error": 0,
         "failed": 0,
-        "passed": 0,
+        "passed": 210,
         "skipped": 0,
         "xfailed": 0,
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 7,
-        "gold": 13,
-        "silver": 10
+        "development": 105,
+        "gold": 210,
+        "silver": 168
       },
-      "scored_passed": 0,
-      "scored_total": 0,
+      "scored_passed": 210,
+      "scored_total": 210,
       "tests_needed_to_next_level": 0
     },
     "vector": {
@@ -192,9 +171,9 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 36,
-        "gold": 73,
-        "silver": 58
+        "development": 54,
+        "gold": 108,
+        "silver": 87
       },
       "scored_passed": 0,
       "scored_total": 0,
@@ -213,33 +192,33 @@
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 65,
-        "gold": 130,
-        "silver": 104
+        "development": 479,
+        "gold": 958,
+        "silver": 767
       },
       "scored_passed": 0,
       "scored_total": 0,
       "tests_needed_to_next_level": 0
     },
     "wire": {
-      "collected_total": 76,
+      "collected_total": 0,
       "display_name": "Wire Request Conformance Suite",
-      "level": "Gold",
+      "level": "No Tests Scored",
       "outcomes": {
         "error": 0,
         "failed": 0,
-        "passed": 76,
+        "passed": 0,
         "skipped": 0,
         "xfailed": 0,
         "xpassed": 0
       },
       "reference_levels": {
-        "development": 37,
-        "gold": 73,
-        "silver": 58
+        "development": 38,
+        "gold": 76,
+        "silver": 61
       },
-      "scored_passed": 76,
-      "scored_total": 76,
+      "scored_passed": 0,
+      "scored_total": 0,
       "tests_needed_to_next_level": 0
     }
   },

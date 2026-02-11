@@ -32,8 +32,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-import corpus_sdk.vector.framework_adapters.semanctic_kernel as sk_adapter_module
-from corpus_sdk.vector.framework_adapters.semanctic_kernel import (
+import corpus_sdk.vector.framework_adapters.semantic_kernel as sk_adapter_module
+from corpus_sdk.vector.framework_adapters.semantic_kernel import (
     CorpusSemanticKernelVectorPlugin,
     CorpusSemanticKernelVectorStore,
 )

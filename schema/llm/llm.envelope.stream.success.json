@@ -3,5 +3,10 @@
   "$id": "https://corpusos.com/schemas/llm/llm.envelope.stream.success.json",
   "title": "LLM Envelope Stream Success (alias)",
   "description": "Alias to common streaming success envelope to keep component-local $refs stable.",
-  "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json"
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json"
+    }
+  ]
 }
