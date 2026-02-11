@@ -21,9 +21,12 @@ SPDX-License-Identifier: Apache-2.0
 
 ## Table of Contents
 - [1. Introduction](#1-introduction)
-  - [1.1 Purpose and Scope](#11-purpose-and-scope)
-  - [1.2 Document Relationships](#12-document-relationships)
-  - [1.3 Schema Philosophy](#13-schema-philosophy)
+  - [1.1 Purpose of the Protocols](#11-purpose-of-the-protocols)
+  - [1.2 Adapter Model Overview](#12-adapter-model-overview)
+  - [1.3 Core Guarantees](#13-core-guarantees)
+  - [1.4 Supported Transports](#14-supported-transports)
+  - [1.5 High-Level Responsibilities of an Adapter](#15-high-level-responsibilities-of-an-adapter)
+  - [1.6 Cross-Document Schema References](#16-cross-document-schema-references)
 - [2. Schema Architecture](#2-schema-architecture)
   - [2.1 Directory Structure](#21-directory-structure)
   - [2.2 Schema Organization Principles](#22-schema-organization-principles)
@@ -141,6 +144,41 @@ Extensibility is **prohibited for outputs/contracts** unless explicitly stated:
 - **Golden tests** - Example-based validation as executable documentation
 - **Schema lint test** - Automated validation that data structures conform to defined rules and constraints
 - **Conformance tests** - Production adapter validation in CI/CD
+
+### 1.4 Cross-Document Semantic Constraints
+
+This section documents semantic constraints defined in PROTOCOLS.md that cannot be enforced by JSON Schema alone. These are normative requirements that implementations MUST satisfy but which fall outside the scope of structural validation.
+
+#### 1.4.1 Token Usage Invariant
+**Schema Location:** §4.1.3.3 (TokenUsage)  
+**Semantic Constraint:** `total_tokens = prompt_tokens + completion_tokens`  
+**Authority:** PROTOCOLS.md §3.7  
+**Validation:** Enforced at runtime; verified in conformance tests
+
+#### 1.4.2 Embedding Stream Field Validation
+**Schema Location:** §4.3.3.2 (EmbedSpec)  
+**Semantic Constraint:** When `stream` field is present, it MUST be `false`. Setting `stream: true` is invalid for `embedding.embed` operation; streaming uses the separate `embedding.stream_embed` operation.  
+**Authority:** PROTOCOLS.md §18.1, §19.2  
+**Validation:** Adapters MUST reject `stream: true` with `BAD_REQUEST` error
+
+#### 1.4.3 Namespace Precedence Rules
+**Schema Locations:**
+- §4.2.2.7 (Vector Upsert Request)
+- §4.4.2.7 (Graph Upsert Nodes Request)  
+- §4.4.2.9 (Graph Upsert Edges Request)
+
+**Semantic Constraint:** When both `args.namespace` and per-item namespace fields (e.g., `Vector.namespace`, `Node.namespace`, `Edge.namespace`) are present, the per-item namespace takes precedence. This enables mixed-namespace operations within a single request.  
+**Authority:** PROTOCOLS.md §7.2, §7.3, §15.4
+
+#### 1.4.4 Graph Batch Operation Naming Convention
+**Schema Location:** §4.4.3.7 (BatchOp)  
+**Semantic Constraint:** The `op` field in batch and transaction operations MUST use fully-qualified operation names. Valid examples include `"graph.upsert_nodes"` and `"graph.delete_edges"`. Invalid examples include `"upsert_nodes"` and `"delete_edges"`.  
+**Authority:** PROTOCOLS.md §8.4  
+**Rationale:** Prevents ambiguity in batch contexts and enables clear operation routing  
+**Schema Enforcement:** Schema validates string structure (`minLength: 1`); naming convention is enforced semantically
+
+#### 1.4.5 Maintenance Note
+This section is authoritative for the list of semantic constraints. When adding new constraints that cannot be expressed in JSON Schema, add them here with schema location reference, clear constraint description, PROTOCOLS.md authority section, and validation approach.
 
 ---
 
