@@ -2176,7 +2176,7 @@ Implementations claiming Corpus-compatible status SHOULD:
 
 Coverage:
 
-* 400+ conformance tests
+* 3,000+ conformance tests
 * Cross-protocol flows
 * Error normalization and partial-failure handling
 * Streaming semantics verification
