@@ -1,6 +1,6 @@
 # CORPUS SPECIFICATION
 
-**specification_version:** `1.0.0`   
+**specification_version:** `1.0.1`   
 
 ## Abstract
 
@@ -218,7 +218,7 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "S
 * Examples are **non-normative** unless explicitly marked **(Normative)**.
 * Field names use **lower_snake_case** unless specified.
 * Error `code` values use `UPPER_SNAKE_CASE`.
-* `tenant_hash` denotes a deterministic, irreversible hash of the tenant identifier.
+* `tenant_hash` denotes a deterministic, irreversible hash of the tenant identifier (recommended: SHA-256 with per-deployment salt).
 * Unless otherwise stated, scores are **higher is better** when represented as scores.
 * Numeric fields MUST respect type/range constraints defined in relevant sections.
 
@@ -230,6 +230,8 @@ Unless otherwise specified:
 * Float fields are IEEE-754 double precision.
 * All durations are non-negative integers in milliseconds.
 * Implementations MUST reject NaN, +Inf, −Inf, and out-of-range numeric values with `BadRequest`.
+
+**Note:** SCHEMA.md uses JSON Schema `integer` and `number` types without explicit bit-width; these specifications provide recommended implementations.
 
 ### 4.1. Relationship to SCHEMA.md and PROTOCOLS.md (Normative)
 
@@ -324,7 +326,7 @@ Rules:
 * `ok` MUST be `true`.
 * `code` MUST be `"STREAMING"` for all streaming success frames.
 * `ms` MUST be a non-negative number representing time elapsed in milliseconds (as defined in SCHEMA.md).
-* `chunk` MUST be an operation-specific payload validated by the operation’s streaming chunk schema (e.g., `llm.types.chunk`, `graph.types.chunk`, `embedding.types.chunk`).
+* `chunk` MUST be an operation-specific payload validated by the operation's streaming chunk schema (e.g., `llm.types.chunk`, `graph.types.chunk`, `embedding.types.chunk`).
 * Streaming success frames are **closed objects** at the top level: adapters MUST NOT include top-level keys beyond `{ "ok", "code", "ms", "chunk" }` (enforced by SCHEMA.md).
 
 ### 4.2.3.2 Terminal Conditions (MUST)
@@ -445,6 +447,8 @@ The following values of `op` are reserved for V1.0:
 | batch | graph.batch | Graph | Execute multiple operations in batch |
 | get_schema | graph.get_schema | Graph | Retrieve graph schema information |
 | health | graph.health | Graph | Check adapter and provider health status |
+| **transaction** | **graph.transaction** | **Graph** | **Execute operations in an atomic transaction** |
+| **traversal** | **graph.traversal** | **Graph** | **Traverse graph relationships from starting nodes** |
 | capabilities | llm.capabilities | LLM | Discover supported LLM features and models |
 | complete | llm.complete | LLM | Generate LLM completion for given messages |
 | stream | llm.stream | LLM | Stream LLM completion incrementally |
@@ -452,6 +456,7 @@ The following values of `op` are reserved for V1.0:
 | health | llm.health | LLM | Check LLM provider health and model availability |
 | capabilities | vector.capabilities | Vector | Discover supported vector features and limits |
 | query | vector.query | Vector | Find similar vectors using approximate nearest neighbor search |
+| **batch_query** | **vector.batch_query** | **Vector** | **Execute multiple vector queries in batch** |
 | upsert | vector.upsert | Vector | Insert or update vectors in a namespace |
 | delete | vector.delete | Vector | Remove vectors by ID |
 | create_namespace | vector.create_namespace | Vector | Create a new vector namespace/collection |
@@ -460,7 +465,9 @@ The following values of `op` are reserved for V1.0:
 | capabilities | embedding.capabilities | Embedding | Discover supported embedding features and models |
 | embed | embedding.embed | Embedding | Generate embedding vector for a single text |
 | embed_batch | embedding.embed_batch | Embedding | Generate embeddings for multiple texts in batch |
+| **stream_embed** | **embedding.stream_embed** | **Embedding** | **Stream embeddings incrementally for a single text** |
 | count_tokens | embedding.count_tokens | Embedding | Count tokens in text for embedding model |
+| **get_stats** | **embedding.get_stats** | **Embedding** | **Retrieve embedding service statistics and usage metrics** |
 | health | embedding.health | Embedding | Check embedding provider health and model status |
 
 **Note:** Filter-based deletion operations (e.g., delete by metadata filter) MAY be supported via extensions (e.g., `graph.delete_nodes_by_filter`, `vector.delete_by_filter`).
@@ -541,9 +548,12 @@ class OperationContext:
     tenant: Optional[str] = None       # never logged raw
     attrs: Optional[Mapping[str, Any]] = None
 
+    # SDK-level cache hints (MAY be passed in attrs at wire level)
     cache_scope: Optional[str] = None        # "tenant" | "global" | "session"; default "tenant"
     cache_tags: Optional[List[str]] = None   # advisory tags for cache keying/invalidation
 ```
+
+**Note:** `cache_scope` and `cache_tags` are advisory SDK-level fields. At the wire level, they MAY be passed in `ctx.attrs` per PROTOCOLS.md §6.1.
 
 **Normative behavior:**
 
@@ -592,7 +602,7 @@ Cache coordination fields are advisory to enable:
 {
   "server": "example-backend",
   "version": "5.17.1",
-  "protocol": "graph/v1.0",
+  "protocol": "graph/v1.0",  // REQUIRED field
   "features": {
     "dialects": ["cypher", "opencypher"],
     "supports_txn": true,
@@ -618,6 +628,8 @@ Cache coordination fields are advisory to enable:
   }
 }
 ```
+
+**Note:** The `protocol` field is REQUIRED in all `*Capabilities` results per PROTOCOLS.md §2.12 and SCHEMA.md capability schemas.
 
 Rules:
 
@@ -731,6 +743,8 @@ class GraphCapabilities:
 
 #### 7.3.1. Node/Edge CRUD
 
+> **Note:** The Python signatures shown here are illustrative SDK-level representations. The **canonical wire format** is defined in PROTOCOLS.md §7 and SCHEMA.md §4.4, which includes additional fields such as `labels`, `namespace`, `created_at`, and `updated_at`.
+
 ```python
 async def upsert_nodes(
     nodes: Iterable[Tuple[str, Mapping[str, Any]]],
@@ -793,11 +807,11 @@ Rules:
 
 When exposed over the wire:
 
-1. Emit zero or more `{"event":"data","data":{...}}` frames.
+1. Emit zero or more `{"ok": true, "code": "STREAMING", "ms": ..., "chunk": {...}}` frames.
 2. Emit exactly one terminal frame:
 
-   * `{"event":"end","code":"OK"}` on success, or
-   * `{"event":"error",...}` on failure.
+   * A frame with `chunk.is_final: true` on success, or
+   * An error envelope on failure.
 
 As async iterator:
 
@@ -1162,6 +1176,12 @@ Vendor-neutral interface for generating embeddings (single/batch), counting toke
 
 The Python dataclasses in this section describe SDK-level representations of embedding types. The **canonical JSON wire shapes** are defined in SCHEMA.md and reflected in the JSON examples. Where there is any discrepancy, SCHEMA.md is authoritative.
 
+> **Note:** The types shown here are SDK-level representations. PROTOCOLS.md uses distinct types for single vs batch operations:
+> - `EmbedResult` (singular `embedding`) for `embedding.embed`
+> - `EmbedBatchResult` (plural `embeddings`) for `embedding.embed_batch`
+> 
+> See PROTOCOLS.md §18-§20 for canonical wire format definitions.
+
 ```python
 from dataclasses import dataclass
 from typing import List, Optional, Mapping, Any
@@ -1438,6 +1458,13 @@ For non-atomic batch operations (e.g. `embed_batch`, vector `upsert`, graph `bat
 
 **Option B Selected:** Keep `code: "OK"` and encode partial vs full success inside result only (matching the existing BatchResult convention in PROTOCOLS.md).
 
+> **Note:** Batch result field names vary by protocol (see PROTOCOLS.md §27.2):
+> - Embedding: `embeddings`, `total_texts`, `failed_texts`
+> - Vector: `upserted_count`/`deleted_count`, `failed_count`, `failures`
+> - Graph: `GraphBatchResult` with `results[]`, `success`, `error?`
+>
+> The examples below use generic field names; refer to protocol-specific sections for exact shapes.
+
 The transport envelope for batch operations MUST be:
 
 ```json
@@ -1585,7 +1612,7 @@ Implementations SHOULD address:
 ## 15. Privacy Considerations
 
 * MUST NOT log raw prompts, source texts, vectors, or tenant IDs.
-* SHOULD hash tenant identifiers.
+* SHOULD hash tenant identifiers using SHA-256 with per-deployment salt.
 * SHOULD limit log retention (≤30 days RECOMMENDED).
 * Training/analytics retention MUST be explicit and access-controlled.
 
@@ -1605,15 +1632,21 @@ Implementations SHOULD address:
 
 ### 16.1. Latency Targets (Indicative)
 
-* Graph CRUD: 1–10 ms
-* Graph queries: 10–1000 ms
-* Graph batch: 100–5000 ms
-* LLM token counting: 1–5 ms
-* LLM completion: 100–30000 ms
-* Vector search: 1–100 ms
-* Vector batch upsert: 10–1000 ms
-* Embedding single: 5–50 ms
-* Embedding batch: 10–1000 ms
+**Note:** Ranges are indicative for typical enterprise deployments:
+
+| Operation Category | Typical Range | Notes |
+|-------------------|---------------|-------|
+| Graph CRUD | 1–10 ms | Single node/edge operations |
+| Graph queries (simple) | 10–100 ms | Small result sets, simple patterns |
+| Graph queries (complex) | 100–1000 ms | Large traversals, aggregations, joins |
+| Graph batch | 100–5000 ms | Bulk operations, size-dependent |
+| LLM token counting | 1–5 ms | Local tokenizer operations |
+| LLM completion (small) | 100–1000 ms | <100 tokens, fast models |
+| LLM completion (large) | 1000–30000 ms | Large contexts, many tokens |
+| Vector search | 1–100 ms | ANN search, filter-dependent |
+| Vector batch upsert | 10–1000 ms | Size and dimension dependent |
+| Embedding single | 5–50 ms | Typical embedding models |
+| Embedding batch | 10–1000 ms | Batch size and model dependent |
 
 ### 16.2. Concurrency Limits
 
@@ -2081,15 +2114,16 @@ Core envelopes in this appendix follow the closed-envelope rules from §4.2.1 an
 
 ### Streaming LLM over NDJSON
 
-Headers:
+**Note:** The base adapter protocol uses canonical streaming success envelopes per §4.2.3. The event-stream format shown below is an optional gateway overlay per PROTOCOLS.md §2.5.
 
-```text
-Content-Type: application/x-ndjson
-Transfer-Encoding: chunked
-X-Protocol-Streaming: chunked-json
+**Base Protocol Format (adapters MUST emit):**
+```json
+{"ok": true, "code": "STREAMING", "ms": 12.3, "chunk": {"text": "Hello", "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 15.7, "chunk": {"text": " world", "is_final": false}}
+{"ok": true, "code": "STREAMING", "ms": 18.2, "chunk": {"text": "!", "is_final": true}}
 ```
-Body:
 
+**Gateway Event Overlay (optional, client-facing):**
 ```json
 {"event":"data","data":{"text":"Hello","is_final":false}}
 {"event":"data","data":{"text":" world","is_final":false}}
@@ -2115,7 +2149,7 @@ Body:
 
 ## Appendix D — Content Redaction Patterns (Normative)
 
-* Replace user/tenant identifiers with irreversible hashes.
+* Replace user/tenant identifiers with irreversible hashes (SHA-256 with per-deployment salt).
 * Replace prompts, graph queries, vectors with hashes or structural metadata in logs.
 * For vectors/embeddings, log only aggregate statistics (e.g. norms, dimensions).
 * Apply the 64-byte truncation+hash rule from §15 to any logged arguments.
@@ -2153,39 +2187,19 @@ Coverage:
 
 ## Appendix F — Change Log / Revision History (Non-Normative)
 
-* **v1.0.0-rc1 — 2025-01-10**
+* **v1.0.0 — 2026-02-10**
+  * Initial specification publication
+  * Establishes complete Corpus Protocol Suite covering Graph, LLM, Vector, and Embedding protocols
+  * Defines wire-first canonical form with envelopes and streaming frames
+  * Implements unified error taxonomy and resilience patterns
+  * Includes production-grade observability, security, and privacy requirements
+  * Provides comprehensive implementation guidelines and testing framework
 
-  * Introduced canonical wire envelopes and streaming frame model.
-  * Added transport bindings for streaming.
-  * Defined common error taxonomy and mappings.
-  * Established baseline security, privacy, and observability requirements.
+---
 
-* **v1.0.0-rc2 — 2025-01-24**
+**Note:** Since this is the first published version, there are no previous versions to list. Future updates will be added chronologically above this initial entry or in a designated CHANGELOG.md.
 
-  * Clarified deadline semantics and conditional retry rules.
-  * Strengthened streaming finalization guarantees.
-  * Added cache coordination hints and capability cache fields.
-  * Introduced explicit partial-failure patterns.
 
-* **v1.0.0 — 2025-02-07**
-
-  * Locked operation registry and v1.0 wire contracts.
-  * Finalized Embedding Protocol with `EmbeddingFailure`.
-  * Documented best-effort transaction coordination.
-  * Declared V1.0 stable; 1.0.x limited to non-breaking clarifications.
-
-* **v1.0.1 — 2025-03-01**
-
-  * Clarified numeric type invariants and NaN/Inf rejection.
-  * Specified score/distance semantics for vector metrics.
-  * Defined idempotency key scope and minimum dedupe retention.
-  * Canonicalized partial-success envelope shape.
-  * Added streaming frame size and keepalive guidance.
-  * Made retry hints machine-actionable.
-  * Froze key capability identifiers for v1.x.
-  * Specified pagination token semantics.
-  * Canonicalized metrics names and log redaction behavior.
-  * Added graded health statuses and implementation/migration appendices.
 
 ---
 
