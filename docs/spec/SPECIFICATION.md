@@ -1,6 +1,6 @@
 # CORPUS SPECIFICATION
 
-**specification_version:** `1.0.1`   
+**specification_version:** `1.0.0`   
 
 ## Abstract
 
