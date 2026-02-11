@@ -8,14 +8,14 @@
 ![Graph Protocol](https://img.shields.io/badge/Graph%20Protocol-100%25%20Conformant-brightgreen)
 ![Embedding Protocol](https://img.shields.io/badge/Embedding%20Protocol-100%25%20Conformant-brightgreen)
 
-Reference implementation of the **CORPUS Protocol Suite** — a **wire-first, vendor-neutral** SDK for interoperable AI/data backends across four domains: **LLM**, **Embedding**, **Vector**, and **Graph**.
+Reference implementation of the **Corpus OS Protocol Suite** — a **wire-first, vendor-neutral** SDK for interoperable AI/data backends across four domains: **LLM**, **Embedding**, **Vector**, and **Graph**.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │  Your App / Agents / RAG Pipelines                                   │
 │  (LangChain · LlamaIndex · Semantic Kernel · CrewAI · AutoGen · MCP) │
 ├──────────────────────────────────────────────────────────────────────┤
-│  CORPUS Protocol Suite (this SDK)                                    │
+│  Corpus OS Protocol Suite (this SDK)                                 │
 │  One protocol · One error taxonomy · One metrics model               │
 ├──────────┬──────────────┬────────────┬───────────────────────────────┤
 │ LLM/v1   │ Embedding/v1 │ Vector/v1  │ Graph/v1                      │
@@ -26,7 +26,7 @@ Reference implementation of the **CORPUS Protocol Suite** — a **wire-first, ve
 
 **Keep your frameworks. Standardize your infra.**
 
-> **Open-Core Model** — The CORPUS Protocol Suite and this SDK are **fully open source** (Apache-2.0). CORPUS Router and official production adapters are **commercial**, optional, and built on the same public protocols. Using this SDK does **not** lock you into CORPUS Router.
+> **Open-Core Model** — The Corpus OS Protocol Suite and this SDK are **fully open source** (Apache-2.0). CORPUS Router and official production adapters are **commercial**, optional, and built on the same public protocols. Using this SDK does **not** lock you into CORPUS Router.
 
 ---
 
