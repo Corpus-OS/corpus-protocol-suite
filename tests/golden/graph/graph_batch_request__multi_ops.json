@@ -1,0 +1,47 @@
+{
+  "op": "graph.batch",
+  "ctx": {
+    "request_id": "t_graph_batch_multi",
+    "tenant": "test"
+  },
+  "args": {
+    "ops": [
+      {
+        "op": "graph.upsert_nodes",
+        "args": {
+          "nodes": [
+            {
+              "id": "node_11",
+              "properties": {
+                "k": "v"
+              }
+            }
+          ],
+          "namespace": "default"
+        }
+      },
+      {
+        "op": "graph.upsert_edges",
+        "args": {
+          "edges": [
+            {
+              "id": "edge_11",
+              "src": "node_11",
+              "dst": "node_10",
+              "label": "LINKS_TO",
+              "properties": {}
+            }
+          ],
+          "namespace": "default"
+        }
+      },
+      {
+        "op": "graph.query",
+        "args": {
+          "text": "MATCH (n) RETURN n LIMIT 2",
+          "dialect": "cypher"
+        }
+      }
+    ]
+  }
+}

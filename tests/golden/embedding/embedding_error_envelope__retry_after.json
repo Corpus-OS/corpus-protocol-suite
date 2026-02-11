@@ -1,0 +1,12 @@
+{
+  "ok": false,
+  "code": "RESOURCE_EXHAUSTED",
+  "error": "RateLimitError",
+  "message": "Rate limit exceeded",
+  "retry_after_ms": 500,
+  "details": {
+    "limit": "rps",
+    "remaining": 0
+  },
+  "ms": 6.8
+}

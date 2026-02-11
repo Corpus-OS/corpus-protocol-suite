@@ -1,0 +1,18 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_json_mode_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Return a JSON object with keys: a, b."
+      }
+    ],
+    "response_format": {
+      "type": "json_object"
+    }
+  }
+}

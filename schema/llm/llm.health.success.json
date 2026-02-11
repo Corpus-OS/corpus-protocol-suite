@@ -1,15 +1,35 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.health.success.json",
-  "title": "LLM Health",
+  "$id": "https://corpusos.com/schemas/llm/llm.health.success.json",
+  "title": "LLM Health Success",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["ok", "status"],
-  "properties": {
-    "ok": { "type": "boolean" },
-    "status": { "type": "string", "enum": ["ok", "degraded", "down"] },
-    "reason": { "type": "string", "maxLength": 512 },
-    "server": { "type": "string", "maxLength": 128 },
-    "version": { "type": "string", "maxLength": 64 }
-  }
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/llm/llm.envelope.success.json"
+    },
+    {
+      "properties": {
+        "result": {
+          "type": "object",
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "server": {
+              "type": "string"
+            },
+            "version": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "ok",
+            "server",
+            "version"
+          ],
+          "additionalProperties": true
+        }
+      }
+    }
+  ]
 }

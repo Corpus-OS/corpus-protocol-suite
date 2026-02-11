@@ -1,0 +1,3 @@
+{"ok":true,"code":"STREAMING","ms":3.0,"chunk":{"text":"A","is_final":false,"usage_so_far":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}}
+{"ok":true,"code":"STREAMING","ms":4.2,"chunk":{"text":"B","is_final":false,"usage_so_far":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}}
+{"ok":true,"code":"STREAMING","ms":5.8,"chunk":{"text":"C","is_final":true,"usage_so_far":{"prompt_tokens":5,"completion_tokens":3,"total_tokens":8}}}

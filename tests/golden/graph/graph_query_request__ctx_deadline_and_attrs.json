@@ -1,0 +1,16 @@
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "t_graph_query_deadline_attrs",
+    "tenant": "test",
+    "deadline_ms": 5000,
+    "attrs": {
+      "x-client": "golden-tests",
+      "x-purpose": "query"
+    }
+  },
+  "args": {
+    "text": "MATCH (n) RETURN n LIMIT 10",
+    "dialect": "cypher"
+  }
+}

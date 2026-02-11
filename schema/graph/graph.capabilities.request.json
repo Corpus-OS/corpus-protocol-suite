@@ -1,9 +1,24 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/graph/graph.capabilities.request.json",
-  "title": "graph.capabilities Args",
-  "description": "Explicit empty-args schema for graph.capabilities(). Improves validation clarity and doc generation.",
+  "$id": "https://corpusos.com/schemas/graph/graph.capabilities.request.json",
+  "title": "Graph Capabilities Request",
   "type": "object",
-  "additionalProperties": false,
-  "maxProperties": 0
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.capabilities"
+        },
+        "args": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "Args object required on the wire; may be empty; extra keys are ignored by the handler."
+        }
+      }
+    }
+  ]
 }

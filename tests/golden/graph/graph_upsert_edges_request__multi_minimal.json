@@ -1,0 +1,28 @@
+{
+  "op": "graph.upsert_edges",
+  "ctx": {
+    "request_id": "t_graph_upsert_edges_multi_min",
+    "tenant": "test"
+  },
+  "args": {
+    "edges": [
+      {
+        "id": "edge_2",
+        "src": "node_2",
+        "dst": "node_3",
+        "label": "LIKES",
+        "properties": {}
+      },
+      {
+        "id": "edge_3",
+        "src": "node_3",
+        "dst": "node_1",
+        "label": "WORKS_WITH",
+        "properties": {
+          "team": "research"
+        }
+      }
+    ],
+    "namespace": "default"
+  }
+}

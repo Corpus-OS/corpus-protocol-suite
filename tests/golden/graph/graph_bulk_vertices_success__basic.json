@@ -1,0 +1,20 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 16.4,
+  "result": {
+    "nodes": [
+      {
+        "id": "node_1",
+        "labels": [
+          "Person"
+        ],
+        "properties": {
+          "name": "Ada"
+        }
+      }
+    ],
+    "next_cursor": null,
+    "has_more": false
+  }
+}

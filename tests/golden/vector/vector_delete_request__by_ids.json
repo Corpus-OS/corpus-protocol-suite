@@ -1,0 +1,14 @@
+{
+  "op": "vector.delete",
+  "ctx": {
+    "request_id": "t_vector_delete_ids",
+    "tenant": "test"
+  },
+  "args": {
+    "ids": [
+      "vec_1",
+      "vec_2"
+    ],
+    "namespace": "default"
+  }
+}

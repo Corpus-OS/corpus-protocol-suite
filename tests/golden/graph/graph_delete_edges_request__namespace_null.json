@@ -1,0 +1,13 @@
+{
+  "op": "graph.delete_edges",
+  "ctx": {
+    "request_id": "t_graph_delete_edges_ns_null",
+    "tenant": "test"
+  },
+  "args": {
+    "filter": {
+      "src": "node_1"
+    },
+    "namespace": null
+  }
+}

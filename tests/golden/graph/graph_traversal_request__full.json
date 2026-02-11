@@ -1,0 +1,32 @@
+{
+  "op": "graph.traversal",
+  "ctx": {
+    "request_id": "t_graph_traversal_full",
+    "tenant": "test"
+  },
+  "args": {
+    "start_nodes": [
+      "node_1",
+      "node_2"
+    ],
+    "max_depth": 3,
+    "direction": "BOTH",
+    "relationship_types": [
+      "KNOWS",
+      "LIKES"
+    ],
+    "node_filters": {
+      "label": "Person"
+    },
+    "relationship_filters": {
+      "since": {
+        "gte": 2020
+      }
+    },
+    "return_properties": [
+      "name",
+      "age"
+    ],
+    "namespace": "default"
+  }
+}

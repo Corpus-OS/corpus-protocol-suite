@@ -1,0 +1,26 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 28.9,
+  "result": {
+    "text": "Calling tool now.",
+    "model": "test-model-1",
+    "model_family": "test-family",
+    "usage": {
+      "prompt_tokens": 10,
+      "completion_tokens": 5,
+      "total_tokens": 15
+    },
+    "finish_reason": "tool_calls",
+    "tool_calls": [
+      {
+        "id": "call_1",
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "arguments": "{\"city\":\"Chicago\"}"
+        }
+      }
+    ]
+  }
+}

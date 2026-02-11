@@ -1,0 +1,16 @@
+{
+  "op": "llm.complete",
+  "ctx": {
+    "request_id": "t_llm_complete_system_message_field",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "What is 2+2?"
+      }
+    ],
+    "system_message": "You are a helpful assistant. Answer concisely."
+  }
+}

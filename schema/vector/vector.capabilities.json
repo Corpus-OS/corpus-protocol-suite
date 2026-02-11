@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.capabilities.json",
+  "title": "Vector Capabilities",
+  "type": "object",
+  "properties": {
+    "server": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "protocol": {
+      "type": "string",
+      "const": "vector/v1.0"
+    },
+    "max_dimensions": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "supported_metrics": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "supports_namespaces": {
+      "type": "boolean"
+    },
+    "supports_metadata_filtering": {
+      "type": "boolean"
+    },
+    "supports_batch_operations": {
+      "type": "boolean"
+    },
+    "max_batch_size": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "supports_index_management": {
+      "type": "boolean"
+    },
+    "idempotent_writes": {
+      "type": "boolean"
+    },
+    "supports_multi_tenant": {
+      "type": "boolean"
+    },
+    "supports_deadline": {
+      "type": "boolean"
+    },
+    "max_top_k": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "max_filter_terms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "text_storage_strategy": {
+      "type": "string",
+      "enum": [
+        "metadata",
+        "docstore",
+        "none"
+      ]
+    },
+    "max_text_length": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "supports_batch_queries": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "server",
+    "version",
+    "protocol"
+  ],
+  "additionalProperties": true
+}

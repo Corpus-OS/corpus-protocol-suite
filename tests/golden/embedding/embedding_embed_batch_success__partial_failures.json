@@ -1,0 +1,44 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 30.1,
+  "result": {
+    "embeddings": [
+      {
+        "vector": [
+          0.11,
+          0.22,
+          0.33
+        ],
+        "text": "alpha",
+        "model": "embed-large",
+        "dimensions": 3,
+        "index": 0,
+        "metadata": null
+      }
+    ],
+    "model": "embed-large",
+    "total_texts": 3,
+    "total_tokens": null,
+    "failed_texts": [
+      {
+        "index": 1,
+        "text": "beta",
+        "error": "TextTooLongError",
+        "code": "TEXT_TOO_LONG",
+        "message": "Input exceeds max_text_length",
+        "metadata": {
+          "max_text_length": 8192
+        }
+      },
+      {
+        "index": 2,
+        "text": "gamma",
+        "error": "ModelNotAvailableError",
+        "code": "MODEL_NOT_AVAILABLE",
+        "message": "Requested model unavailable",
+        "metadata": null
+      }
+    ]
+  }
+}

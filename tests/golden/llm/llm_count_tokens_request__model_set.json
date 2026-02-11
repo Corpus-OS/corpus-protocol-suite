@@ -1,0 +1,11 @@
+{
+  "op": "llm.count_tokens",
+  "ctx": {
+    "request_id": "t_llm_count_tokens_model_set",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "hello world",
+    "model": "test-model-1"
+  }
+}

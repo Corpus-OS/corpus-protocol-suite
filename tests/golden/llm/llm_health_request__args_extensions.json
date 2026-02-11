@@ -1,0 +1,11 @@
+{
+  "op": "llm.health",
+  "ctx": {
+    "request_id": "t_llm_health_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "x-include-models": true,
+    "verbose": true
+  }
+}

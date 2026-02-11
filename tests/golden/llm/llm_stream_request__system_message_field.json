@@ -1,0 +1,16 @@
+{
+  "op": "llm.stream",
+  "ctx": {
+    "request_id": "t_llm_stream_system_message_field",
+    "tenant": "test"
+  },
+  "args": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "Stream a concise answer."
+      }
+    ],
+    "system_message": "You are a helpful assistant. Keep responses short."
+  }
+}

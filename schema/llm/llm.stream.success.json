@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.stream.success.json",
+  "title": "LLM Stream Success",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json"
+    },
+    {
+      "properties": {
+        "chunk": {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.chunk.json"
+        }
+      }
+    }
+  ]
+}

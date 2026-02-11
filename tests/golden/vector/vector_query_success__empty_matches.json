@@ -1,0 +1,15 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 12.1,
+  "result": {
+    "matches": [],
+    "query_vector": [
+      0.1,
+      0.2,
+      0.3
+    ],
+    "namespace": "default",
+    "total_matches": 0
+  }
+}

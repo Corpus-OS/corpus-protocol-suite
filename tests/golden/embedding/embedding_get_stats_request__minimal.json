@@ -1,0 +1,8 @@
+{
+  "op": "embedding.get_stats",
+  "ctx": {
+    "request_id": "t_embedding_get_stats_min",
+    "tenant": "test"
+  },
+  "args": {}
+}

@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.tools.json",
+  "title": "LLM Tools",
+  "type": [
+    "array",
+    "null"
+  ],
+  "items": {
+    "type": "object",
+    "properties": {
+      "type": {
+        "type": "string"
+      },
+      "function": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "required": [
+      "type"
+    ],
+    "additionalProperties": true,
+    "allOf": [
+      {
+        "if": {
+          "properties": {
+            "type": {
+              "const": "function"
+            }
+          },
+          "required": [
+            "type"
+          ]
+        },
+        "then": {
+          "required": [
+            "function"
+          ]
+        }
+      }
+    ]
+  }
+}

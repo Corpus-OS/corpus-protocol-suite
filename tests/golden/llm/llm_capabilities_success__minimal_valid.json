@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.2,
+  "result": {
+    "server": "corpus-llm",
+    "version": "1.0.0",
+    "model_family": "test-family",
+    "max_context_length": 8192,
+    "protocol": "llm/v1.0"
+  }
+}

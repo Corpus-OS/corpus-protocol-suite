@@ -1,0 +1,13 @@
+{
+  "op": "graph.query",
+  "ctx": {
+    "request_id": "t_graph_query_ns_timeout",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "g.V().limit(1)",
+    "dialect": "gremlin",
+    "namespace": "default",
+    "timeout_ms": 250
+  }
+}

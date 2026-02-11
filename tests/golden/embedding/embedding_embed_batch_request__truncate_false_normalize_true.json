@@ -1,0 +1,17 @@
+{
+  "op": "embedding.embed_batch",
+  "ctx": {
+    "request_id": "t_embedding_embed_batch_trunc_norm",
+    "tenant": "test"
+  },
+  "args": {
+    "texts": [
+      "alpha",
+      "beta",
+      "gamma"
+    ],
+    "model": "embed-large",
+    "truncate": false,
+    "normalize": true
+  }
+}

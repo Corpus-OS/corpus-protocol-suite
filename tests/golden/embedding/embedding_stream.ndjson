@@ -1,0 +1,2 @@
+{"ok":true,"code":"STREAMING","ms":5.2,"chunk":{"embeddings":[{"vector":[0.1,0.2],"text":"hello streaming","model":"embed-small","dimensions":2,"index":0,"metadata":null}],"is_final":false,"usage":null,"model":"embed-small"}}
+{"ok":true,"code":"STREAMING","ms":9.4,"chunk":{"embeddings":[{"vector":[0.3,0.4],"text":"hello streaming","model":"embed-small","dimensions":2,"index":1,"metadata":null}],"is_final":true,"usage":{"tokens":3},"model":"embed-small"}}

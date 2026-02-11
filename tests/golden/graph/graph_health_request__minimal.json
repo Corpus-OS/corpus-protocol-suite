@@ -1,0 +1,8 @@
+{
+  "op": "graph.health",
+  "ctx": {
+    "request_id": "t_graph_health_min",
+    "tenant": "test"
+  },
+  "args": {}
+}

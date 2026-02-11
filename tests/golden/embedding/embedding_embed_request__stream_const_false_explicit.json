@@ -1,0 +1,12 @@
+{
+  "op": "embedding.embed",
+  "ctx": {
+    "request_id": "t_embedding_embed_stream_false",
+    "tenant": "test"
+  },
+  "args": {
+    "text": "stream flag must be false for unary embed",
+    "model": "embed-small",
+    "stream": false
+  }
+}

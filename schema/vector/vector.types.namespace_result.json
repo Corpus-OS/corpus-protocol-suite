@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.namespace_result.json",
+  "title": "Namespace Result",
+  "type": "object",
+  "properties": {
+    "success": {
+      "type": "boolean"
+    },
+    "namespace": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "details": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "success",
+    "namespace",
+    "details"
+  ],
+  "additionalProperties": false
+}

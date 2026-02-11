@@ -1,40 +1,75 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.types.message.json",
-  "title": "LLM Chat Message",
-  "description": "Canonical chat message for LLM operations. SIEM-safe; no secrets or PII.",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.message.json",
+  "title": "LLM Message",
   "type": "object",
-  "required": ["role", "content"],
-  "additionalProperties": false,
   "properties": {
     "role": {
-      "type": "string",
-      "enum": ["system", "user", "assistant", "tool"],
-      "description": "Message role per spec §8.3."
+      "type": "string"
     },
     "content": {
-      "type": "string",
-      "minLength": 0,
-      "maxLength": 200000,
-      "description": "Primary message text. Implementations MAY also accept structured content via vendor extensions."
+      "type": "string"
     },
     "name": {
-      "type": "string",
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
-      "description": "Optional display name for assistant/tool roles."
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "tool_call_id": {
-      "type": "string",
-      "maxLength": 128,
-      "pattern": "^[A-Za-z0-9._:-]{1,128}$",
-      "description": "For role=tool, the originating tool_call identifier."
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "tool_calls": {
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "#/$defs/ToolCall"
+      }
     }
   },
-  "patternProperties": {
-    "^(vendor:)[a-z0-9_.:-]+$": {
-      "description": "Vendor/extension namespaced fields for structured content parts.",
-      "type": ["string", "number", "boolean", "object", "array", "null"]
+  "required": [
+    "role",
+    "content"
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "ToolCall": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "function": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "arguments": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "arguments"
+          ],
+          "additionalProperties": true
+        }
+      },
+      "required": [
+        "id",
+        "type",
+        "function"
+      ],
+      "additionalProperties": true
     }
   }
 }

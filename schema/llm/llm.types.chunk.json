@@ -1,48 +1,44 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/llm/llm.types.chunk.json",
-  "title": "LLM Stream Chunk",
+  "$id": "https://corpusos.com/schemas/llm/llm.types.chunk.json",
+  "title": "LLM Streaming Chunk",
   "type": "object",
-  "additionalProperties": false,
   "properties": {
-    "text": { "type": "string" },
-    "is_final": { "type": "boolean", "default": false },
-    "model": { "type": "string", "maxLength": 128 },
-    "usage_so_far": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.token_usage.json" },
-    "logprobs": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.logprobs.json" },
-    "redactions": {
-      "type": "array",
-      "maxItems": 256,
-      "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["start", "end", "reason"],
-        "properties": {
-          "start": { "type": "integer", "minimum": 0 },
-          "end": { "type": "integer", "minimum": 0 },
-          "reason": { "type": "string", "maxLength": 128 }
+    "text": {
+      "type": "string"
+    },
+    "is_final": {
+      "type": "boolean"
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "usage_so_far": {
+      "anyOf": [
+        {
+          "$ref": "https://corpusos.com/schemas/llm/llm.types.token_usage.json"
+        },
+        {
+          "type": "null"
         }
-      }
-    },
-    "heartbeat": {
-      "type": "boolean",
-      "const": true,
-      "description": "Keepalive frame; clients MUST ignore for content."
-    },
-    "json_stream_mode": {
-      "type": "string",
-      "enum": ["off", "object", "array"],
-      "default": "off",
-      "description": "If not 'off', text may represent an incrementally valid JSON fragment."
+      ]
     },
     "tool_calls": {
-      "type": "array",
-      "maxItems": 16,
-      "items": { "$ref": "https://adaptersdk.org/schemas/llm/llm.types.tool.json#/$defs/toolCall" }
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "$ref": "https://corpusos.com/schemas/llm/llm.types.message.json#/$defs/ToolCall"
+      }
     }
   },
-  "oneOf": [
-    { "required": ["text"] },
-    { "required": ["heartbeat"], "properties": { "text": { "maxLength": 0 } } }
-  ]
+  "required": [
+    "text",
+    "is_final"
+  ],
+  "additionalProperties": true
 }

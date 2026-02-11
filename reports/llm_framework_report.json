@@ -1,0 +1,238 @@
+{
+  "adapter": {
+    "endpoint_set": false,
+    "spec": "tests.mock.mock_llm_adapter:MockLLMAdapter"
+  },
+  "duration_s": 19.091073036193848,
+  "generated_at_epoch_s": 1770778114,
+  "platinum_certified": true,
+  "policy": {
+    "max_failures": null,
+    "strict": false
+  },
+  "protocols": {
+    "embedding": {
+      "collected_total": 0,
+      "display_name": "Embedding Protocol V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 68,
+        "gold": 135,
+        "silver": 108
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "embedding_frameworks": {
+      "collected_total": 0,
+      "display_name": "Embedding Framework Adapters V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 209,
+        "gold": 418,
+        "silver": 335
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "graph": {
+      "collected_total": 0,
+      "display_name": "Graph Protocol V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 50,
+        "gold": 99,
+        "silver": 80
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "graph_frameworks": {
+      "collected_total": 0,
+      "display_name": "Graph Framework Adapters V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 287,
+        "gold": 574,
+        "silver": 460
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "llm": {
+      "collected_total": 0,
+      "display_name": "LLM Protocol V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 66,
+        "gold": 132,
+        "silver": 106
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "llm_frameworks": {
+      "collected_total": 624,
+      "display_name": "LLM Framework Adapters V1.0",
+      "level": "Gold",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 624,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 312,
+        "gold": 624,
+        "silver": 500
+      },
+      "scored_passed": 624,
+      "scored_total": 624,
+      "tests_needed_to_next_level": 0
+    },
+    "schema": {
+      "collected_total": 0,
+      "display_name": "CORPUS Schema Conformance Suite",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 105,
+        "gold": 210,
+        "silver": 168
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "vector": {
+      "collected_total": 0,
+      "display_name": "Vector Protocol V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 54,
+        "gold": 108,
+        "silver": 87
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "vector_frameworks": {
+      "collected_total": 0,
+      "display_name": "Vector Framework Adapters V1.0",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 479,
+        "gold": 958,
+        "silver": 767
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    },
+    "wire": {
+      "collected_total": 0,
+      "display_name": "Wire Request Conformance Suite",
+      "level": "No Tests Scored",
+      "outcomes": {
+        "error": 0,
+        "failed": 0,
+        "passed": 0,
+        "skipped": 0,
+        "xfailed": 0,
+        "xpassed": 0
+      },
+      "reference_levels": {
+        "development": 38,
+        "gold": 76,
+        "silver": 61
+      },
+      "scored_passed": 0,
+      "scored_total": 0,
+      "tests_needed_to_next_level": 0
+    }
+  },
+  "version": 2,
+  "why_not_platinum": {
+    "blocked": false,
+    "reasons": [],
+    "strict": false,
+    "totals": {
+      "error": 0,
+      "failed": 0,
+      "skipped": 0,
+      "xfailed": 0,
+      "xpassed": 0
+    }
+  }
+}

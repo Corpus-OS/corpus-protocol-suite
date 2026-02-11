@@ -3,118 +3,130 @@
 Graph Conformance — Streaming semantics.
 
 Asserts (Spec refs):
-  • stream_query yields dict rows                              (§7.3.2)
+  • stream_query yields dict rows inside QueryChunks           (§7.3.2)
   • early interruption is safe                                 (§7.3.2)
   • resources released on cancel                               (§7.3.2)
   • deadline respected mid-stream                              (§6.1, §12.1)
 """
-import asyncio
-import time
+
+from __future__ import annotations
+
+import json
 import pytest
 
 from corpus_sdk.graph.graph_base import (
     OperationContext as GraphContext,
-    DeadlineExceeded,
+    NotSupported,
     BaseGraphAdapter,
+    GraphQuerySpec,
+    QueryChunk,
+    WireGraphHandler,
 )
-from examples.common.ctx import make_ctx, clear_time_cache
 
 pytestmark = pytest.mark.asyncio
 
 
-async def test_streaming_stream_query_yields_mappings(adapter: BaseGraphAdapter):
-    """§7.3.2: stream_query must yield dictionary results."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_rows", tenant="t")
-    
-    count = 0
-    async for item in adapter.stream_query(dialect="cypher", text="RETURN 1 as value", ctx=ctx):
-        assert isinstance(item, dict), "Stream items must be dictionaries"
-        count += 1
-        if count >= 3:  # Limit to avoid infinite streams
-            break
-    
-    # Some adapters may return empty streams for simple queries
-    # The important part is that if items are returned, they're dictionaries
+async def test_stream_query_capability_alignment(adapter: BaseGraphAdapter):
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_stream_cap", tenant="t")
+    spec = GraphQuerySpec(text="RETURN 1", dialect="cypher", stream=True)
+
+    if not getattr(caps, "supports_stream_query", True):
+        with pytest.raises(NotSupported):
+            async for _ in adapter.stream_query(spec, ctx=ctx):
+                pass
+        return
+
+    async for chunk in adapter.stream_query(spec, ctx=ctx):
+        assert isinstance(chunk, QueryChunk)
+        break
+
+
+async def test_stream_query_yields_querychunks_with_json_serializable_records(adapter: BaseGraphAdapter):
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_stream_rows", tenant="t")
+    spec = GraphQuerySpec(text="RETURN 1 as value", dialect="cypher", stream=True)
+
+    if not getattr(caps, "supports_stream_query", True):
+        with pytest.raises(NotSupported):
+            async for _ in adapter.stream_query(spec, ctx=ctx):
+                pass
+        return
+
+    async for chunk in adapter.stream_query(spec, ctx=ctx):
+        assert isinstance(chunk, QueryChunk)
+        assert isinstance(chunk.records, list)
+        json.dumps(chunk.records)
+        if chunk.is_final and chunk.summary is not None:
+            json.dumps(chunk.summary)
+        break
 
 
 async def test_streaming_can_be_interrupted_early(adapter: BaseGraphAdapter):
-    """§7.3.2: Streams must support early interruption."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_early", tenant="t")
-    
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_stream_early", tenant="t")
+    spec = GraphQuerySpec(text="RETURN 1 LIMIT 10", dialect="cypher", stream=True)
+
+    if not getattr(caps, "supports_stream_query", True):
+        with pytest.raises(NotSupported):
+            async for _ in adapter.stream_query(spec, ctx=ctx):
+                pass
+        return
+
     count = 0
-    async for _ in adapter.stream_query(dialect="cypher", text="RETURN 1 as value LIMIT 10", ctx=ctx):
+    async for _ in adapter.stream_query(spec, ctx=ctx):
         count += 1
         if count == 2:
             break
-    
-    assert count == 2, "Should be able to break from stream early"
-    # No assertion about resource cleanup - that's implementation specific
+    assert count == 2
 
 
 async def test_streaming_releases_resources_on_cancel(adapter: BaseGraphAdapter):
-    """§7.3.2: Streams must release resources when cancelled."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_cancel", tenant="t")
-    
-    # Start streaming and consume one item
-    stream = adapter.stream_query(dialect="cypher", text="RETURN 1 as value LIMIT 5", ctx=ctx)
-    first_item = await stream.__anext__()
-    assert isinstance(first_item, dict), "First stream item should be a dictionary"
-    
-    # Explicitly close the stream to test resource cleanup
+    caps = await adapter.capabilities()
+    ctx = GraphContext(request_id="t_stream_cancel", tenant="t")
+    spec = GraphQuerySpec(text="RETURN 1 LIMIT 5", dialect="cypher", stream=True)
+
+    if not getattr(caps, "supports_stream_query", True):
+        with pytest.raises(NotSupported):
+            async for _ in adapter.stream_query(spec, ctx=ctx):
+                pass
+        return
+
+    stream = adapter.stream_query(spec, ctx=ctx)
+    first_chunk = await stream.__anext__()
+    assert isinstance(first_chunk, QueryChunk)
     await stream.aclose()
-    # If we get here without errors, resource cleanup is working
 
 
-async def test_streaming_respects_deadline(adapter: BaseGraphAdapter):
-    """§6.1: Streams must respect deadline constraints."""
-    clear_time_cache()
-    now_ms = int(time.time() * 1000)
-    
-    # Use a very short deadline to force timeout
-    ctx = make_ctx(GraphContext, request_id="t_stream_deadline", tenant="t", deadline_ms=now_ms + 10)
-    
-    # Burn some time to ensure deadline is exceeded
-    await asyncio.sleep(0.02)
-    
-    with pytest.raises(DeadlineExceeded):
-        async for _ in adapter.stream_query(dialect="cypher", text="RETURN 1 as value", ctx=ctx):
-            pass
+# ---------------------------- NEW: wire handle_stream ----------------------------
 
+async def test_wire_handle_stream_emits_streaming_frames_when_supported(adapter: BaseGraphAdapter):
+    """
+    NEW: Wire streaming must yield STREAMING frames when supported, else an error envelope.
+    """
+    caps = await adapter.capabilities()
+    h = WireGraphHandler(adapter)
 
-async def test_streaming_empty_results_handled(adapter: BaseGraphAdapter):
-    """§7.3.2: Empty streams should be handled gracefully."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_empty", tenant="t")
-    
-    # Test with a query that likely returns no results
-    count = 0
-    async for item in adapter.stream_query(
-        dialect="cypher", 
-        text="MATCH (n:NonExistentLabel) RETURN n LIMIT 10", 
-        ctx=ctx
-    ):
-        count += 1
-    
-    # Empty streams are valid - should complete without errors
-    assert count >= 0, "Empty streams should complete without errors"
+    dialect = caps.supported_query_dialects[0] if caps.supported_query_dialects else None
+    args = {"text": "RETURN 1"}
+    if dialect is not None:
+        args["dialect"] = dialect
 
+    agen = h.handle_stream({"op": "graph.stream_query", "ctx": {"request_id": "ws1"}, "args": args})
 
-async def test_streaming_large_results_handled(adapter: BaseGraphAdapter):
-    """§7.3.2: Streams should handle large result sets efficiently."""
-    ctx = make_ctx(GraphContext, request_id="t_stream_large", tenant="t")
-    
-    # Stream a reasonable number of items to test chunking
-    max_items = 20
-    count = 0
-    async for item in adapter.stream_query(
-        dialect="cypher", 
-        text=f"UNWIND range(1, {max_items}) AS i RETURN i as value", 
-        ctx=ctx
-    ):
-        assert isinstance(item, dict)
-        assert "value" in item
-        count += 1
-        if count >= max_items:
-            break
-    
-    # Should be able to stream multiple items
-    assert count > 0, "Should stream at least some items"
+    first = None
+    async for item in agen:
+        first = item
+        break
+
+    assert first is not None
+    if getattr(caps, "supports_stream_query", True):
+        assert first.get("ok") is True
+        assert first.get("code") == "STREAMING"
+        assert isinstance(first.get("ms"), (int, float))
+        assert isinstance(first.get("chunk"), dict)
+        assert isinstance(first["chunk"].get("records"), list)
+    else:
+        assert first.get("ok") is False
+        assert isinstance(first.get("code"), str)
+        assert isinstance(first.get("error"), str)

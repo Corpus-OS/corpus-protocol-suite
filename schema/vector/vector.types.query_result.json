@@ -1,38 +1,37 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/vector/vector.types.query_result.json",
-  "title": "QueryResult",
-  "description": "Structured result payload from vector.query.",
+  "$id": "https://corpusos.com/schemas/vector/vector.types.query_result.json",
+  "title": "Vector Query Result",
   "type": "object",
-  "additionalProperties": false,
   "properties": {
     "matches": {
       "type": "array",
-      "items": { "$ref": "https://adaptersdk.org/schemas/vector/vector.types.vector_match.json" }
+      "items": {
+        "$ref": "https://corpusos.com/schemas/vector/vector.types.vector_match.json"
+      }
     },
     "query_vector": {
       "type": "array",
-      "minItems": 1,
-      "maxItems": 8192,
-      "items": { "type": "number" },
-      "description": "Echo of the query vector when included by adapter; optional per capabilities."
+      "items": {
+        "type": "number"
+      },
+      "minItems": 1
     },
     "namespace": {
       "type": "string",
-      "maxLength": 256,
-      "pattern": "^[A-Za-z0-9._:-]{1,256}$"
+      "minLength": 1,
+      "pattern": ".*\\S.*"
     },
     "total_matches": {
       "type": "integer",
       "minimum": 0
-    },
-    "next_page_token": {
-      "type": ["string", "null"],
-      "maxLength": 4096,
-      "pattern": "^[A-Za-z0-9+/=_-]{1,4096}$",
-      "description": "Opaque token for pagination; omit or null if no further pages."
     }
   },
-  "required": ["matches", "namespace", "total_matches"],
-  "$comment": "Page token semantics per §11.5; clients must treat tokens as opaque."
+  "required": [
+    "matches",
+    "query_vector",
+    "namespace",
+    "total_matches"
+  ],
+  "additionalProperties": false
 }

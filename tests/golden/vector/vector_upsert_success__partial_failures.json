@@ -1,0 +1,16 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 25.7,
+  "result": {
+    "upserted_count": 1,
+    "failed_count": 1,
+    "failures": [
+      {
+        "id": "vec_bad",
+        "error": "BadRequestError",
+        "detail": "Vector dimension mismatch"
+      }
+    ]
+  }
+}

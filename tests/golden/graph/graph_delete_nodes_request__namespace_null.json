@@ -1,0 +1,13 @@
+{
+  "op": "graph.delete_nodes",
+  "ctx": {
+    "request_id": "t_graph_delete_nodes_ns_null",
+    "tenant": "test"
+  },
+  "args": {
+    "ids": [
+      "node_3"
+    ],
+    "namespace": null
+  }
+}

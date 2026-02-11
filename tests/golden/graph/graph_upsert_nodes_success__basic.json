@@ -1,0 +1,10 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 21.4,
+  "result": {
+    "upserted_count": 2,
+    "failed_count": 0,
+    "failures": []
+  }
+}

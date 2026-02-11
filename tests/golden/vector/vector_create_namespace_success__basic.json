@@ -1,0 +1,12 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 18.8,
+  "result": {
+    "success": true,
+    "namespace": "tenant_a",
+    "details": {
+      "created": true
+    }
+  }
+}

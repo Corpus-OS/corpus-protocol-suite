@@ -1,0 +1,13 @@
+{
+  "op": "graph.get_schema",
+  "ctx": {
+    "request_id": "t_graph_get_schema_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "include_counts": true,
+    "x-debug": {
+      "notes": "schema extension args"
+    }
+  }
+}

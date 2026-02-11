@@ -1,0 +1,25 @@
+{
+  "op": "vector.upsert",
+  "ctx": {
+    "request_id": "t_vector_upsert_meta_text",
+    "tenant": "test"
+  },
+  "args": {
+    "vectors": [
+      {
+        "id": "vec_2",
+        "vector": [
+          0.9,
+          0.8
+        ],
+        "metadata": {
+          "source": "doc_2",
+          "lang": "en"
+        },
+        "namespace": "default",
+        "text": "short text payload"
+      }
+    ],
+    "namespace": "default"
+  }
+}

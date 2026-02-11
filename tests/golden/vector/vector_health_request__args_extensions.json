@@ -1,0 +1,13 @@
+{
+  "op": "vector.health",
+  "ctx": {
+    "request_id": "t_vector_health_args_ext",
+    "tenant": "test"
+  },
+  "args": {
+    "verbose": true,
+    "x-probe": {
+      "deep": false
+    }
+  }
+}

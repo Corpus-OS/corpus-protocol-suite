@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.capabilities.json",
+  "title": "Embedding Capabilities",
+  "type": "object",
+  "properties": {
+    "server": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": ".*\\S.*"
+    },
+    "supported_models": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "protocol": {
+      "type": "string",
+      "const": "embedding/v1.0"
+    },
+    "max_batch_size": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "max_text_length": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "max_dimensions": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "supports_normalization": {
+      "type": "boolean"
+    },
+    "supports_truncation": {
+      "type": "boolean"
+    },
+    "supports_token_counting": {
+      "type": "boolean"
+    },
+    "supports_streaming": {
+      "type": "boolean"
+    },
+    "supports_batch_embedding": {
+      "type": "boolean"
+    },
+    "supports_caching": {
+      "type": "boolean"
+    },
+    "idempotent_writes": {
+      "type": "boolean"
+    },
+    "supports_multi_tenant": {
+      "type": "boolean"
+    },
+    "normalizes_at_source": {
+      "type": "boolean"
+    },
+    "truncation_mode": {
+      "type": "string"
+    },
+    "supports_deadline": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "server",
+    "version",
+    "supported_models",
+    "protocol"
+  ],
+  "additionalProperties": true
+}

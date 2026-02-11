@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.stream.success.json",
+  "title": "Embedding Protocol Streaming Success Envelope",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/common/envelope.stream.success.json"
+    }
+  ]
+}

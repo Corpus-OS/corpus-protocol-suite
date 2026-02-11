@@ -256,6 +256,8 @@ You should see a response like:
 
 Congrats — your service now speaks the Corpus Protocol.
 
+Note: WireEmbeddingHandler is framework-agnostic (works with Flask, Django, gRPC, etc.)
+
 ---
 
 ## 4. "I Want LLM / Vector / Graph Instead"

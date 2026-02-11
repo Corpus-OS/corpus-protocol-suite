@@ -1,0 +1,5 @@
+{
+  "op": "llm.capabilities",
+  "ctx": {},
+  "args": {}
+}

@@ -1,0 +1,29 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.4,
+  "result": {
+    "server": "corpus-vector",
+    "version": "1.0.0",
+    "protocol": "vector/v1.0",
+    "max_dimensions": 1536,
+    "supported_metrics": [
+      "cosine",
+      "euclidean",
+      "dotproduct"
+    ],
+    "supports_namespaces": true,
+    "supports_metadata_filtering": true,
+    "supports_batch_operations": true,
+    "max_batch_size": 100,
+    "supports_index_management": true,
+    "idempotent_writes": true,
+    "supports_multi_tenant": true,
+    "supports_deadline": true,
+    "max_top_k": 200,
+    "max_filter_terms": 50,
+    "text_storage_strategy": "metadata",
+    "max_text_length": 20000,
+    "supports_batch_queries": true
+  }
+}

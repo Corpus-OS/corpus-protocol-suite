@@ -1,0 +1,16 @@
+{
+  "op": "vector.query",
+  "ctx": {
+    "request_id": "t_vector_query_ns_custom",
+    "tenant": "test"
+  },
+  "args": {
+    "vector": [
+      0.3,
+      0.2,
+      0.1
+    ],
+    "top_k": 10,
+    "namespace": "tenant_a"
+  }
+}

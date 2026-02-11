@@ -5,6 +5,12 @@ Embedding Conformance — Error taxonomy & retry hints.
 Spec refs:
   • §12.1, §12.4 Error Handling
   • §10.4 Errors (Embedding-Specific)
+
+Notes:
+- No skips: tests assert behavior consistent with capabilities.
+- Batch failure records in this SDK are flat dicts:
+    {index, text, error, code, message, metadata?}
+  (not nested error objects).
 """
 
 import pytest
@@ -25,33 +31,42 @@ from corpus_sdk.embedding.embedding_base import (
     BadRequest,
     NotSupported,
 )
-from examples.common.ctx import make_ctx
 
-pytestmark = pytest.mark.asyncio
+# NOTE:
+# Do NOT set a global pytestmark=asyncio because this file contains a sync test.
+# Instead mark async tests individually.
+# This avoids: PytestWarning: marked with '@pytest.mark.asyncio' but it is not an async function.
 
 
+@pytest.mark.asyncio
 async def test_error_handling_text_too_long_maps_correctly(adapter: BaseEmbeddingAdapter):
-    """§10.4: TextTooLong must map to TEXT_TOO_LONG and be non-retryable."""
-    caps = adapter.capabilities
-    if caps.max_text_length is None:
-        pytest.skip("Adapter does not declare max_text_length")
+    """§10.4: If max_text_length is declared, TextTooLong must map to TEXT_TOO_LONG and be non-retryable."""
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
 
-    long_text = "x" * (caps.max_text_length + 1)
-    spec = EmbedSpec(text=long_text, model=caps.supported_models[0], truncate=False)
+    if caps.max_text_length is not None:
+        long_text = "x" * (caps.max_text_length + 1)
+        spec = EmbedSpec(text=long_text, model=model, truncate=False)
 
-    with pytest.raises(TextTooLong) as exc_info:
-        await adapter.embed(spec)
+        with pytest.raises(TextTooLong) as exc_info:
+            await adapter.embed(spec)
 
-    err = exc_info.value
-    assert err.code == "TEXT_TOO_LONG"
-    assert err.retry_after_ms is None
-    
-    # Verify error message is descriptive
-    error_msg = str(err).lower()
-    assert any(term in error_msg for term in ['text', 'long', 'length', 'max']), \
-        f"Error should mention text length: {error_msg}"
+        err = exc_info.value
+        assert err.code == "TEXT_TOO_LONG"
+        assert err.retry_after_ms is None
+
+        error_msg = str(err).lower()
+        assert any(term in error_msg for term in ["text", "long", "length", "max"])
+    else:
+        # If no max_text_length declared, raising TextTooLong for length alone is inconsistent.
+        long_text = "x" * 20000
+        try:
+            await adapter.embed(EmbedSpec(text=long_text, model=model, truncate=False))
+        except TextTooLong:
+            raise AssertionError("Adapter raised TextTooLong but capabilities.max_text_length is None")
 
 
+@pytest.mark.asyncio
 async def test_error_handling_model_not_available_maps_correctly(adapter: BaseEmbeddingAdapter):
     """§10.4: Unsupported models must raise ModelNotAvailable with correct code."""
     with pytest.raises(ModelNotAvailable) as exc_info:
@@ -60,127 +75,131 @@ async def test_error_handling_model_not_available_maps_correctly(adapter: BaseEm
     err = exc_info.value
     assert err.code == "MODEL_NOT_AVAILABLE"
     assert err.retry_after_ms is None
-    
-    # Verify error message references the model
+
     error_msg = str(err).lower()
-    assert any(term in error_msg for term in ['model', 'available', 'support']), \
-        f"Error should mention model: {error_msg}"
+    assert any(term in error_msg for term in ["model", "available", "support"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_bad_request_validation(adapter: BaseEmbeddingAdapter):
     """§10.4: Invalid inputs must raise BadRequest with clear messages."""
-    # Test empty text
-    with pytest.raises(BadRequest) as exc_info:
-        await adapter.embed(EmbedSpec(text="", model=adapter.supported_models[0]))
-    
-    error_msg = str(exc_info.value).lower()
-    assert any(term in error_msg for term in ['text', 'empty', 'invalid']), \
-        f"Error should mention text: {error_msg}"
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
 
-    # Test empty model
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.embed(EmbedSpec(text="", model=model))
+
+    error_msg = str(exc_info.value).lower()
+    assert any(term in error_msg for term in ["text", "empty", "invalid"])
+
     with pytest.raises(BadRequest) as exc_info:
         await adapter.embed(EmbedSpec(text="test", model=""))
-    
+
     error_msg = str(exc_info.value).lower()
-    assert any(term in error_msg for term in ['model', 'empty', 'invalid']), \
-        f"Error should mention model: {error_msg}"
+    assert any(term in error_msg for term in ["model", "empty", "invalid"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_not_supported_clear_messages(adapter: BaseEmbeddingAdapter):
-    """§10.4: NotSupported errors must indicate missing features clearly."""
-    caps = adapter.capabilities
-    
-    # Test normalization if not supported
-    if not getattr(caps, "supports_normalization", False):
-        spec = EmbedSpec(text="test", model=caps.supported_models[0], normalize=True)
+    """§10.4: NotSupported errors must indicate missing features clearly, consistent with capabilities."""
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
+
+    # Normalization
+    if caps.supports_normalization:
+        res = await adapter.embed(EmbedSpec(text="test", model=model, normalize=True))
+        assert res.embedding.vector
+    else:
         with pytest.raises(NotSupported) as exc_info:
-            await adapter.embed(spec)
-        
+            await adapter.embed(EmbedSpec(text="test", model=model, normalize=True))
         error_msg = str(exc_info.value).lower()
-        assert any(term in error_msg for term in ['normaliz', 'support', 'implement']), \
-            f"Error should mention normalization: {error_msg}"
+        assert any(term in error_msg for term in ["normaliz", "support", "implement"])
 
-    # Test batch if not supported
-    if not getattr(caps, "supports_batch_embedding", True):
-        spec = BatchEmbedSpec(texts=["test"], model=caps.supported_models[0])
+    # Batch
+    if getattr(caps, "supports_batch_embedding", True):
+        res = await adapter.embed_batch(BatchEmbedSpec(texts=["test"], model=model))
+        assert res.embeddings
+    else:
         with pytest.raises(NotSupported) as exc_info:
-            await adapter.embed_batch(spec)
-        
+            await adapter.embed_batch(BatchEmbedSpec(texts=["test"], model=model))
         error_msg = str(exc_info.value).lower()
-        assert any(term in error_msg for term in ['batch', 'support', 'implement']), \
-            f"Error should mention batch: {error_msg}"
+        assert any(term in error_msg for term in ["batch", "support", "implement"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_deadline_exceeded_maps_correctly(adapter: BaseEmbeddingAdapter):
     """§12.4: DeadlineExceeded must have correct code and message."""
-    # Use a past deadline to force immediate failure
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
+
     past_deadline = int(time.time() * 1000) - 1000
-    ctx = make_ctx(OperationContext, deadline_ms=past_deadline)
-    spec = EmbedSpec(text="x", model=adapter.supported_models[0])
+    ctx = OperationContext(deadline_ms=past_deadline)
+    spec = EmbedSpec(text="x", model=model)
 
     with pytest.raises(DeadlineExceeded) as exc_info:
         await adapter.embed(spec, ctx=ctx)
 
     err = exc_info.value
     assert err.code == "DEADLINE_EXCEEDED"
-    
+
     error_msg = str(err).lower()
-    assert any(term in error_msg for term in ['deadline', 'timeout', 'exceeded']), \
-        f"Error should mention deadline: {error_msg}"
+    assert any(term in error_msg for term in ["deadline", "timeout", "exceeded"])
 
 
+@pytest.mark.asyncio
 async def test_error_handling_batch_partial_failure_codes(adapter: BaseEmbeddingAdapter):
-    """§12.5: Batch failures must use normalized error codes."""
-    if not getattr(adapter.capabilities, "supports_batch_embedding", True):
-        pytest.skip("Batch embedding not supported")
+    """§12.5: If batch returns failed_texts, they must use normalized flat codes (uppercase)."""
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
 
-    ctx = make_ctx(OperationContext, request_id="t_batch_errors", tenant="test")
-    
-    # Mix of valid and invalid inputs
+    if not getattr(caps, "supports_batch_embedding", True):
+        with pytest.raises(NotSupported):
+            await adapter.embed_batch(BatchEmbedSpec(texts=["x"], model=model))
+        return
+
+    ctx = OperationContext(request_id="t_batch_errors", tenant="test")
     texts = ["valid", "", "another valid", " "]
-    spec = BatchEmbedSpec(texts=texts, model=adapter.supported_models[0])
-    
-    result = await adapter.embed_batch(spec, ctx=ctx)
-    
-    # Validate failure structure
+    spec = BatchEmbedSpec(texts=texts, model=model)
+
+    try:
+        result = await adapter.embed_batch(spec, ctx=ctx)
+    except BadRequest:
+        # Fail-fast is acceptable for invalid batch inputs.
+        return
+
     for failure in result.failed_texts:
-        assert "index" in failure
+        assert "index" in failure and isinstance(failure["index"], int)
         assert 0 <= failure["index"] < len(texts)
-        assert "error" in failure
-        assert "code" in failure["error"]
-        assert "message" in failure["error"]
-        
-        # Error codes should be uppercase and descriptive
-        code = failure["error"]["code"]
+        assert "error" in failure and isinstance(failure["error"], str)
+        assert "code" in failure and isinstance(failure["code"], str)
+        assert "message" in failure and isinstance(failure["message"], str)
+
+        code = failure["code"]
         assert code.isupper(), f"Error code should be uppercase: {code}"
         assert len(code) <= 50, f"Error code too long: {code}"
 
 
 def test_error_handling_retryable_errors_have_retry_after_ms():
     """§12.4: Retryable errors should expose retry_after_ms hints."""
-    # Test ResourceExhausted
     err1 = ResourceExhausted("rate limited", retry_after_ms=123)
     assert err1.code == "RESOURCE_EXHAUSTED"
     assert err1.retry_after_ms == 123
-    
-    # Test Unavailable
+
     err2 = Unavailable("backend down", retry_after_ms=456)
     assert err2.code == "UNAVAILABLE"
     assert err2.retry_after_ms == 456
-    
-    # Test TransientNetwork
+
     err3 = TransientNetwork("net flake", retry_after_ms=42)
     assert err3.code == "TRANSIENT_NETWORK"
     assert err3.retry_after_ms == 42
-    
-    # Test that retry_after_ms is optional
+
     err4 = ResourceExhausted("no retry hint")
     assert err4.retry_after_ms is None
 
 
+@pytest.mark.asyncio
 async def test_error_handling_error_inheritance_hierarchy(adapter: BaseEmbeddingAdapter):
     """§12.1: Error types must follow proper inheritance hierarchy."""
-    # All embedding errors should inherit from EmbeddingAdapterError
     assert issubclass(TextTooLong, EmbeddingAdapterError)
     assert issubclass(ModelNotAvailable, EmbeddingAdapterError)
     assert issubclass(ResourceExhausted, EmbeddingAdapterError)
@@ -191,22 +210,22 @@ async def test_error_handling_error_inheritance_hierarchy(adapter: BaseEmbedding
     assert issubclass(NotSupported, EmbeddingAdapterError)
 
 
+@pytest.mark.asyncio
 async def test_error_handling_context_preserved_in_errors(adapter: BaseEmbeddingAdapter):
-    """§6.1: Error context should preserve request information."""
-    from unittest.mock import Mock
-    mock_metrics = Mock()
-    
-    ctx = make_ctx(
-        OperationContext,
+    """§6.1: Context may be provided on error paths; error objects must remain well-formed and SIEM-safe."""
+    caps = await adapter.capabilities()
+    model = caps.supported_models[0]
+
+    ctx = OperationContext(
         request_id="test_error_ctx",
-        tenant="test-tenant", 
-        metrics=mock_metrics
+        tenant="test-tenant",
+        attrs={"simulate": "none"},
     )
-    
-    try:
-        await adapter.embed(EmbedSpec(text="", model=adapter.supported_models[0]), ctx=ctx)
-    except BadRequest:
-        # If adapter implements metrics, they should capture the error
-        if mock_metrics.method_calls:
-            error_calls = [call for call in mock_metrics.method_calls if 'error' in str(call).lower()]
-            assert error_calls, "Expected error metrics for BadRequest"
+
+    with pytest.raises(BadRequest) as exc_info:
+        await adapter.embed(EmbedSpec(text="", model=model), ctx=ctx)
+
+    err = exc_info.value
+    assert isinstance(err, EmbeddingAdapterError)
+    assert isinstance(err.code, str) and err.code
+    assert "tenant" not in str(err.details).lower()

@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.delete_nodes.request.json",
+  "title": "Graph Delete Nodes Request",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "https://corpusos.com/schemas/graph/graph.envelope.request.json"
+    },
+    {
+      "properties": {
+        "op": {
+          "type": "string",
+          "const": "graph.delete_nodes"
+        },
+        "args": {
+          "type": "object",
+          "properties": {
+            "ids": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": ".*\\S.*"
+              },
+              "minItems": 1
+            },
+            "filter": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": true
+            },
+            "namespace": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "required": [
+                "ids"
+              ]
+            },
+            {
+              "required": [
+                "filter"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

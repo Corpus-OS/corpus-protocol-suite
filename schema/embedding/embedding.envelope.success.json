@@ -1,68 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://adaptersdk.org/schemas/embedding/embedding.envelope.success.json",
-  "title": "Embedding Success Envelope",
+  "$id": "https://corpusos.com/schemas/embedding/embedding.envelope.success.json",
+  "title": "Embedding Protocol Success Envelope",
   "type": "object",
-  "additionalProperties": false,
-  "required": ["ok", "code", "ms", "result"],
-  "properties": {
-    "ok": { "type": "boolean", "const": true },
-    "code": { "type": "string", "enum": ["OK", "PARTIAL_SUCCESS"] },
-    "ms": { "type": "number", "minimum": 0 },
-    "result": {
-      "oneOf": [
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.embed.success.json" },
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.embed_batch.success.json" },
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.count_tokens.success.json" },
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.capabilities.success.json" },
-        { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.health.success.json" }
-      ]
-    },
-    "protocol": { "type": "string", "const": "embedding/v1.0" },
-    "component": { "type": "string", "const": "embedding" },
-    "schema_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$" },
-    "request_id": { "type": "string", "pattern": "^[A-Za-z0-9._~:-]{1,256}$" },
-    "result_hash": {
-      "type": "string",
-      "pattern": "^[A-Fa-f0-9]{64}$",
-      "description": "SHA-256 of canonical JSON of `result` (no envelope fields)."
-    },
-    "warnings": {
-      "type": "array",
-      "maxItems": 100,
-      "items": { "$ref": "https://adaptersdk.org/schemas/embedding/embedding.types.warning.json" }
-    },
-    "deprecation": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": {
-        "deprecated": { "type": "boolean", "default": false },
-        "replacements": {
-          "type": "array",
-          "maxItems": 8,
-          "items": { "type": "string", "pattern": "^embedding\\.[a-z_]+$" }
-        },
-        "note": { "type": "string", "maxLength": 2000 }
-      }
-    }
-  },
   "allOf": [
     {
-      "if": {
-        "properties": { "code": { "const": "PARTIAL_SUCCESS" } },
-        "required": ["code"]
-      },
-      "then": {
-        "properties": {
-          "result": {
-            "properties": {
-              "failures": { "minItems": 1 }
-            },
-            "required": ["failures"]
-          }
-        }
-      }
+      "$ref": "https://corpusos.com/schemas/common/envelope.success.json"
     }
-  ],
-  "$comment": "Partial-success guardrail ensures failures[] present when code=PARTIAL_SUCCESS."
+  ]
 }

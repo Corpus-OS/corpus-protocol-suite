@@ -9,6 +9,7 @@ Spec refs:
 
 import time
 import asyncio
+from typing import Optional
 import pytest
 from corpus_sdk.vector.vector_base import (
     OperationContext,
@@ -62,7 +63,8 @@ async def test_deadline_deadline_exceeded_on_expired_budget(adapter):
         await adapter.query(QuerySpec(vector=[0.1], top_k=1, namespace="default"), ctx=ctx)
     
     err = exc_info.value
-    assert err.code in ("DEADLINE", "DEADLINE_EXCEEDED")
+    # Align with BaseVectorAdapter code normalization.
+    assert getattr(err, "code", None) in ("DEADLINE_EXCEEDED", "DEADLINE")
 
 
 async def test_deadline_preflight_deadline_check_on_upsert(adapter):

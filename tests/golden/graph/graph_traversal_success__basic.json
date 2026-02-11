@@ -1,0 +1,44 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 22.2,
+  "result": {
+    "nodes": [
+      {
+        "id": "node_1",
+        "labels": [
+          "Person"
+        ],
+        "properties": {
+          "name": "Ada"
+        }
+      }
+    ],
+    "relationships": [
+      {
+        "id": "edge_1",
+        "src": "node_1",
+        "dst": "node_2",
+        "label": "KNOWS",
+        "properties": {}
+      }
+    ],
+    "paths": [
+      [
+        {
+          "id": "node_1"
+        },
+        {
+          "id": "edge_1"
+        },
+        {
+          "id": "node_2"
+        }
+      ]
+    ],
+    "summary": {
+      "paths": 1
+    },
+    "namespace": "default"
+  }
+}

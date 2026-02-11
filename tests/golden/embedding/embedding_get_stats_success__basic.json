@@ -1,0 +1,17 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.9,
+  "result": {
+    "total_requests": 100,
+    "total_texts": 130,
+    "total_tokens": 1000,
+    "cache_hits": 40,
+    "cache_misses": 60,
+    "avg_processing_time_ms": 4.2,
+    "error_count": 2,
+    "stream_requests": 10,
+    "stream_chunks_generated": 20,
+    "stream_abandoned": 1
+  }
+}

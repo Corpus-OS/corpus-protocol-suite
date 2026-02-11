@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/llm/llm.health.request.json",
+  "title": "LLM Health Request",
+  "description": "Request envelope for llm.health. Allows args extensions.",
+  "allOf": [
+    { "$ref": "https://corpusos.com/schemas/common/envelope.request.json" },
+    {
+      "type": "object",
+      "properties": {
+        "op": { "const": "llm.health" },
+        "args": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "required": ["op", "ctx", "args"]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 3.2,
+  "result": {
+    "server": "corpus-embedding",
+    "version": "1.0.0",
+    "supported_models": [
+      "embed-small"
+    ],
+    "protocol": "embedding/v1.0",
+    "max_batch_size": null,
+    "max_text_length": null,
+    "max_dimensions": null,
+    "supports_normalization": false,
+    "supports_truncation": false,
+    "supports_token_counting": false,
+    "supports_streaming": false,
+    "supports_batch_embedding": false,
+    "supports_caching": false,
+    "idempotent_writes": false,
+    "supports_multi_tenant": false,
+    "normalizes_at_source": false,
+    "truncation_mode": "none",
+    "supports_deadline": false
+  }
+}

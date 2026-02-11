@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://corpusos.com/schemas/graph/graph.types.query_result.json",
+  "title": "Graph Query Result",
+  "type": "object",
+  "properties": {
+    "records": {
+      "type": "array",
+      "description": "Query results (any JSON value)"
+    },
+    "summary": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dialect": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "namespace": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "records",
+    "summary"
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,35 @@
+{
+  "ok": true,
+  "code": "OK",
+  "ms": 22.4,
+  "result": {
+    "embeddings": [
+      {
+        "vector": [
+          0.1,
+          0.2
+        ],
+        "text": "a",
+        "model": "embed-small",
+        "dimensions": 2,
+        "index": 0,
+        "metadata": null
+      },
+      {
+        "vector": [
+          0.3,
+          0.4
+        ],
+        "text": "b",
+        "model": "embed-small",
+        "dimensions": 2,
+        "index": 1,
+        "metadata": null
+      }
+    ],
+    "model": "embed-small",
+    "total_texts": 2,
+    "total_tokens": 2,
+    "failed_texts": []
+  }
+}

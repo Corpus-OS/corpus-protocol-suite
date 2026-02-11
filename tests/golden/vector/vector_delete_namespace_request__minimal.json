@@ -1,0 +1,10 @@
+{
+  "op": "vector.delete_namespace",
+  "ctx": {
+    "request_id": "t_vector_delete_ns_min",
+    "tenant": "test"
+  },
+  "args": {
+    "namespace": "tenant_a"
+  }
+}
