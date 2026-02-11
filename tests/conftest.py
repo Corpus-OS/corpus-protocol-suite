@@ -146,7 +146,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "llm": ProtocolConfig(
         name="llm",
         display_name="LLM Protocol V1.0",
-        conformance_levels={"gold": 111, "silver": 89, "development": 56},
+        conformance_levels={"gold": 132, "silver": 106, "development": 66},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
@@ -250,7 +250,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "vector": ProtocolConfig(
         name="vector",
         display_name="Vector Protocol V1.0",
-        conformance_levels={"gold": 73, "silver": 58, "development": 36},
+        conformance_levels={"gold": 108, "silver": 87, "development": 54},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
@@ -335,7 +335,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "graph": ProtocolConfig(
         name="graph",
         display_name="Graph Protocol V1.0",
-        conformance_levels={"gold": 68, "silver": 54, "development": 34},
+        conformance_levels={"gold": 99, "silver": 80, "development": 50},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
@@ -405,7 +405,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "embedding": ProtocolConfig(
         name="embedding",
         display_name="Embedding Protocol V1.0",
-        conformance_levels={"gold": 75, "silver": 60, "development": 38},
+        conformance_levels={"gold": 135, "silver": 108, "development": 68},
         test_categories={
             "wire_contract": "Wire Contract & Routing",
             "core_ops": "Core Operations",
@@ -473,7 +473,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "wire": ProtocolConfig(
         name="wire",
         display_name="Wire Request Conformance Suite",
-        conformance_levels={"gold": 73, "silver": 58, "development": 37},
+        conformance_levels={"gold": 76, "silver": 61, "development": 38},
         test_categories={"wire": "Wire Request Envelope Conformance"},
         spec_sections={"wire": "Wire Request Conformance Suite (tests/live/test_wire_conformance.py)"},
         error_guidance={
@@ -503,7 +503,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "schema": ProtocolConfig(
         name="schema",
         display_name="CORPUS Schema Conformance Suite",
-        conformance_levels={"gold": 13, "silver": 10, "development": 7},
+        conformance_levels={"gold": 199, "silver": 160, "development": 100},
         test_categories={
             "schema_loading": "Schema Loading & IDs",
             "file_organization": "File Organization",
@@ -647,7 +647,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "embedding_frameworks": ProtocolConfig(
         name="embedding_frameworks",
         display_name="Embedding Framework Adapters V1.0",
-        conformance_levels={"gold": 121, "silver": 97, "development": 60},
+        conformance_levels={"gold": 418, "silver": 335, "development": 209},
         test_categories={
             "framework_specific": "Framework-Specific Adapters",
             "contract_interface": "Cross-Framework Interface Conformance",
@@ -710,7 +710,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "graph_frameworks": ProtocolConfig(
         name="graph_frameworks",
         display_name="Graph Framework Adapters V1.0",
-        conformance_levels={"gold": 184, "silver": 147, "development": 92},
+        conformance_levels={"gold": 574, "silver": 460, "development": 287},
         test_categories={
             "framework_specific": "Framework-Specific Graph Adapters",
             "contract_interface": "Cross-Framework Interface Conformance",
@@ -825,7 +825,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "llm_frameworks": ProtocolConfig(
         name="llm_frameworks",
         display_name="LLM Framework Adapters V1.0",
-        conformance_levels={"gold": 150, "silver": 120, "development": 75},
+        conformance_levels={"gold": 624, "silver": 500, "development": 312},
         test_categories={
             "framework_specific": "Framework-Specific LLM Adapters",
             "contract_interface": "Cross-Framework Interface Conformance",
@@ -876,7 +876,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "vector_frameworks": ProtocolConfig(
         name="vector_frameworks",
         display_name="Vector Framework Adapters V1.0",
-        conformance_levels={"gold": 130, "silver": 104, "development": 65},
+        conformance_levels={"gold": 958, "silver": 767, "development": 479},
         test_categories={
             "framework_specific": "Framework-Specific Vector Adapters",
             "contract_interface": "Cross-Framework Interface Conformance",
