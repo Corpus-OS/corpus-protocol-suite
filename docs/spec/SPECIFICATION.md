@@ -153,7 +153,7 @@ SPDX-License-Identifier: Apache-2.0
 
 The AI infrastructure landscape is fragmenting in two directions simultaneously. At the framework layer, LangChain, LlamaIndex, AutoGen, CrewAI, and Semantic Kernel each define their own abstractions for orchestrating AI operations. At the provider layer, OpenAI, Anthropic, Cohere, Pinecone, Weaviate, Neo4j, and countless others expose incompatible APIs. This creates an N×M integration problem: every framework must maintain adapters for every provider, and every new provider means updates across all frameworks. The result is duplicated effort, inconsistent error handling, incompatible observability, and operational blindness across the stack.
 
-Corpus solves this by defining vendor-neutral protocol standards that sit beneath frameworks and above providers—the TCP/IP for AI infrastructure. Frameworks adopt common protocols once and get compatibility with all conformant providers. Providers implement protocols once and gain compatibility with all conformant frameworks. Enterprises get unified observability, consistent error semantics, and genuine portability across their entire AI stack,without abandoning existing tooling.​​​​​​​​​​​​​​​​
+Corpus solves this by defining vendor-neutral protocol standards that sit beneath frameworks and above providers. Frameworks adopt common protocols once and get compatibility with all conformant providers. Corpus also enables framework interoperability. Providers implement protocols once and gain compatibility with all conformant frameworks. Enterprises get unified observability, consistent error semantics, and genuine portability across their entire AI stack,without abandoning existing tooling.​​​​​​​​​​​​​​​​
 
 ### 1.2. Scope
 
