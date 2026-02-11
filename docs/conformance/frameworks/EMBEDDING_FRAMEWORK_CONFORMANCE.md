@@ -29,7 +29,7 @@ This suite constitutes the **official Embedding Framework Adapters V1.0 Referenc
 **Adapter Version:** Embedding Framework Adapters V1.0  
 **Protocol Version:** Embedding Protocol V1.0  
 **Status:** Stable / Production-Ready  
-**Last Updated:** 2026-01-30  
+**Last Updated:** 2026-02-10  
 **Test Location:** `tests/frameworks/embedding/`
 
 ## Conformance Summary
@@ -309,7 +309,6 @@ Registry integrity and descriptor validation tests.
 - **Contract Tests**: Each framework is validated by 38 parametrized contract tests (190 total ÷ 5 = 38 per framework)
 - **Total Tests Validating**: Combined coverage showing how thoroughly each framework is tested
 
-
 ### Execution Time Breakdown
 
 | Category | Tests | Avg Time/Test |
@@ -505,15 +504,15 @@ Use this when implementing or validating a new **Embedding framework adapter**.
 
 **Certification Levels:**
 - 🏆 **Platinum:** 418/418 tests (100%) - All frameworks, all tests passing
-- 🥇 **Gold:** 334+ tests (80%+) - Most functionality validated
-- 🥈 **Silver:** 209+ tests (50%+) - Core functionality validated
-- 🔬 **Development:** <50% - Early development, not production-ready
+- 🥇 **Gold:** 418 tests (100%) - All frameworks, all tests passing
+- 🥈 **Silver:** 335+ tests (80%+) - Core functionality validated
+- 🔬 **Development:** 210+ tests (50%+) - Early development, not production-ready
 
 **Certification Requirements:**
-- **Platinum:** Pass all 418 tests with zero failures
-- **Gold:** Pass ≥334 tests (all parametrized + ≥60% framework-specific)
-- **Silver:** Pass ≥209 tests (all parametrized + ≥10% framework-specific)
-- **Development:** Pass <50% of tests
+- **🏆 Platinum:** Pass all 418 tests with zero failures
+- **🥇 Gold:** Pass all 418 tests with zero failures  
+- **🥈 Silver:** Pass ≥335 tests (80%+)
+- **🔬 Development:** Pass ≥210 tests (50%+)
 
 ---
 
@@ -597,7 +596,7 @@ pytest tests/frameworks/embedding/ --profile
 
 ---
 
-**Last Updated:** 2026-01-30  
+**Last Updated:** 2026-02-10  
 **Maintained By:** Corpus SDK Team  
 **Status:** 100% V1.0 Conformant - Production Ready - Platinum Certification 🏆  
 **Test Count:** 418/418 tests (100%)  
