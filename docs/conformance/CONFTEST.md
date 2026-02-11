@@ -59,7 +59,7 @@ except ImportError:
 ```
 
 **Minimum Requirements**:
-- **Python**: 3.8+ (based on type hints and dataclass usage in the file)
+- **Python**: 3.10+ (based on type hints and dataclass usage in the file)
 - **SQLite**: ≥3.35.0 (or `pysqlite3-binary` package)
 - **pytest**: 7.0+ (based on plugin API usage)
 
