@@ -37,7 +37,7 @@ This suite constitutes the **official Corpus Protocol Suite V1.0 Reference Confo
 **Protocol Version:** Corpus Protocol Suite V1.0  
 **Status:** Stable / Production-Ready  
 **Last Updated:** 2026-02-10  
-**Test Location:** `https://github.com/corpus/protocol-tests`  
+**Test Location:** `https://github.com/tests/`  
 **Full Conformance (Platinum):** MUST pass **760/760** tests
 
 ## Performance Characteristics
