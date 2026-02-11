@@ -586,7 +586,7 @@ PROTOCOLS_CONFIG: Dict[str, ProtocolConfig] = {
     "golden": ProtocolConfig(
         name="golden",
         display_name="CORPUS Golden Wire Suite",
-        conformance_levels={"gold": 78, "silver": 62, "development": 39},
+        conformance_levels={"gold": 199, "silver": 160, "development": 100},
         test_categories={
             "core_validation": "Core Schema Validation",
             "ndjson_stream": "NDJSON Stream Validation",
