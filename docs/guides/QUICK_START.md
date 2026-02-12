@@ -94,10 +94,10 @@ An **adapter** is a thin translation layer that converts between Corpus Protocol
 **Critical insight:** The base class is *not* abstract—it provides working fallbacks. You only override what your provider does *better* than the default.
 
 The full protocol specification is embedded in the docstrings of each base class:
-- [`corpus_sdk/embedding/embedding_base.py`](../corpus_sdk/embedding/embedding_base.py) — Embedding Protocol V1
-- [`corpus_sdk/llm/llm_base.py`](../corpus_sdk/llm/llm_base.py) — LLM Protocol V1
-- [`corpus_sdk/vector/vector_base.py`](../corpus_sdk/vector/vector_base.py) — Vector Protocol V1
-- [`corpus_sdk/graph/graph_base.py`](../corpus_sdk/graph/graph_base.py) — Graph Protocol V1
+- [`../../corpus_sdk/embedding/embedding_base.py`](../../corpus_sdk/embedding/embedding_base.py) — Embedding Protocol V1
+- [`../../corpus_sdk/llm/llm_base.py`](../../corpus_sdk/llm/llm_base.py) — LLM Protocol V1
+- [`../../corpus_sdk/vector/vector_base.py`](../../corpus_sdk/vector/vector_base.py) — Vector Protocol V1
+- [`../../corpus_sdk/graph/graph_base.py`](../../corpus_sdk/graph/graph_base.py) — Graph Protocol V1
 
 ---
 
@@ -2691,7 +2691,7 @@ if ctx.idempotency_key:
     if cached: return cached
 ```
 
-Full specification: [`corpus_sdk/embedding/embedding_base.py`](../corpus_sdk/embedding/embedding_base.py)
+Full specification: [`../../corpus_sdk/embedding/embedding_base.py`](../../corpus_sdk/embedding/embedding_base.py)
 
 ---
 
@@ -2719,7 +2719,7 @@ if not caps.supports_system_message:
     raise NotSupported("system_message not supported")
 ```
 
-Full specification: [`corpus_sdk/llm/llm_base.py`](../corpus_sdk/llm/llm_base.py)
+Full specification: [`../../corpus_sdk/llm/llm_base.py`](../../corpus_sdk/llm/llm_base.py)
 
 ---
 
@@ -2751,7 +2751,7 @@ except Exception:
     text = None  # Graceful degradation
 ```
 
-Full specification: [`corpus_sdk/vector/vector_base.py`](../corpus_sdk/vector/vector_base.py)
+Full specification: [`../../corpus_sdk/vector/vector_base.py`](../../corpus_sdk/vector/vector_base.py)
 
 ---
 
@@ -2782,7 +2782,7 @@ if spec.dialect and caps.supported_query_dialects:
         raise NotSupported(f"dialect '{spec.dialect}' not supported")
 ```
 
-Full specification: [`corpus_sdk/graph/graph_base.py`](../corpus_sdk/graph/graph_base.py)
+Full specification: [`../../corpus_sdk/graph/graph_base.py`](../../corpus_sdk/graph/graph_base.py)
 
 ---
 
@@ -2860,14 +2860,12 @@ if await txn.commit():
 
 | Document | Purpose | Location |
 |----------|---------|----------|
-| **Protocol Specifications** | Normative behavior for each protocol | [`corpus_sdk/embedding/embedding_base.py`](../corpus_sdk/embedding/embedding_base.py)<br>[`corpus_sdk/llm/llm_base.py`](../corpus_sdk/llm/llm_base.py)<br>[`corpus_sdk/vector/vector_base.py`](../corpus_sdk/vector/vector_base.py)<br>[`corpus_sdk/graph/graph_base.py`](../corpus_sdk/graph/graph_base.py) |
+| **Protocol Specifications** | Normative behavior for each protocol | [`../../corpus_sdk/embedding/embedding_base.py`](../../corpus_sdk/embedding/embedding_base.py)<br>[`../../corpus_sdk/llm/llm_base.py`](../../corpus_sdk/llm/llm_base.py)<br>[`../../corpus_sdk/vector/vector_base.py`](../../corpus_sdk/vector/vector_base.py)<br>[`../../corpus_sdk/graph/graph_base.py`](../../corpus_sdk/graph/graph_base.py) |
 | **Implementation Guide** | Deep dive on `_do_*` semantics | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) |
 | **Conformance Guide** | Running certification suites | [`CONFORMANCE_GUIDE.md`](CONFORMANCE_GUIDE.md) |
 | **Adapter Recipes** | Multi-cloud and RAG scenarios | [`ADAPTER_RECIPES.md`](ADAPTER_RECIPES.md) *(coming soon)* |
-| **Error Taxonomy** | Complete error hierarchy | [`ERRORS.md`](ERRORS.md) *(in spec docstrings)* |
-| **Metrics Schema** | SIEM-safe observability | [`METRICS.md`](METRICS.md) *(in `MetricsSink` protocol)* |
 
-**The conformance tests in `tests/` are the source of truth.** When this document and the tests disagree, **the tests are correct.**
+**The conformance tests in [`../../tests/`](../../tests/) are the source of truth.** When this document and the tests disagree, **the tests are correct.**
 
 ---
 
@@ -3043,8 +3041,8 @@ if "cypher" not in caps.supported_query_dialects:
 | Term | Definition | Location |
 |------|------------|----------|
 | **Adapter** | A class that implements `_do_*` hooks and `build_*_envelope()` methods | This guide |
-| **Base Class** | `BaseEmbeddingAdapter`, `BaseLLMAdapter`, `BaseVectorAdapter`, `BaseGraphAdapter` | `corpus_sdk/*/*_base.py` |
-| **Certification Suite** | The conformance tests in `tests/embedding/`, `tests/llm/`, etc. | `tests/` directory |
+| **Base Class** | `BaseEmbeddingAdapter`, `BaseLLMAdapter`, `BaseVectorAdapter`, `BaseGraphAdapter` | [`../../corpus_sdk/embedding/embedding_base.py`](../../corpus_sdk/embedding/embedding_base.py)<br>[`../../corpus_sdk/llm/llm_base.py`](../../corpus_sdk/llm/llm_base.py)<br>[`../../corpus_sdk/vector/vector_base.py`](../../corpus_sdk/vector/vector_base.py)<br>[`../../corpus_sdk/graph/graph_base.py`](../../corpus_sdk/graph/graph_base.py) |
+| **Certification Suite** | The conformance tests in `tests/embedding/`, `tests/llm/`, etc. | [`../../tests/`](../../tests/) |
 | **Gold Certification** | 100% pass rate in a single protocol | Section 5 |
 | **build_*_envelope()** | Test fixture methods that return wire envelopes (REQUIRED) | Section 3 |
 | **Wire Envelope** | The JSON `{op, ctx, args}` structure all Corpus services speak | Base class docstrings |
@@ -3149,6 +3147,4 @@ Quick fix: Capabilities missing required field 'protocol'
 **Last Updated:** 2026-02-11  
 **Scope:** Complete adapter authoring reference for all Corpus Protocols v1.0 (Embedding, LLM, Vector, Graph).
 
-**The conformance tests in `tests/` are the source of truth.** When this document and the tests disagree, **the tests are correct.**
-
----
+**The conformance tests in [`../../tests/`](../../tests/) are the source of truth.** When this document and the tests disagree, **the tests are correct.**
