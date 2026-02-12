@@ -200,7 +200,8 @@
 
 &nbsp;&nbsp;&nbsp;&nbsp;[15.4 Graph Adapter Checklist](#154-graph-adapter-checklist)
 
-[16. COMMON PITFALLS (55+ CONFORMANCE FAILURES)](#16-common-pitfalls-55-conformance-failures)
+&nbsp;&nbsp;&nbsp;&nbsp; [16. COMMON PITFALLS (55+ CONFORMANCE FAILURES)](#16-common-pitfalls-55-conformance-failures)
+
 ---
 
 ## 1. PURPOSE & SCOPE
