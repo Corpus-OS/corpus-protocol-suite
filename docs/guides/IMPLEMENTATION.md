@@ -1,4 +1,4 @@
-# Corpus OS IMPLEMENTATION GUIDE
+# Corpus OS Implementation Guide
 
 ## ⚠️ Implementation Ground Rules (READ FIRST)
 
