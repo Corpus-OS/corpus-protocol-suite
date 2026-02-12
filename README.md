@@ -49,7 +49,7 @@ Reference implementation of the **Corpus OS Protocol and SDK** — a **wire-firs
 
 ---
 
-## Why CORPUS
+## Why Corpus OS
 
 Modern AI platforms juggle multiple LLM, embedding, vector, and graph backends. Each vendor ships unique APIs, error schemes, rate limits, and capabilities — making cross-provider integration brittle and costly.
 
