@@ -44,100 +44,163 @@
 ---
 **TABLE OF CONTENTS**
 
-1. PURPOSE & SCOPE
+[1. PURPOSE & SCOPE](#1-purpose--scope)
 
-2. SYSTEM LAYOUT
-   2.1 Base Classes (Provided)
-   2.2 What You Implement
-   2.3 What You NEVER Implement
+[2. SYSTEM LAYOUT](#2-system-layout)
 
-3. CONTEXT & IDENTITY (PRODUCTION RULES)
-   3.1 OperationContext Structure
-   3.2 Deadline Propagation (MANDATORY)
-   3.3 Tenant Hashing (MANDATORY)
-   3.4 CRITICAL: Context Attributes Are TEST ONLY
+&nbsp;&nbsp;&nbsp;&nbsp;[2.1 Base Classes (Provided)](#21-base-classes-provided)
 
-4. ERROR TAXONOMY & MAPPING
-   4.1 Canonical Error Hierarchy
-   4.2 Provider Error Mapping (MANDATORY)
-   4.3 Error Detail Schemas (PER ERROR TYPE) (MANDATORY)
-   4.4 Retry Semantics (MANDATORY)
+&nbsp;&nbsp;&nbsp;&nbsp;[2.2 What You Implement](#22-what-you-implement)
 
-5. MODES: THIN vs STANDALONE
+&nbsp;&nbsp;&nbsp;&nbsp;[2.3 What You NEVER Implement](#23-what-you-never-implement)
 
-6. DEADLINES & CANCELLATION
+[3. CONTEXT & IDENTITY (PRODUCTION RULES)](#3-context--identity-production-rules)
 
-7. LLM ADAPTER IMPLEMENTATION REQUIREMENTS
-   7.1 Required Methods
-   7.2 Shared Planning Path (COMPLETE and STREAM) (MANDATORY)
-   7.3 Tool Calling (Validation and Accounting) (MANDATORY)
-   7.4 Token Counting and Usage Accounting (TOOL CALLS) (MANDATORY)
-   7.5 Stop Sequences (FIRST Occurrence Rule) (MANDATORY)
-   7.6 Streaming Rules (Tool Calls) (MANDATORY)
-   7.7 Capabilities Enforcement (Operation Coupling) (MANDATORY)
-   7.8 Role Validation (Permissive, Not Restrictive) (MANDATORY)
-   7.9 Complete LLM Example (Production Ready)
+&nbsp;&nbsp;&nbsp;&nbsp;[3.1 OperationContext Structure](#31-operationcontext-structure)
 
-8. EMBEDDING ADAPTER IMPLEMENTATION REQUIREMENTS
-   8.1 Required Methods
-   8.2 Validation Placement (_do_embed MUST Validate) (MANDATORY)
-   8.3 Batch Failure Mode (CHOOSE ONE) (MANDATORY)
-   8.4 Batch Failure Mode (CONFIGURABILITY FORBIDDEN) (MANDATORY)
-   8.5 Truncation and Normalization (Base Owns, You Report)
-   8.6 Cache Stats Ownership (CRITICAL BOUNDARY) (MANDATORY)
-   8.7 Streaming Pattern (CHOOSE ONE) (MANDATORY)
-   8.8 Capabilities (NO RUNTIME CONFIGURATION) (MANDATORY)
-   8.9 Token Counting (NO APPROXIMATIONS) (MANDATORY)
-   8.10 Complete Embedding Example (Production Ready)
+&nbsp;&nbsp;&nbsp;&nbsp;[3.2 Deadline Propagation (MANDATORY)](#32-deadline-propagation-mandatory)
 
-9. VECTOR ADAPTER IMPLEMENTATION REQUIREMENTS
-   9.1 Required Methods
-   9.2 Namespace Authority (Spec.namespace is Authoritative) (MANDATORY)
-   9.3 Include Vectors Contract ([] NOT null) (MANDATORY)
-   9.4 Filter Dialect Validation (Strict, No Silent Ignore) (MANDATORY)
-   9.5 Filter Operator Error Details (CANONICAL SHAPE) (MANDATORY)
-   9.6 Batch Query Atomicity (All or Nothing) (MANDATORY)
-   9.7 Delete Idempotency (No Error on Missing) (MANDATORY)
-   9.8 Delete Parameter Rule (IDs XOR Filter) (MANDATORY)
-   9.9 Distance Metric Strings (EXACT VALUES) (MANDATORY)
-   9.10 Suggested Batch Reduction (Percentage Semantics) (MANDATORY)
-   9.11 IndexNotReady (Retry Semantics) (MANDATORY)
-   9.12 Namespace Mismatch Error Details (CANONICAL SHAPE) (MANDATORY)
-   9.13 Dimension Mismatch Error Details (CANONICAL SHAPE) (MANDATORY)
-   9.14 Health Response (Namespace Status) (MANDATORY)
-   9.15 Complete Vector Example (Production Ready)
+&nbsp;&nbsp;&nbsp;&nbsp;[3.3 Tenant Hashing (MANDATORY)](#33-tenant-hashing-mandatory)
 
-10. GRAPH ADAPTER IMPLEMENTATION REQUIREMENTS
-    10.1 Required Methods
-    10.2 Batch/Transaction Result Envelope ({ok, result}) (MANDATORY)
-    10.3 Shared Op Executor (Single Kernel for Batch + Transaction) (MANDATORY)
-    10.4 Dialect Validation (TWO Layers) (MANDATORY)
-    10.5 Delete Idempotency (No Error on Missing) (MANDATORY)
-    10.6 Bulk Vertices Pagination (Cursor Contract) (MANDATORY)
-    10.7 Traversal Result Shape (Nodes, Edges, Paths) (MANDATORY)
-    10.8 Capabilities Enforcement (Operation Coupling) (MANDATORY)
-    10.9 Capabilities (NO RUNTIME CONFIGURATION) (MANDATORY)
-    10.10 Complete Graph Example (Production Ready)
+&nbsp;&nbsp;&nbsp;&nbsp;[3.4 CRITICAL: Context Attributes Are TEST ONLY](#34-critical-context-attributes-are-test-only)
 
-11. CACHE OWNERSHIP BOUNDARY (CRITICAL)
-    11.1 Embedding Stats (NO Cache Metrics) (MANDATORY)
-    11.2 Capabilities Caching (Allowed, With Rules) (MANDATORY)
+[4. ERROR TAXONOMY & MAPPING](#4-error-taxonomy--mapping)
 
-12. BATCH FAILURE MODE (DECISION MATRIX)
+&nbsp;&nbsp;&nbsp;&nbsp;[4.1 Canonical Error Hierarchy](#41-canonical-error-hierarchy)
 
-13. STREAMING PATTERN (DECISION MATRIX)
+&nbsp;&nbsp;&nbsp;&nbsp;[4.2 Provider Error Mapping (MANDATORY)](#42-provider-error-mapping-mandatory)
 
-14. PRODUCTION HARDENING (REMOVE ALL MOCK ONLY CODE)
-    14.1 Patterns to DELETE Entirely
-    14.2 Patterns to TRANSFORM
+&nbsp;&nbsp;&nbsp;&nbsp;[4.3 Error Detail Schemas (PER ERROR TYPE) (MANDATORY)](#43-error-detail-schemas-per-error-type-mandatory)
 
-15. PER DOMAIN IMPLEMENTATION CHECKLISTS
-    15.1 LLM Adapter Checklist
-    15.2 Embedding Adapter Checklist
-    15.3 Vector Adapter Checklist
-    15.4 Graph Adapter Checklist
+&nbsp;&nbsp;&nbsp;&nbsp;[4.4 Retry Semantics (MANDATORY)](#44-retry-semantics-mandatory)
 
-16. COMMON PITFALLS (55+ CONFORMANCE FAILURES)
+[5. MODES: THIN vs STANDALONE](#5-modes-thin-vs-standalone)
+
+[6. DEADLINES & CANCELLATION](#6-deadlines--cancellation)
+
+[7. LLM ADAPTER IMPLEMENTATION REQUIREMENTS](#7-llm-adapter-implementation-requirements)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.1 Required Methods](#71-required-methods)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.2 Shared Planning Path (COMPLETE and STREAM) (MANDATORY)](#72-shared-planning-path-complete-and-stream-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.3 Tool Calling (Validation and Accounting) (MANDATORY)](#73-tool-calling-validation-and-accounting-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.4 Token Counting and Usage Accounting (TOOL CALLS) (MANDATORY)](#74-token-counting-and-usage-accounting-tool-calls-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.5 Stop Sequences (FIRST Occurrence Rule) (MANDATORY)](#75-stop-sequences-first-occurrence-rule-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.6 Streaming Rules (Tool Calls) (MANDATORY)](#76-streaming-rules-tool-calls-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.7 Capabilities Enforcement (Operation Coupling) (MANDATORY)](#77-capabilities-enforcement-operation-coupling-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.8 Role Validation (Permissive, Not Restrictive) (MANDATORY)](#78-role-validation-permissive-not-restrictive-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[7.9 Complete LLM Example (Production Ready)](#79-complete-llm-example-production-ready)
+
+[8. EMBEDDING ADAPTER IMPLEMENTATION REQUIREMENTS](#8-embedding-adapter-implementation-requirements)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.1 Required Methods](#81-required-methods)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.2 Validation Placement (_do_embed MUST Validate) (MANDATORY)](#82-validation-placement-_do_embed-must-validate-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.3 Batch Failure Mode (CHOOSE ONE) (MANDATORY)](#83-batch-failure-mode-choose-one-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.4 Batch Failure Mode (CONFIGURABILITY FORBIDDEN) (MANDATORY)](#84-batch-failure-mode-configurability-forbidden-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.5 Truncation and Normalization (Base Owns, You Report)](#85-truncation-and-normalization-base-owns-you-report)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.6 Cache Stats Ownership (CRITICAL BOUNDARY) (MANDATORY)](#86-cache-stats-ownership-critical-boundary-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.7 Streaming Pattern (CHOOSE ONE) (MANDATORY)](#87-streaming-pattern-choose-one-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.8 Capabilities (NO RUNTIME CONFIGURATION) (MANDATORY)](#88-capabilities-no-runtime-configuration-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.9 Token Counting (NO APPROXIMATIONS) (MANDATORY)](#89-token-counting-no-approximations-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[8.10 Complete Embedding Example (Production Ready)](#810-complete-embedding-example-production-ready)
+
+[9. VECTOR ADAPTER IMPLEMENTATION REQUIREMENTS](#9-vector-adapter-implementation-requirements)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.1 Required Methods](#91-required-methods)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.2 Namespace Authority (Spec.namespace is Authoritative) (MANDATORY)](#92-namespace-authority-specnamespace-is-authoritative-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.3 Include Vectors Contract ([] NOT null) (MANDATORY)](#93-include-vectors-contract--not-null-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.4 Filter Dialect Validation (Strict, No Silent Ignore) (MANDATORY)](#94-filter-dialect-validation-strict-no-silent-ignore-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.5 Filter Operator Error Details (CANONICAL SHAPE) (MANDATORY)](#95-filter-operator-error-details-canonical-shape-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.6 Batch Query Atomicity (All or Nothing) (MANDATORY)](#96-batch-query-atomicity-all-or-nothing-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.7 Delete Idempotency (No Error on Missing) (MANDATORY)](#97-delete-idempotency-no-error-on-missing-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.8 Delete Parameter Rule (IDs XOR Filter) (MANDATORY)](#98-delete-parameter-rule-ids-xor-filter-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.9 Distance Metric Strings (EXACT VALUES) (MANDATORY)](#99-distance-metric-strings-exact-values-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.10 Suggested Batch Reduction (Percentage Semantics) (MANDATORY)](#910-suggested-batch-reduction-percentage-semantics-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.11 IndexNotReady (Retry Semantics) (MANDATORY)](#911-indexnotready-retry-semantics-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.12 Namespace Mismatch Error Details (CANONICAL SHAPE) (MANDATORY)](#912-namespace-mismatch-error-details-canonical-shape-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.13 Dimension Mismatch Error Details (CANONICAL SHAPE) (MANDATORY)](#913-dimension-mismatch-error-details-canonical-shape-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.14 Health Response (Namespace Status) (MANDATORY)](#914-health-response-namespace-status-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[9.15 Complete Vector Example (Production Ready)](#915-complete-vector-example-production-ready)
+
+[10. GRAPH ADAPTER IMPLEMENTATION REQUIREMENTS](#10-graph-adapter-implementation-requirements)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.1 Required Methods](#101-required-methods)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.2 Batch/Transaction Result Envelope ({ok, result}) (MANDATORY)](#102-batchtransaction-result-envelope-ok-result-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.3 Shared Op Executor (Single Kernel for Batch + Transaction) (MANDATORY)](#103-shared-op-executor-single-kernel-for-batch--transaction-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.4 Dialect Validation (TWO Layers) (MANDATORY)](#104-dialect-validation-two-layers-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.5 Delete Idempotency (No Error on Missing) (MANDATORY)](#105-delete-idempotency-no-error-on-missing-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.6 Bulk Vertices Pagination (Cursor Contract) (MANDATORY)](#106-bulk-vertices-pagination-cursor-contract-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.7 Traversal Result Shape (Nodes, Edges, Paths) (MANDATORY)](#107-traversal-result-shape-nodes-edges-paths-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.8 Capabilities Enforcement (Operation Coupling) (MANDATORY)](#108-capabilities-enforcement-operation-coupling-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.9 Capabilities (NO RUNTIME CONFIGURATION) (MANDATORY)](#109-capabilities-no-runtime-configuration-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[10.10 Complete Graph Example (Production Ready)](#1010-complete-graph-example-production-ready)
+
+[11. CACHE OWNERSHIP BOUNDARY (CRITICAL)](#11-cache-ownership-boundary-critical)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[11.1 Embedding Stats (NO Cache Metrics) (MANDATORY)](#111-embedding-stats-no-cache-metrics-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[11.2 Capabilities Caching (Allowed, With Rules) (MANDATORY)](#112-capabilities-caching-allowed-with-rules-mandatory)
+
+[12. BATCH FAILURE MODE (DECISION MATRIX)](#12-batch-failure-mode-decision-matrix)
+
+[13. STREAMING PATTERN (DECISION MATRIX)](#13-streaming-pattern-decision-matrix)
+
+[14. PRODUCTION HARDENING (REMOVE ALL MOCK ONLY CODE)](#14-production-hardening-remove-all-mock-only-code)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[14.1 Patterns to DELETE Entirely](#141-patterns-to-delete-entirely)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[14.2 Patterns to TRANSFORM](#142-patterns-to-transform)
+
+[15. PER DOMAIN IMPLEMENTATION CHECKLISTS](#15-per-domain-implementation-checklists)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[15.1 LLM Adapter Checklist](#151-llm-adapter-checklist)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[15.2 Embedding Adapter Checklist](#152-embedding-adapter-checklist)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[15.3 Vector Adapter Checklist](#153-vector-adapter-checklist)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[15.4 Graph Adapter Checklist](#154-graph-adapter-checklist)
+
+[16. COMMON PITFALLS (55+ CONFORMANCE FAILURES)](#16-common-pitfalls-55-conformance-failures)
 ---
 
 ## 1. PURPOSE & SCOPE
