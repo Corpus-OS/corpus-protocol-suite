@@ -50,9 +50,11 @@
 
 &nbsp;&nbsp;&nbsp;&nbsp;[2.1 Base Classes (Provided)](#21-base-classes-provided)
 
-&nbsp;&nbsp;&nbsp;&nbsp;[2.2 What You Implement](#22-what-you-implement)
+&nbsp;&nbsp;&nbsp;&nbsp;[2.2 What You Implement (_do_* hooks)](#22-what-you-implement-_do_-hooks)
 
-&nbsp;&nbsp;&nbsp;&nbsp;[2.3 What You NEVER Implement](#23-what-you-never-implement)
+&nbsp;&nbsp;&nbsp;&nbsp;[2.3 What You NEVER Implement (Public Methods)](#23-what-you-never-implement-public-methods)
+
+&nbsp;&nbsp;&nbsp;&nbsp;[2.4 What You NEVER Call](#24-what-you-never-call)
 
 [3. CONTEXT & IDENTITY (PRODUCTION RULES)](#3-context--identity-production-rules)
 
@@ -263,29 +265,73 @@ from corpus_sdk.graph.graph_base import BaseGraphAdapter
 
 **YOU implement these. This document tells you how.**
 
-### 2.2 What You Implement
+---
 
-**In your subclass, you implement:**
+### 2.2 What You Implement (_do_* hooks)
 
-| Component | Required `_do_*` Methods |
-|-----------|--------------------------|
+**In your subclass, you implement the `_do_*` hook methods. The base class public methods call these hooks.**
+
+| Component | Required `_do_*` Methods (YOU IMPLEMENT THESE) |
+|-----------|------------------------------------------------|
 | **LLM** | `_do_capabilities()`, `_do_complete()`, `_do_stream()`, `_do_count_tokens()`, `_do_health()` |
 | **Embedding** | `_do_capabilities()`, `_do_embed()`, `_do_embed_batch()`, `_do_stream_embed()`, `_do_count_tokens()` (if supported), `_do_get_stats()`, `_do_health()` |
 | **Vector** | `_do_capabilities()`, `_do_query()`, `_do_batch_query()`, `_do_upsert()`, `_do_delete()`, `_do_create_namespace()`, `_do_delete_namespace()`, `_do_health()` |
 | **Graph** | `_do_capabilities()`, `_do_query()`, `_do_stream_query()`, `_do_bulk_vertices()`, `_do_batch()`, `_do_transaction()` (if supported), `_do_traversal()` (if supported), `_do_get_schema()` (if supported), `_do_upsert_nodes()`, `_do_upsert_edges()`, `_do_delete_nodes()`, `_do_delete_edges()`, `_do_health()` |
 
-### 2.3 What You NEVER Implement
+**Example pattern:**
 
 ```python
-# ❌ NEVER IMPLEMENT THESE: BASE OWNS THEM
-def capabilities(self): ...  # Base implements
-def complete(self): ...      # Base implements
-def query(self): ...         # Base implements
-def upsert(self): ...        # Base implements
+from corpus_sdk.llm.llm_base import BaseLLMAdapter
 
+class MyLLMAdapter(BaseLLMAdapter):
+    async def _do_capabilities(self):    # ✅ YOU implement this
+        ...
+    
+    async def _do_complete(self, ...):   # ✅ YOU implement this
+        ...
+    
+    # ❌ NEVER implement the public method
+    # async def capabilities(self): ...  # WRONG - base owns this
+```
+
+---
+
+### 2.3 What You NEVER Implement (Public Methods)
+
+```python
+# ❌ NEVER IMPLEMENT THESE PUBLIC METHODS: BASE OWNS THEM
+def capabilities(self): ...  # Base implements, calls your _do_capabilities
+def complete(self): ...      # Base implements, calls your _do_complete
+def query(self): ...         # Base implements, calls your _do_query
+def upsert(self): ...        # Base implements, calls your _do_upsert
+def embed(self): ...         # Base implements, calls your _do_embed
+def stream(self): ...        # Base implements, calls your _do_stream
+
+# ✅ CORRECT: Implement the _do_* hooks instead
+async def _do_capabilities(self): ...
+async def _do_complete(self, ...): ...
+async def _do_query(self, ...): ...
+async def _do_upsert(self, ...): ...
+async def _do_embed(self, ...): ...
+async def _do_stream(self, ...): ...
+```
+
+**RULE:** The base classes implement the public protocol methods. You implement the `_do_*` hooks that the base calls. Never override the public methods.
+
+---
+
+### 2.4 What You NEVER Call
+
+```python
 # ❌ NEVER CALL PUBLIC METHODS FROM _do_* METHODS
-await self.capabilities()    # WRONG: causes deadlock
-await self._do_capabilities()  # CORRECT: call hook directly
+await self.capabilities()    # WRONG: causes deadlock/recursion
+await self.complete()        # WRONG: calls back into your _do_complete
+await self.query()           # WRONG: calls back into your _do_query
+
+# ✅ CORRECT: Call the _do_* hooks directly
+await self._do_capabilities()  # CORRECT: direct hook call
+await self._do_complete(...)   # CORRECT: direct hook call
+await self._do_query(...)      # CORRECT: direct hook call
 
 # ❌ NEVER IMPLEMENT YOUR OWN CACHE
 self._my_cache = {}  # WRONG: base owns caching
@@ -317,7 +363,7 @@ from corpus_sdk.graph.graph_base import OperationContext as GraphOperationContex
 **Note:** These are identical dataclasses; alias them to avoid name collisions.
 
 ```python
-@dataclass
+@dataclass(frozen=True)
 class OperationContext:
     request_id: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -325,6 +371,13 @@ class OperationContext:
     traceparent: Optional[str] = None  # W3C trace context
     tenant: Optional[str] = None
     attrs: Mapping[str, Any] = field(default_factory=dict)
+    
+    def remaining_ms(self) -> Optional[int]:
+        """Return remaining milliseconds until deadline, or None if no deadline."""
+        if self.deadline_ms is None:
+            return None
+        now_ms = int(time.time() * 1000)
+        return max(0, self.deadline_ms - now_ms)
 ```
 
 ### 3.2 Deadline Propagation: MANDATORY
@@ -349,16 +402,22 @@ async def _do_embed(self, spec, *, ctx=None):
 
 ### 3.3 Tenant Hashing: MANDATORY
 
-```
+```python
+def _tenant_hash(self, tenant: Optional[str]) -> Optional[str]:
+    """Create privacy-preserving hash of tenant identifier."""
+    if not tenant:
+        return None
+    return hashlib.sha256(tenant.encode()).hexdigest()[:12]
+
 # NEVER log or emit raw tenant IDs
 tenant_id = ctx.tenant if ctx else None
-metric_tenant = tenant_hash(tenant_id) if tenant_id else "global"
+metric_tenant = self._tenant_hash(tenant_id) if tenant_id else "global"
 
 # Use hashed tenant in metrics, cache keys, logs
 cache_key = f"embedding:{metric_tenant}:{model}:{text_hash}"
 ```
 
-**RULE:** Tenant IDs in logs, metrics, and cache keys MUST be hashed via `tenant_hash()`. Raw tenant IDs are PII and forbidden.
+**RULE:** Tenant IDs in logs, metrics, and cache keys MUST be hashed via `_tenant_hash()`. Raw tenant IDs are PII and forbidden.
 
 ### 3.4 ⚠️ CRITICAL: Context Attributes Are TEST ONLY
 
@@ -406,93 +465,117 @@ ctx.attrs.get("health")          # NO - use real health checks
 **Import errors directly from their respective domain base classes:**
 
 ```python
-# Base adapter errors (common across all domains)
+# LLM errors - import from llm_base
 from corpus_sdk.llm.llm_base import (
     LLMAdapterError, BadRequest, AuthError, ResourceExhausted,
-    TransientNetwork, Unavailable, NotSupported, DeadlineExceeded
-)  # LLM base has the full hierarchy; reuse these across domains
+    TransientNetwork, Unavailable, NotSupported, DeadlineExceeded,
+    ModelOverloaded
+)
 
-# Domain-specific errors
-from corpus_sdk.llm.llm_base import ModelOverloaded
-from corpus_sdk.embedding.embedding_base import TextTooLong, ModelNotAvailable
-from corpus_sdk.vector.vector_base import DimensionMismatch, IndexNotReady
-from corpus_sdk.graph.graph_base import NotSupported as GraphNotSupported  # Graph uses same base errors
+# Embedding errors - import from embedding_base  
+from corpus_sdk.embedding.embedding_base import (
+    EmbeddingAdapterError, BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported, DeadlineExceeded,
+    TextTooLong, ModelNotAvailable
+)
+
+# Vector errors - import from vector_base
+from corpus_sdk.vector.vector_base import (
+    VectorAdapterError, BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported, DeadlineExceeded,
+    DimensionMismatch, IndexNotReady
+)
+
+# Graph errors - import from graph_base
+from corpus_sdk.graph.graph_base import (
+    GraphAdapterError, BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported, DeadlineExceeded
+)
 ```
 
-**Note:** `ContentFiltered`, `DialectNotSupported`, and `InvalidQuery` are **not** defined in the base files. Remove references to them or define them in your adapter if needed.
+**Note:** There is no shared `corpus_sdk.exceptions` module. Each domain defines its own error hierarchy in its base file. This is intentional — domains evolve independently.
 
 ### 4.2 Provider Error Mapping: MANDATORY
 
+**Implement error mapping as a method on your adapter class:**
+
 ```python
-def map_provider_error(self, e: Exception) -> LLMAdapterError:
-    """Map provider-specific errors to canonical Corpus errors."""
-    
-    # Rate limits
-    if isinstance(e, ProviderRateLimitError):
-        return ResourceExhausted(
-            "Rate limit exceeded",
-            retry_after_ms=e.retry_after or 5000,
-            resource_scope="rate_limit",
-            details={"provider_error": str(e)}
-        )
-    
-    # Authentication
-    if isinstance(e, ProviderAuthError):
-        return AuthError("Invalid credentials")
-    
-    # Invalid requests
-    if isinstance(e, ProviderInvalidRequest):
-        return BadRequest(str(e))
-    
-    # Model availability
-    if isinstance(e, ProviderModelNotFound):
-        return ModelNotAvailable(
-            f"Model '{e.model}' not available",
-            details={"requested_model": e.model}
-        )
-    
-    # Text too long (embedding)
-    if isinstance(e, ProviderTextTooLong):
-        return TextTooLong(
-            f"Text exceeds maximum length of {e.max_length}",
-            details={
-                "max_length": e.max_length,
-                "actual_length": e.actual_length
-            }
-        )
-    
-    # Dimension mismatch (vector)
-    if isinstance(e, ProviderDimensionError):
-        return DimensionMismatch(
-            f"Vector dimension {e.actual} does not match index dimension {e.expected}",
-            details={
-                "expected": e.expected,
-                "actual": e.actual,
-                "namespace": e.namespace
-            }
-        )
-    
-    # Index not ready (vector)
-    if isinstance(e, ProviderIndexNotReady):
-        return IndexNotReady(
-            "Index not ready for queries",
-            retry_after_ms=e.retry_after or 500,
-            details={"namespace": e.namespace}
-        )
-    
-    # Timeouts
-    if isinstance(e, ProviderTimeout):
-        return TransientNetwork("Upstream timeout")
-    
-    # Service unavailable
-    if isinstance(e, ProviderServerError):
-        return Unavailable("Provider unavailable")
-    
-    # Catch-all
-    return Unavailable(f"Unknown provider error: {type(e).__name__}")
+from corpus_sdk.llm.llm_base import (
+    BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, ModelOverloaded,
+    DeadlineExceeded, NotSupported
+)
+
+class MyLLMAdapter(BaseLLMAdapter):
+    def _map_provider_error(self, e: Exception) -> LLMAdapterError:
+        """Map provider-specific errors to canonical Corpus errors."""
+        
+        # Rate limits
+        if isinstance(e, ProviderRateLimitError):
+            return ResourceExhausted(
+                "Rate limit exceeded",
+                retry_after_ms=e.retry_after or 5000,
+                resource_scope="rate_limit",
+                details={"provider_error": str(e)}
+            )
+        
+        # Authentication
+        if isinstance(e, ProviderAuthError):
+            return AuthError("Invalid credentials")
+        
+        # Invalid requests
+        if isinstance(e, ProviderInvalidRequest):
+            return BadRequest(str(e))
+        
+        # Model availability
+        if isinstance(e, ProviderModelNotFound):
+            return ModelNotAvailable(
+                f"Model '{e.model}' not available",
+                details={"requested_model": e.model}
+            )
+        
+        # Text too long (embedding)
+        if isinstance(e, ProviderTextTooLong):
+            return TextTooLong(
+                f"Text exceeds maximum length of {e.max_length}",
+                details={
+                    "max_length": e.max_length,
+                    "actual_length": e.actual_length
+                }
+            )
+        
+        # Dimension mismatch (vector)
+        if isinstance(e, ProviderDimensionError):
+            return DimensionMismatch(
+                f"Vector dimension {e.actual} does not match index dimension {e.expected}",
+                details={
+                    "expected": e.expected,
+                    "actual": e.actual,
+                    "namespace": e.namespace
+                }
+            )
+        
+        # Index not ready (vector)
+        if isinstance(e, ProviderIndexNotReady):
+            return IndexNotReady(
+                "Index not ready for queries",
+                retry_after_ms=e.retry_after or 500,
+                details={"namespace": e.namespace}
+            )
+        
+        # Timeouts
+        if isinstance(e, ProviderTimeout):
+            return TransientNetwork("Upstream timeout")
+        
+        # Service unavailable
+        if isinstance(e, ProviderServerError):
+            return Unavailable("Provider unavailable")
+        
+        # Catch-all
+        return Unavailable(f"Unknown provider error: {type(e).__name__}")
 ```
 
-**RULE:** Every provider error MUST map to the same canonical error type every time. No conditional mapping based on context.
+**RULE:** Every provider error MUST map to the same canonical error type every time. No conditional mapping based on context. Import error classes directly from the domain base.
 
 ### 4.3 Error Detail Schemas: PER ERROR TYPE: MANDATORY
 
@@ -687,24 +770,57 @@ async def _do_complete(self, request, *, ctx=None):
 from corpus_sdk.llm.llm_base import BaseLLMAdapter
 from corpus_sdk.llm.llm_base import (
     LLMCapabilities, LLMCompletion, LLMChunk, TokenUsage,
-    ToolCall, ToolCallFunction  # Tool call types are in llm_base
+    ToolCall, ToolCallFunction
 )
 from corpus_sdk.llm.llm_base import (
-    ModelOverloaded,  # Domain-specific error
-    BadRequest, NotSupported, DeadlineExceeded, Unavailable
+    BadRequest, NotSupported, ResourceExhausted, 
+    ModelOverloaded, DeadlineExceeded, Unavailable
 )
 
 class MyLLMAdapter(BaseLLMAdapter):
     async def _do_capabilities(self) -> LLMCapabilities:
         """REQUIRED: Describe your models and features."""
         
-    async def _do_complete(self, request, *, ctx=None) -> LLMCompletion:
+    async def _do_complete(
+        self, 
+        messages: List[Mapping[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        ctx: Optional[OperationContext] = None,
+    ) -> LLMCompletion:
         """REQUIRED: Unary completion."""
         
-    async def _do_stream(self, request, *, ctx=None) -> AsyncIterator[LLMChunk]:
+    async def _do_stream(
+        self,
+        messages: List[Mapping[str, str]],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        top_p: Optional[float] = None,
+        frequency_penalty: Optional[float] = None,
+        presence_penalty: Optional[float] = None,
+        stop_sequences: Optional[List[str]] = None,
+        model: Optional[str] = None,
+        system_message: Optional[str] = None,
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: Optional[Union[str, Dict[str, Any]]] = None,
+        ctx: Optional[OperationContext] = None,
+    ) -> AsyncIterator[LLMChunk]:
         """REQUIRED: Streaming completion."""
         
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
+    async def _do_count_tokens(
+        self,
+        text: str,
+        model: Optional[str] = None,
+        ctx: Optional[OperationContext] = None,
+    ) -> int:
         """REQUIRED: Accurate token counting."""
         
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
@@ -724,21 +840,94 @@ async def _do_stream(self, request, *, ctx=None):
     yield "llo"  # Different from complete ❌
 
 # ✅ CORRECT: Single planning function for both
-def _plan_response(self, request) -> Tuple[str, str, List[ToolCall]]:
+def _plan_response(self, request, ctx=None) -> Tuple[str, str, str, List[ToolCall]]:
     """Single source of truth for both complete() and stream()."""
     # Deterministic logic based ONLY on request + ctx
     # NO random, NO RNG, NO temperature simulation
-    prompt = self._build_prompt(request.messages)
-    completion = self._generate_completion(prompt, request)
-    return prompt, completion.text, completion.tool_calls
+    
+    # Validate model
+    if request.model not in self._supported_models:
+        from corpus_sdk.llm.llm_base import ModelNotAvailable
+        raise ModelNotAvailable(
+            f"Model '{request.model}' is not supported",
+            details={
+                "requested_model": request.model,
+                "supported_models": list(self._supported_models)
+            }
+        )
+    
+    # Build prompt
+    prompt = self._build_prompt(request)
+    
+    # Generate completion (call provider)
+    completion = self._call_provider_completion(request, ctx)
+    
+    # Apply stop sequences (FIRST occurrence rule)
+    text = self._apply_stop_sequences(completion.text, request.stop_sequences)
+    
+    finish_reason = "length" if completion.finish_reason == "length" else "stop"
+    
+    return prompt, text, finish_reason, completion.tool_calls
 
 async def _do_complete(self, request, *, ctx=None):
-    _, completion_text, tool_calls = self._plan_response(request)
-    # ... build LLMCompletion
+    prompt, text, finish_reason, tool_calls = self._plan_response(request, ctx)
     
+    # Calculate usage
+    usage = self._calculate_usage(prompt, text, tool_calls, request.model)
+    
+    return LLMCompletion(
+        text=text,
+        model=request.model,
+        model_family=self._get_model_family(request.model),
+        usage=usage,
+        finish_reason=finish_reason,
+        tool_calls=tool_calls
+    )
+
 async def _do_stream(self, request, *, ctx=None):
-    _, completion_text, tool_calls = self._plan_response(request)
-    # ... stream tokens from completion_text
+    prompt, text, finish_reason, tool_calls = self._plan_response(request, ctx)
+    
+    # Stream tokens from the SAME text
+    if tool_calls:
+        # Tool call streaming pattern
+        yield LLMChunk(
+            text="",
+            is_final=False,
+            model=request.model,
+            usage_so_far=self._calculate_usage_so_far(prompt, "", None)
+        )
+        
+        final_usage = self._calculate_usage(prompt, text, tool_calls, request.model)
+        yield LLMChunk(
+            text="",
+            is_final=True,
+            model=request.model,
+            usage_so_far=final_usage,
+            tool_calls=tool_calls
+        )
+    else:
+        # Normal text streaming
+        tokens = text.split()
+        emitted = []
+        for i, token in enumerate(tokens):
+            emitted.append(token)
+            partial = " ".join(emitted)
+            usage = self._calculate_usage_so_far(prompt, partial, None)
+            
+            yield LLMChunk(
+                text=token + (" " if i < len(tokens) - 1 else ""),
+                is_final=False,
+                model=request.model,
+                usage_so_far=usage
+            )
+        
+        final_usage = self._calculate_usage(prompt, text, None, request.model)
+        yield LLMChunk(
+            text="",
+            is_final=True,
+            model=request.model,
+            usage_so_far=final_usage
+        )
 ```
 
 **RULE:** The text returned by `_do_complete()` MUST be identical to the concatenated text streamed by `_do_stream()` for the same request. Conformance tests verify this.
@@ -748,6 +937,8 @@ async def _do_stream(self, request, *, ctx=None):
 ```python
 def _validate_tool_choice(self, tool_choice, tools):
     """Validate tool_choice against available tools."""
+    from corpus_sdk.llm.llm_base import BadRequest
+    
     if not tools:
         if tool_choice not in (None, "none", "auto"):
             raise BadRequest("tool_choice provided but no tools")
@@ -766,7 +957,14 @@ def _validate_tool_choice(self, tool_choice, tools):
     
     # Validate if specific tool requested
     if requested:
-        tool_names = [self._extract_tool_name(t) for t in tools]
+        tool_names = []
+        for t in tools:
+            if isinstance(t, dict):
+                if "function" in t:
+                    tool_names.append(t["function"].get("name"))
+                elif "name" in t:
+                    tool_names.append(t["name"])
+        
         if requested not in tool_names:
             raise BadRequest(
                 f"tool_choice requested unknown tool: {requested}",
@@ -782,44 +980,37 @@ def _validate_tool_choice(self, tool_choice, tools):
 ### 7.4 Token Counting & Usage Accounting: TOOL CALLS: MANDATORY
 
 ```python
-def _calculate_usage(self, prompt_text: str, completion: LLMCompletion) -> TokenUsage:
+def _calculate_usage(self, prompt_text: str, completion_text: str, 
+                    tool_calls: Optional[List[ToolCall]], model: str) -> TokenUsage:
     """Calculate token usage with tool call accounting."""
+    from corpus_sdk.llm.llm_base import TokenUsage
     
-    # Base tokens
-    prompt_tokens = self._count_tokens_sync(prompt_text, completion.model)
+    # Prompt tokens
+    prompt_tokens = self._count_tokens_sync(prompt_text, model)
     
-    # For normal completions
-    if not completion.tool_calls:
-        completion_tokens = self._count_tokens_sync(
-            completion.text, 
-            completion.model
-        )
-        return TokenUsage(
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            total_tokens=prompt_tokens + completion_tokens
-        )
-    
-    # FOR TOOL CALLS: Provider returned zero tokens? SYNTHESIZE.
-    # Convert tool calls to JSON string for token counting
-    tool_payload = json.dumps([
-        {
-            "id": tc.id,
-            "type": "function",
-            "function": {
-                "name": tc.function.name,
-                "arguments": tc.function.arguments
+    # Completion tokens
+    if tool_calls:
+        # SYNTHESIZE tokens from tool call payload if provider returns 0
+        tool_payload = json.dumps([
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments
+                }
             }
-        }
-        for tc in completion.tool_calls
-    ], separators=(",", ":"))
-    
-    completion_tokens = self._count_tokens_sync(tool_payload, completion.model)
-    
-    # ENSURE non-zero completion tokens for tool-calling turns
-    if completion_tokens == 0:
-        completion_tokens = 10  # Minimum viable
+            for tc in tool_calls
+        ], separators=(",", ":"))
         
+        completion_tokens = self._count_tokens_sync(tool_payload, model)
+        
+        # ENSURE non-zero completion tokens for tool-calling turns
+        if completion_tokens == 0:
+            completion_tokens = 10  # Minimum viable
+    else:
+        completion_tokens = self._count_tokens_sync(completion_text, model)
+    
     return TokenUsage(
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -832,9 +1023,9 @@ def _calculate_usage(self, prompt_text: str, completion: LLMCompletion) -> Token
 ### 7.5 Stop Sequences: FIRST Occurrence Rule: MANDATORY
 
 ```python
-def _apply_stop_sequences(self, text: str, stop_sequences: List[str]) -> str:
-    """Apply stop sequences: cut at FIRST occurrence."""
-    if not stop_sequences:
+def _apply_stop_sequences(self, text: str, stop_sequences: Optional[List[str]]) -> str:
+    """Apply stop sequences: cut at FIRST occurrence of ANY stop sequence."""
+    if not stop_sequences or not text:
         return text
     
     cut_position = len(text)
@@ -858,7 +1049,7 @@ def _apply_stop_sequences(self, text: str, stop_sequences: List[str]) -> str:
 async def _do_stream(self, request, *, ctx=None):
     """Stream with proper tool call semantics."""
     
-    prompt_text, completion_text, tool_calls = self._plan_response(request)
+    prompt_text, completion_text, finish_reason, tool_calls = self._plan_response(request, ctx)
     
     # TOOL CALL STREAMING PATTERN
     if tool_calls:
@@ -867,11 +1058,11 @@ async def _do_stream(self, request, *, ctx=None):
             text="",
             is_final=False,
             model=request.model,
-            usage_so_far=self._calculate_usage_so_far(prompt_text, "")
+            usage_so_far=self._calculate_usage_so_far(prompt_text, "", None)
         )
         
         # 2. Final chunk with tool_calls populated
-        final_usage = self._calculate_usage(prompt_text, completion_text, tool_calls)
+        final_usage = self._calculate_usage(prompt_text, completion_text, tool_calls, request.model)
         yield LLMChunk(
             text="",
             is_final=True,
@@ -882,13 +1073,13 @@ async def _do_stream(self, request, *, ctx=None):
         return
     
     # NORMAL TEXT STREAMING
-    tokens = self._tokenize(completion_text)
+    tokens = completion_text.split()
     emitted = []
     
     for i, token in enumerate(tokens):
         emitted.append(token)
         partial = " ".join(emitted)
-        usage = self._calculate_usage_so_far(prompt_text, partial)
+        usage = self._calculate_usage_so_far(prompt_text, partial, None)
         
         yield LLMChunk(
             text=token + (" " if i < len(tokens) - 1 else ""),
@@ -898,7 +1089,7 @@ async def _do_stream(self, request, *, ctx=None):
         )
     
     # Final chunk with no text, is_final=True
-    final_usage = self._calculate_usage(prompt_text, completion_text)
+    final_usage = self._calculate_usage(prompt_text, completion_text, None, request.model)
     yield LLMChunk(
         text="",
         is_final=True,
@@ -918,6 +1109,8 @@ async def _do_stream(self, request, *, ctx=None):
 ```python
 async def _do_stream(self, request, *, ctx=None):
     """Enforce capabilities before proceeding."""
+    from corpus_sdk.llm.llm_base import NotSupported
+    
     caps = await self._do_capabilities()
     
     if not caps.supports_streaming:
@@ -939,6 +1132,8 @@ ALLOWED_ROLES = {"system", "user", "assistant", "tool", "function", "developer"}
 
 def _validate_roles(self, messages):
     """Validate roles: be permissive, not restrictive."""
+    from corpus_sdk.llm.llm_base import BadRequest
+    
     for msg in messages:
         role = msg.get("role")
         if role and role not in ALLOWED_ROLES:
@@ -950,54 +1145,91 @@ def _validate_roles(self, messages):
 
 **RULE:** Do not hard-block roles not in your allowlist. Only reject roles your provider explicitly cannot handle. Be permissive to support future protocol extensions.
 
-### 7.9 Complete LLM Example: Production Ready
+### 7.9 Complete LLM Example (Production Ready)
 
 ```python
-from typing import AsyncIterator, Dict, Any, List, Optional, Tuple
-import json
+from typing import AsyncIterator, Dict, Any, List, Optional, Tuple, Union
 import asyncio
+import json
+import time
+import hashlib
 from corpus_sdk.llm.llm_base import BaseLLMAdapter
 from corpus_sdk.llm.llm_base import (
     LLMCapabilities, LLMCompletion, LLMChunk, TokenUsage,
-    ToolCall, ToolCallFunction
+    ToolCall, ToolCallFunction, OperationContext
 )
 from corpus_sdk.llm.llm_base import (
-    BadRequest, NotSupported, ResourceExhausted, 
-    ModelOverloaded, DeadlineExceeded, Unavailable
+    BadRequest, AuthError, ResourceExhausted, TransientNetwork,
+    Unavailable, NotSupported, ModelOverloaded, DeadlineExceeded
 )
 
 class ProductionLLMAdapter(BaseLLMAdapter):
-    """Production-ready LLM adapter with 100% conformance."""
+    """
+    Production-ready LLM adapter with 100% conformance.
     
-    def __init__(self, client, supported_models, **kwargs):
+    SHARED PLANNING: Single _plan_response used by both complete and stream.
+    TOOL CALLS: Validates tool_choice, synthesizes token usage.
+    STOP SEQUENCES: Cuts at FIRST occurrence.
+    STREAMING: Tool calls only in final chunk, empty non-final chunks.
+    CAPABILITIES: Hardcoded, not configurable.
+    """
+    
+    def __init__(self, client, supported_models, model_families=None, **kwargs):
         super().__init__(**kwargs)
         self._client = client
         self._supported_models = tuple(supported_models)
-        self._caps_cache = None
-        self._caps_cache_time = 0
+        self._model_families = model_families or {}
+        self._max_context_length = 128000
+        self._max_tool_calls_per_turn = 5
         
+        # Stats tracking (adapter-owned only)
+        self._stats = {
+            "complete_calls": 0,
+            "stream_calls": 0,
+            "count_tokens_calls": 0,
+            "total_completion_tokens": 0,
+            "total_prompt_tokens": 0,
+            "total_processing_time_ms": 0.0,
+            "error_count": 0
+        }
+    
+    # ----------------------------------------------------------------------
+    # CAPABILITIES (Hardcoded - NOT configurable)
+    # ----------------------------------------------------------------------
+    
     async def _do_capabilities(self) -> LLMCapabilities:
-        """Advertise true capabilities: never configurable at runtime."""
+        """Advertise true provider capabilities - NEVER configurable."""
         return LLMCapabilities(
             server="my-llm-provider",
             version="1.0.0",
             protocol="llm/v1.0",
-            supported_models=self._supported_models,
-            max_context_length=128000,
+            model_family="gpt",
+            max_context_length=self._max_context_length,
             supports_streaming=True,
             supports_roles=True,
+            supports_json_output=False,
             supports_tools=True,
             supports_parallel_tool_calls=False,
             supports_tool_choice=True,
-            max_tool_calls_per_turn=5,
+            max_tool_calls_per_turn=self._max_tool_calls_per_turn,
+            idempotent_writes=False,
+            supports_multi_tenant=True,
+            supports_system_message=True,
             supports_deadline=True,
-            supports_count_tokens=True
+            supports_count_tokens=True,
+            supported_models=self._supported_models
         )
     
-    # ---------- SHARED PLANNING PATH (Single source of truth) ----------
+    # ----------------------------------------------------------------------
+    # SHARED PLANNING PATH (Single source of truth)
+    # ----------------------------------------------------------------------
     
     def _plan_response(self, request, ctx=None):
-        """Single planning function for BOTH complete() and stream()."""
+        """
+        Single planning function for BOTH complete() and stream().
+        
+        Returns: (prompt_text, completion_text, finish_reason, tool_calls)
+        """
         # Validate model
         if request.model not in self._supported_models:
             raise ModelNotAvailable(
@@ -1011,50 +1243,419 @@ class ProductionLLMAdapter(BaseLLMAdapter):
         # Validate tool_choice
         self._validate_tool_choice(request.tool_choice, request.tools)
         
-        # Build prompt (deterministic)
+        # Build prompt
         prompt = self._build_prompt(request)
         
-        # Decide if tool call
-        emit_tool, tool_name = self._should_emit_tool_call(request)
-        
-        if emit_tool and tool_name:
-            # Tool call response
-            tool_call = self._create_tool_call(tool_name, request, ctx)
-            return prompt, "", "tool_calls", [tool_call]
-        
-        # Normal completion: call provider
+        # Get timeout from context
         timeout = self._get_timeout(ctx)
-        response = self._client.complete(
-            model=request.model,
-            messages=request.messages,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            stop=self._apply_stop_sequences(request.stop),
-            timeout=timeout
-        )
+        
+        # Call provider
+        try:
+            response = self._client.complete(
+                model=request.model,
+                messages=request.messages,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+                top_p=request.top_p,
+                frequency_penalty=request.frequency_penalty,
+                presence_penalty=request.presence_penalty,
+                stop=request.stop_sequences,
+                system=request.system_message,
+                tools=request.tools,
+                tool_choice=request.tool_choice,
+                timeout=timeout
+            )
+        except Exception as e:
+            raise self._map_provider_error(e)
         
         # Apply stop sequences (FIRST occurrence rule)
-        text = self._apply_stop_sequences(
-            response.text, 
-            request.stop_sequences
+        text = self._apply_stop_sequences(response.text, request.stop_sequences)
+        
+        finish_reason = response.finish_reason
+        if finish_reason not in ("stop", "length", "tool_calls", "error"):
+            finish_reason = "stop"
+        
+        return prompt, text, finish_reason, response.tool_calls
+    
+    def _validate_tool_choice(self, tool_choice, tools):
+        """Validate tool_choice against available tools."""
+        if not tools:
+            if tool_choice not in (None, "none", "auto"):
+                raise BadRequest("tool_choice provided but no tools")
+            return
+        
+        requested = None
+        if isinstance(tool_choice, dict):
+            if tool_choice.get("type") == "function":
+                fn = tool_choice.get("function", {})
+                requested = fn.get("name")
+            elif "name" in tool_choice:
+                requested = tool_choice["name"]
+        elif isinstance(tool_choice, str):
+            if tool_choice not in ("none", "auto", "required"):
+                requested = tool_choice
+        
+        if requested:
+            tool_names = []
+            for t in tools:
+                if isinstance(t, dict):
+                    if "function" in t:
+                        tool_names.append(t["function"].get("name"))
+                    elif "name" in t:
+                        tool_names.append(t["name"])
+            
+            if requested not in tool_names:
+                raise BadRequest(
+                    f"tool_choice requested unknown tool: {requested}",
+                    details={
+                        "requested": requested,
+                        "available": tool_names
+                    }
+                )
+    
+    def _apply_stop_sequences(self, text: str, stops: Optional[List[str]]) -> str:
+        """Stop at FIRST occurrence of ANY stop sequence."""
+        if not stops or not text:
+            return text
+        
+        cut_pos = len(text)
+        for stop in stops:
+            if not stop:
+                continue
+            pos = text.find(stop)
+            if pos != -1 and pos < cut_pos:
+                cut_pos = pos
+        
+        if cut_pos < len(text):
+            return text[:cut_pos].rstrip()
+        return text
+    
+    def _build_prompt(self, request) -> str:
+        """Build prompt string for token counting."""
+        parts = []
+        if request.system_message:
+            parts.append(f"system: {request.system_message}")
+        for msg in request.messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            parts.append(f"{role}: {content}")
+        return "\n".join(parts)
+    
+    # ----------------------------------------------------------------------
+    # TOKEN COUNTING (Accurate - no approximations)
+    # ----------------------------------------------------------------------
+    
+    async def _do_count_tokens(self, text: str, model: Optional[str], *, ctx=None) -> int:
+        """Accurate token counting - NEVER approximate."""
+        self._stats["count_tokens_calls"] += 1
+        t0 = time.monotonic()
+        
+        if model and model not in self._supported_models:
+            raise ModelNotAvailable(f"Model '{model}' is not supported")
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            count = await self._client.count_tokens(
+                text=text,
+                model=model or self._supported_models[0],
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        return count
+    
+    def _count_tokens_sync(self, text: str, model: str) -> int:
+        """Synchronous token counting for internal use."""
+        import tiktoken
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    
+    def _calculate_usage(self, prompt: str, completion: str, 
+                        tool_calls: Optional[List[ToolCall]], 
+                        model: str) -> TokenUsage:
+        """Calculate token usage with tool call accounting."""
+        prompt_tokens = self._count_tokens_sync(prompt, model)
+        
+        if tool_calls:
+            # Synthesize tokens from tool call payload
+            tool_payload = json.dumps([
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments
+                    }
+                }
+                for tc in tool_calls
+            ], separators=(",", ":"))
+            
+            completion_tokens = self._count_tokens_sync(tool_payload, model)
+            if completion_tokens == 0:
+                completion_tokens = 10  # Minimum viable
+        else:
+            completion_tokens = self._count_tokens_sync(completion, model)
+        
+        return TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens
+        )
+    
+    def _calculate_usage_so_far(self, prompt: str, partial: str, 
+                               tool_calls: Optional[List[ToolCall]]) -> TokenUsage:
+        """Calculate usage for partial stream."""
+        prompt_tokens = self._count_tokens_sync(prompt, self._get_default_model())
+        
+        if tool_calls:
+            return TokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=0,
+                total_tokens=prompt_tokens
+            )
+        
+        completion_tokens = self._count_tokens_sync(partial, self._get_default_model())
+        return TokenUsage(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            total_tokens=prompt_tokens + completion_tokens
+        )
+    
+    def _get_default_model(self) -> str:
+        return self._supported_models[0] if self._supported_models else "gpt-4"
+    
+    # ----------------------------------------------------------------------
+    # COMPLETE (Unary)
+    # ----------------------------------------------------------------------
+    
+    async def _do_complete(self, messages, max_tokens=None, temperature=None,
+                          top_p=None, frequency_penalty=None, presence_penalty=None,
+                          stop_sequences=None, model=None, system_message=None,
+                          tools=None, tool_choice=None, ctx=None) -> LLMCompletion:
+        
+        self._stats["complete_calls"] += 1
+        t0 = time.monotonic()
+        
+        # Create request object
+        request = _Request(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stop_sequences=stop_sequences,
+            model=model or self._supported_models[0],
+            system_message=system_message,
+            tools=tools,
+            tool_choice=tool_choice
         )
         
-        finish_reason = "length" if response.finish_reason == "length" else "stop"
+        # Plan response
+        prompt, text, finish_reason, tool_calls = self._plan_response(request, ctx)
         
-        return prompt, text, finish_reason, []
+        # Calculate usage
+        usage = self._calculate_usage(prompt, text, tool_calls, request.model)
+        
+        # Update stats
+        self._stats["total_prompt_tokens"] += usage.prompt_tokens
+        self._stats["total_completion_tokens"] += usage.completion_tokens
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return LLMCompletion(
+            text=text,
+            model=request.model,
+            model_family=self._get_model_family(request.model),
+            usage=usage,
+            finish_reason=finish_reason,
+            tool_calls=tool_calls or []
+        )
     
-    # ... (rest of implementation) ...
+    def _get_model_family(self, model: str) -> str:
+        """Extract model family from model name."""
+        if model in self._model_families:
+            return self._model_families[model]
+        if "gpt" in model:
+            return "gpt"
+        if "claude" in model:
+            return "claude"
+        if "gemini" in model:
+            return "gemini"
+        return "custom"
     
-    def _map_error(self, e: Exception):
-        """Map provider errors to canonical errors from base."""
-        # Error classes are imported from llm_base
+    # ----------------------------------------------------------------------
+    # STREAM
+    # ----------------------------------------------------------------------
+    
+    async def _do_stream(self, messages, max_tokens=None, temperature=None,
+                        top_p=None, frequency_penalty=None, presence_penalty=None,
+                        stop_sequences=None, model=None, system_message=None,
+                        tools=None, tool_choice=None, ctx=None) -> AsyncIterator[LLMChunk]:
+        
+        self._stats["stream_calls"] += 1
+        t0 = time.monotonic()
+        
+        # Enforce capabilities
+        caps = await self._do_capabilities()
+        if not caps.supports_streaming:
+            raise NotSupported("streaming is not supported")
+        
+        # Create request object
+        request = _Request(
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            frequency_penalty=frequency_penalty,
+            presence_penalty=presence_penalty,
+            stop_sequences=stop_sequences,
+            model=model or self._supported_models[0],
+            system_message=system_message,
+            tools=tools,
+            tool_choice=tool_choice
+        )
+        
+        # Plan response (SAME planning function as complete)
+        prompt, text, finish_reason, tool_calls = self._plan_response(request, ctx)
+        
+        # TOOL CALL STREAMING
+        if tool_calls:
+            # Non-final chunk (empty)
+            yield LLMChunk(
+                text="",
+                is_final=False,
+                model=request.model,
+                usage_so_far=self._calculate_usage_so_far(prompt, "", None)
+            )
+            
+            # Final chunk with tool_calls
+            final_usage = self._calculate_usage(prompt, text, tool_calls, request.model)
+            yield LLMChunk(
+                text="",
+                is_final=True,
+                model=request.model,
+                usage_so_far=final_usage,
+                tool_calls=tool_calls
+            )
+            
+            # Update stats
+            self._stats["total_prompt_tokens"] += final_usage.prompt_tokens
+            self._stats["total_completion_tokens"] += final_usage.completion_tokens
+            self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+            return
+        
+        # NORMAL TEXT STREAMING
+        tokens = text.split()
+        emitted = []
+        
+        for i, token in enumerate(tokens):
+            emitted.append(token)
+            partial = " ".join(emitted)
+            usage = self._calculate_usage_so_far(prompt, partial, None)
+            
+            yield LLMChunk(
+                text=token + (" " if i < len(tokens) - 1 else ""),
+                is_final=False,
+                model=request.model,
+                usage_so_far=usage
+            )
+        
+        # Final chunk
+        final_usage = self._calculate_usage(prompt, text, None, request.model)
+        yield LLMChunk(
+            text="",
+            is_final=True,
+            model=request.model,
+            usage_so_far=final_usage
+        )
+        
+        # Update stats
+        self._stats["total_prompt_tokens"] += final_usage.prompt_tokens
+        self._stats["total_completion_tokens"] += final_usage.completion_tokens
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+    
+    # ----------------------------------------------------------------------
+    # HEALTH
+    # ----------------------------------------------------------------------
+    
+    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+        """Health check - NO ctx.attrs-driven forcing."""
+        try:
+            healthy = await self._client.health_check()
+            return {
+                "ok": healthy,
+                "status": "ok" if healthy else "degraded",
+                "server": "my-llm-provider",
+                "version": "1.0.0",
+                "models": {
+                    m: {"status": "ready"} 
+                    for m in self._supported_models
+                }
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "status": "down",
+                "server": "my-llm-provider",
+                "version": "1.0.0"
+            }
+    
+    # ----------------------------------------------------------------------
+    # UTILITIES
+    # ----------------------------------------------------------------------
+    
+    def _get_timeout(self, ctx):
+        """Convert deadline to timeout."""
+        if ctx is None:
+            return None
+        rem = ctx.remaining_ms()
+        if rem is None or rem <= 0:
+            return None
+        return rem / 1000.0
+    
+    def _map_provider_error(self, e: Exception):
+        """Map provider errors to canonical Corpus errors."""
+        # Import error classes directly from llm_base
         from corpus_sdk.llm.llm_base import (
             BadRequest, AuthError, ResourceExhausted,
             TransientNetwork, Unavailable, ModelOverloaded,
-            DeadlineExceeded
+            DeadlineExceeded, NotSupported
         )
         
-        # Mapping logic here...
+        # Mapping logic - customize for your provider
+        if "rate limit" in str(e).lower():
+            return ResourceExhausted("Rate limit exceeded", retry_after_ms=5000)
+        if "auth" in str(e).lower() or "key" in str(e).lower():
+            return AuthError("Authentication failed")
+        if "timeout" in str(e).lower():
+            return TransientNetwork("Request timeout")
+        if "not found" in str(e).lower() or "does not exist" in str(e).lower():
+            return BadRequest(str(e))
+        
+        return Unavailable(f"Provider error: {type(e).__name__}")
+
+
+@dataclass
+class _Request:
+    """Internal request container."""
+    messages: List[Mapping[str, str]]
+    max_tokens: Optional[int]
+    temperature: Optional[float]
+    top_p: Optional[float]
+    frequency_penalty: Optional[float]
+    presence_penalty: Optional[float]
+    stop_sequences: Optional[List[str]]
+    model: str
+    system_message: Optional[str]
+    tools: Optional[List[Dict[str, Any]]]
+    tool_choice: Optional[Union[str, Dict[str, Any]]]
 ```
 
 ---
@@ -1068,33 +1669,63 @@ from corpus_sdk.embedding.embedding_base import BaseEmbeddingAdapter
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingCapabilities, EmbedSpec, BatchEmbedSpec,
     EmbedResult, BatchEmbedResult, EmbeddingVector,
-    EmbedChunk, EmbeddingStats
+    EmbedChunk, EmbeddingStats, OperationContext
 )
 from corpus_sdk.embedding.embedding_base import (
-    TextTooLong, ModelNotAvailable, BadRequest,
-    NotSupported, ResourceExhausted, DeadlineExceeded
+    BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported,
+    DeadlineExceeded, TextTooLong, ModelNotAvailable
 )
 
 class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     async def _do_capabilities(self) -> EmbeddingCapabilities:
         """REQUIRED: Describe your models, limits, normalization behavior."""
         
-    async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
+    async def _do_embed(
+        self,
+        spec: EmbedSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> EmbedResult:
         """REQUIRED: Single text embedding with validation."""
         
-    async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
+    async def _do_embed_batch(
+        self,
+        spec: BatchEmbedSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchEmbedResult:
         """REQUIRED: Batch embedding with chosen failure mode."""
         
-    async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None) -> AsyncIterator[EmbedChunk]:
+    async def _do_stream_embed(
+        self,
+        spec: EmbedSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> AsyncIterator[EmbedChunk]:
         """REQUIRED: Streaming embedding with chosen pattern."""
         
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
+    async def _do_count_tokens(
+        self,
+        text: str,
+        model: str,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> int:
         """REQUIRED if supports_token_counting=True: Accurate token counting."""
         
-    async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
+    async def _do_get_stats(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> EmbeddingStats:
         """REQUIRED: Adapter-owned stats only. NO cache metrics."""
         
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Dict[str, Any]:
         """REQUIRED: Health check."""
 ```
 
@@ -1145,6 +1776,7 @@ async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbed
             
             # Generate embedding
             vec = await self._generate_embedding(text, spec.model)
+            tokens = self._count_tokens_sync(text, spec.model)
             
             embeddings.append(EmbeddingVector(
                 vector=vec,
@@ -1164,11 +1796,16 @@ async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbed
                 "metadata": spec.metadatas[i] if spec.metadatas else None
             })
     
+    total_tokens = sum(
+        self._count_tokens_sync(ev.text, ev.model) 
+        for ev in embeddings
+    )
+    
     return BatchEmbedResult(
         embeddings=embeddings,
         model=spec.model,
         total_texts=len(spec.texts),
-        total_tokens=sum(e.get("tokens", 0) for e in embeddings),
+        total_tokens=total_tokens,
         failed_texts=failures  # REQUIRED: partial failure reporting
     )
 ```
@@ -1191,8 +1828,13 @@ async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbed
     
     # If validation passes, process entire batch
     embeddings = []
+    total_tokens = 0
+    
     for text in spec.texts:
         vec = await self._generate_embedding(text, spec.model)
+        tokens = self._count_tokens_sync(text, spec.model)
+        total_tokens += tokens
+        
         embeddings.append(EmbeddingVector(
             vector=vec,
             text=text,
@@ -1204,7 +1846,7 @@ async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbed
         embeddings=embeddings,
         model=spec.model,
         total_texts=len(spec.texts),
-        total_tokens=sum(e.get("tokens", 0) for e in embeddings),
+        total_tokens=total_tokens,
         failed_texts=[]  # REQUIRED: empty array, not None
     )
 ```
@@ -1234,7 +1876,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 
 **RULE:** Your adapter MUST have exactly ONE batch failure behavior. It MUST NOT be configurable at runtime. Document your choice in the class docstring.
 
-### 8.5 Truncation & Normalization: Base Owns, You Report
+### 8.5 Truncation and Normalization: Base Owns, You Report
 
 ```python
 async def _do_capabilities(self) -> EmbeddingCapabilities:
@@ -1268,7 +1910,8 @@ async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
     total_ops = (
         self._stats["embed_calls"] +
         self._stats["embed_batch_calls"] +
-        self._stats["stream_embed_calls"]
+        self._stats["stream_embed_calls"] +
+        self._stats["count_tokens_calls"]
     )
     
     avg_ms = (self._stats["total_processing_time_ms"] / total_ops) if total_ops else 0
@@ -1286,7 +1929,7 @@ async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
     )
 ```
 
-**RULE:** `_do_get_stats()` MUST NOT include `cache_hits`, `cache_misses`, or any stream stats aggregated by base. Base owns these counters. Duplicating them causes double-counting in metrics.
+**RULE:** `_do_get_stats()` MUST NOT include `cache_hits`, `cache_misses`, or any stream stats aggregated by base. Base owns these counters. Duplicating them causes double-counting in metrics and conformance failures.
 
 ### 8.7 Streaming Pattern: CHOOSE ONE: MANDATORY
 
@@ -1302,6 +1945,7 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
     
     # Generate full vector
     vec = await self._generate_embedding(spec.text, spec.model)
+    tokens = self._count_tokens_sync(spec.text, spec.model)
     
     ev = EmbeddingVector(
         vector=vec,
@@ -1314,7 +1958,7 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
     yield EmbedChunk(
         embeddings=[ev],
         is_final=True,
-        usage={"tokens": self._count_tokens_sync(spec.text, spec.model)},
+        usage={"tokens": tokens},
         model=spec.model
     )
 ```
@@ -1328,19 +1972,17 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
     """STREAMING PATTERN: Progressive: partial vectors growing to full dimension."""
     
     dim = self._get_dimension(spec.model)
-    chunk_size = max(1, dim // 3)  # Example: 3 chunks
-    
+    chunk_size = max(1, dim // 3)
     accumulated = []
+    tokens = self._count_tokens_sync(spec.text, spec.model)
+    
     for i in range(0, dim, chunk_size):
-        # Generate next chunk of the vector
+        # Generate next chunk
         chunk_vec = await self._generate_partial_embedding(
-            spec.text, 
-            spec.model,
-            start=i,
-            length=min(chunk_size, dim - i)
+            spec.text, spec.model,
+            start=i, length=min(chunk_size, dim - i)
         )
         accumulated.extend(chunk_vec)
-        
         is_final = len(accumulated) >= dim
         
         ev = EmbeddingVector(
@@ -1355,7 +1997,7 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
         yield EmbedChunk(
             embeddings=[ev],
             is_final=is_final,
-            usage={"tokens": self._count_tokens_sync(spec.text, spec.model)} if is_final else None,
+            usage={"tokens": tokens} if is_final else None,
             model=spec.model
         )
 ```
@@ -1368,10 +2010,10 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
 async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
     """STREAMING PATTERN: Multi-vector: multiple complete vectors per chunk."""
     
-    num_vectors = 3  # Example: generate 3 variations
+    num_vectors = 3
+    tokens = self._count_tokens_sync(spec.text, spec.model)
     
     for i in range(num_vectors):
-        # Generate complete vector (different variation)
         vec = await self._generate_embedding_variation(spec.text, spec.model, i)
         
         ev = EmbeddingVector(
@@ -1387,7 +2029,7 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
         yield EmbedChunk(
             embeddings=[ev],
             is_final=is_final,
-            usage={"tokens": self._count_tokens_sync(spec.text, spec.model)} if is_final else None,
+            usage={"tokens": tokens} if is_final else None,
             model=spec.model
         )
 ```
@@ -1433,67 +2075,443 @@ def _approx_tokens(self, text: str) -> int:
 async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
     """MANDATORY: Accurate token counting."""
     
-    # Use provider's token counting API
+    if model not in self._supported_models:
+        raise ModelNotAvailable(f"Model '{model}' is not supported")
+    
+    timeout = self._get_timeout(ctx)
+    
     try:
         return await self._client.count_tokens(
             model=model,
             text=text,
-            timeout=self._get_timeout(ctx)
+            timeout=timeout
         )
     except Exception as e:
-        # Map error using base error classes
-        from corpus_sdk.embedding.embedding_base import (
-            BadRequest, ModelNotAvailable, Unavailable
-        )
-        raise self._map_error(e)
+        raise self._map_provider_error(e)
 
-# OR for local counting:
 def _count_tokens_sync(self, text: str, model: str) -> int:
-    """Use tiktoken or provider's local tokenizer."""
+    """Synchronous token count for internal use."""
     import tiktoken
-    encoding = tiktoken.encoding_for_model(model)
+    try:
+        encoding = tiktoken.encoding_for_model(model)
+    except KeyError:
+        encoding = tiktoken.get_encoding("cl100k_base")
     return len(encoding.encode(text))
 ```
 
 **RULE:** Token counting MUST be accurate. Word-count approximations are FOR TESTING ONLY and MUST NOT appear in production adapters.
 
-### 8.10 Complete Embedding Example: Production Ready
+### 8.10 Complete Embedding Example (Production Ready)
 
 ```python
 from typing import AsyncIterator, Dict, Any, List, Optional
 import asyncio
 import time
+import hashlib
 from corpus_sdk.embedding.embedding_base import BaseEmbeddingAdapter
 from corpus_sdk.embedding.embedding_base import (
     EmbeddingCapabilities, EmbedSpec, BatchEmbedSpec,
     EmbedResult, BatchEmbedResult, EmbeddingVector,
-    EmbedChunk, EmbeddingStats
+    EmbedChunk, EmbeddingStats, OperationContext
 )
 from corpus_sdk.embedding.embedding_base import (
-    BadRequest, ModelNotAvailable, ResourceExhausted, 
-    TextTooLong, DeadlineExceeded, Unavailable
+    BadRequest, AuthError, ResourceExhausted, TransientNetwork,
+    Unavailable, NotSupported, DeadlineExceeded,
+    TextTooLong, ModelNotAvailable
 )
 
 class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
-    """Production-ready embedding adapter with 100% conformance.
+    """
+    Production-ready embedding adapter with 100% conformance.
     
     BATCH FAILURE MODE: Collect per-item failures with partial success reporting.
     STREAMING PATTERN: Single-chunk (one final chunk with complete vector).
     CAPABILITIES: Hardcoded based on provider capabilities.
     """
     
-    # ... (implementation as shown in original) ...
+    def __init__(self, client, supported_models, model_dimensions, **kwargs):
+        super().__init__(**kwargs)
+        self._client = client
+        self._supported_models = tuple(supported_models)
+        self._dimensions = model_dimensions
+        self._max_batch_size = 256
+        self._max_text_length = 8192
+        
+        # Stats: NO CACHE METRICS (base owns those)
+        self._stats = {
+            "embed_calls": 0,
+            "embed_batch_calls": 0,
+            "stream_embed_calls": 0,
+            "count_tokens_calls": 0,
+            "total_texts_embedded": 0,
+            "total_tokens_processed": 0,
+            "total_processing_time_ms": 0.0,
+            "error_count": 0
+        }
     
-    def _map_error(self, e: Exception):
-        """Map provider errors to canonical errors from base."""
-        # Import error classes directly from embedding_base
+    # ----------------------------------------------------------------------
+    # CAPABILITIES (Hardcoded - NOT configurable)
+    # ----------------------------------------------------------------------
+    
+    async def _do_capabilities(self) -> EmbeddingCapabilities:
+        """Advertise true provider capabilities - NEVER configurable."""
+        return EmbeddingCapabilities(
+            server="my-embed-provider",
+            version="1.0.0",
+            protocol="embedding/v1.0",
+            supported_models=self._supported_models,
+            max_batch_size=self._max_batch_size,
+            max_text_length=self._max_text_length,
+            max_dimensions=max(self._dimensions.values()),
+            supports_normalization=True,
+            supports_truncation=True,
+            supports_token_counting=True,
+            normalizes_at_source=False,  # Provider returns raw vectors
+            truncation_mode="base",
+            supports_deadline=True,
+            idempotent_writes=True,
+            supports_multi_tenant=True,
+            supports_streaming=True,
+            supports_batch_embedding=True
+        )
+    
+    # ----------------------------------------------------------------------
+    # SINGLE EMBED (with validation)
+    # ----------------------------------------------------------------------
+    
+    async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
+        """MANDATORY: Single embedding with validation."""
+        self._stats["embed_calls"] += 1
+        t0 = time.monotonic()
+        
+        # ✅ VALIDATE in _do_embed
+        if not isinstance(spec.text, str) or not spec.text.strip():
+            raise BadRequest("text must be a non-empty string")
+        
+        if spec.model not in self._supported_models:
+            raise ModelNotAvailable(
+                f"Model '{spec.model}' is not supported",
+                details={
+                    "requested_model": spec.model,
+                    "supported_models": list(self._supported_models)
+                }
+            )
+        
+        # Get timeout from deadline
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.embed(
+                model=spec.model,
+                text=spec.text,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        vec = response["vector"]
+        tokens = response.get("tokens", self._count_tokens_sync(spec.text, spec.model))
+        
+        ev = EmbeddingVector(
+            vector=vec,
+            text=spec.text,
+            model=spec.model,
+            dimensions=len(vec)
+        )
+        
+        self._stats["total_texts_embedded"] += 1
+        self._stats["total_tokens_processed"] += tokens
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return EmbedResult(
+            embedding=ev,
+            model=spec.model,
+            text=spec.text,
+            tokens_used=tokens,
+            truncated=False  # Base sets this if truncation occurred
+        )
+    
+    # ----------------------------------------------------------------------
+    # BATCH EMBED (Collection pattern - chosen, not configurable)
+    # ----------------------------------------------------------------------
+    
+    async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
+        """
+        BATCH FAILURE MODE: Collect per-item failures, continue processing.
+        
+        This adapter never fails the entire batch due to individual item errors.
+        Failures are reported in failed_texts with full error details.
+        """
+        self._stats["embed_batch_calls"] += 1
+        t0 = time.monotonic()
+        
+        if spec.model not in self._supported_models:
+            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+        
+        if len(spec.texts) > self._max_batch_size:
+            reduction_pct = self._suggested_batch_reduction_percent(
+                len(spec.texts), self._max_batch_size
+            )
+            raise BadRequest(
+                f"Batch size {len(spec.texts)} exceeds maximum of {self._max_batch_size}",
+                details={
+                    "max_batch_size": self._max_batch_size,
+                    "actual": len(spec.texts)
+                },
+                suggested_batch_reduction=reduction_pct
+            )
+        
+        timeout = self._get_timeout(ctx)
+        
+        embeddings = []
+        failures = []
+        total_tokens = 0
+        
+        for i, text in enumerate(spec.texts):
+            try:
+                # ✅ Validate each item
+                if not isinstance(text, str) or not text.strip():
+                    raise BadRequest("text must be non-empty")
+                
+                if len(text) > self._max_text_length:
+                    raise TextTooLong(
+                        f"Text length {len(text)} exceeds maximum of {self._max_text_length}",
+                        details={
+                            "max_length": self._max_text_length,
+                            "actual_length": len(text)
+                        }
+                    )
+                
+                # Call provider
+                response = await self._client.embed(
+                    model=spec.model,
+                    text=text,
+                    timeout=timeout
+                )
+                
+                vec = response["vector"]
+                tokens = response.get("tokens", self._count_tokens_sync(text, spec.model))
+                
+                embeddings.append(EmbeddingVector(
+                    vector=vec,
+                    text=text,
+                    model=spec.model,
+                    dimensions=len(vec)
+                ))
+                
+                total_tokens += tokens
+                self._stats["total_texts_embedded"] += 1
+                self._stats["total_tokens_processed"] += tokens
+                
+            except Exception as e:
+                # COLLECT failure, continue processing
+                failures.append({
+                    "index": i,
+                    "text": text[:100],  # Truncate for safety
+                    "error": type(e).__name__,
+                    "code": getattr(e, "code", None) or type(e).__name__.upper(),
+                    "message": str(e)[:200],  # Truncate for safety
+                    "metadata": spec.metadatas[i] if spec.metadatas else None
+                })
+                self._stats["error_count"] += 1
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return BatchEmbedResult(
+            embeddings=embeddings,
+            model=spec.model,
+            total_texts=len(spec.texts),
+            total_tokens=total_tokens,
+            failed_texts=failures  # REQUIRED: partial failure reporting
+        )
+    
+    def _suggested_batch_reduction_percent(self, requested: int, maximum: int) -> Optional[int]:
+        """PERCENTAGE reduction hint, not absolute."""
+        if requested <= 0 or maximum < 0 or requested <= maximum:
+            return None
+        return int(100 * (requested - maximum) / requested)
+    
+    # ----------------------------------------------------------------------
+    # STREAM EMBED (Single-chunk pattern - chosen, not configurable)
+    # ----------------------------------------------------------------------
+    
+    async def _do_stream_embed(
+        self, spec: EmbedSpec, *, ctx=None
+    ) -> AsyncIterator[EmbedChunk]:
+        """
+        STREAMING PATTERN: Single chunk with one complete vector.
+        
+        This adapter emits exactly one chunk with is_final=True containing
+        the complete embedding vector. No partial vectors are emitted.
+        """
+        self._stats["stream_embed_calls"] += 1
+        t0 = time.monotonic()
+        
+        # Validate (same as _do_embed)
+        if not isinstance(spec.text, str) or not spec.text.strip():
+            raise BadRequest("text must be a non-empty string")
+        
+        if spec.model not in self._supported_models:
+            raise ModelNotAvailable(f"Model '{spec.model}' is not supported")
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.embed(
+                model=spec.model,
+                text=spec.text,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        vec = response["vector"]
+        tokens = response.get("tokens", self._count_tokens_sync(spec.text, spec.model))
+        
+        ev = EmbeddingVector(
+            vector=vec,
+            text=spec.text,
+            model=spec.model,
+            dimensions=len(vec)
+        )
+        
+        # SINGLE CHUNK, is_final=True
+        yield EmbedChunk(
+            embeddings=[ev],
+            is_final=True,
+            usage={"tokens": tokens},
+            model=spec.model
+        )
+        
+        self._stats["total_texts_embedded"] += 1
+        self._stats["total_tokens_processed"] += tokens
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+    
+    # ----------------------------------------------------------------------
+    # TOKEN COUNTING (Accurate - no approximations)
+    # ----------------------------------------------------------------------
+    
+    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
+        """MANDATORY: Accurate token counting."""
+        self._stats["count_tokens_calls"] += 1
+        t0 = time.monotonic()
+        
+        if model not in self._supported_models:
+            raise ModelNotAvailable(f"Model '{model}' is not supported")
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            count = await self._client.count_tokens(
+                model=model,
+                text=text,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        return count
+    
+    def _count_tokens_sync(self, text: str, model: str) -> int:
+        """Synchronous token count for internal use."""
+        import tiktoken
+        try:
+            encoding = tiktoken.encoding_for_model(model)
+        except KeyError:
+            encoding = tiktoken.get_encoding("cl100k_base")
+        return len(encoding.encode(text))
+    
+    # ----------------------------------------------------------------------
+    # STATS (NO CACHE METRICS - CRITICAL)
+    # ----------------------------------------------------------------------
+    
+    async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
+        """MANDATORY: Adapter-owned stats ONLY. NO cache metrics."""
+        total_ops = (
+            self._stats["embed_calls"] +
+            self._stats["embed_batch_calls"] +
+            self._stats["stream_embed_calls"] +
+            self._stats["count_tokens_calls"]
+        )
+        
+        avg_ms = (self._stats["total_processing_time_ms"] / total_ops) if total_ops else 0
+        
+        # ✅ CORRECT: NO cache_hits, NO cache_misses
+        return EmbeddingStats(
+            total_requests=total_ops,
+            total_texts=self._stats["total_texts_embedded"],
+            total_tokens=self._stats["total_tokens_processed"],
+            avg_processing_time_ms=avg_ms,
+            error_count=self._stats["error_count"]
+        )
+    
+    # ----------------------------------------------------------------------
+    # HEALTH
+    # ----------------------------------------------------------------------
+    
+    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+        """Health check - NO ctx.attrs-driven forcing."""
+        try:
+            healthy = await self._client.health_check()
+            return {
+                "ok": healthy,
+                "status": "ok" if healthy else "degraded",
+                "server": "my-embed-provider",
+                "version": "1.0.0",
+                "models": {
+                    m: {"status": "ready"}
+                    for m in self._supported_models
+                }
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "status": "down",
+                "server": "my-embed-provider",
+                "version": "1.0.0"
+            }
+    
+    # ----------------------------------------------------------------------
+    # UTILITIES
+    # ----------------------------------------------------------------------
+    
+    def _get_timeout(self, ctx):
+        """Convert deadline to timeout."""
+        if ctx is None:
+            return None
+        rem = ctx.remaining_ms()
+        if rem is None or rem <= 0:
+            return None
+        return rem / 1000.0
+    
+    def _map_provider_error(self, e: Exception):
+        """Map provider errors to canonical Corpus errors."""
         from corpus_sdk.embedding.embedding_base import (
             BadRequest, AuthError, ResourceExhausted,
             TransientNetwork, Unavailable, TextTooLong,
             ModelNotAvailable, DeadlineExceeded
         )
         
-        # Mapping logic here...
+        if "rate limit" in str(e).lower():
+            return ResourceExhausted("Rate limit exceeded", retry_after_ms=5000)
+        if "auth" in str(e).lower() or "key" in str(e).lower():
+            return AuthError("Authentication failed")
+        if "timeout" in str(e).lower():
+            return TransientNetwork("Request timeout")
+        if "too long" in str(e).lower() or "length" in str(e).lower():
+            return TextTooLong(str(e))
+        if "model" in str(e).lower() and "not found" in str(e).lower():
+            return ModelNotAvailable(str(e))
+        
+        return Unavailable(f"Provider error: {type(e).__name__}")
+    
+    def reset_stats(self):
+        """Reset stats (for testing)."""
+        self._stats = {k: 0 for k in self._stats}
 ```
 
 ---
@@ -1508,36 +2526,71 @@ from corpus_sdk.vector.vector_base import (
     VectorCapabilities, QuerySpec, BatchQuerySpec,
     UpsertSpec, DeleteSpec, NamespaceSpec,
     QueryResult, UpsertResult, DeleteResult, NamespaceResult,
-    Vector, VectorMatch, VectorID
+    Vector, VectorMatch, VectorID, OperationContext
 )
 from corpus_sdk.vector.vector_base import (
-    BadRequest, DimensionMismatch, IndexNotReady,
-    NotSupported, ResourceExhausted, DeadlineExceeded
+    BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported,
+    DeadlineExceeded, DimensionMismatch, IndexNotReady
 )
 
 class MyVectorAdapter(BaseVectorAdapter):
     async def _do_capabilities(self) -> VectorCapabilities:
         """REQUIRED: Describe dimensions, metrics, limits."""
         
-    async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
+    async def _do_query(
+        self,
+        spec: QuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> QueryResult:
         """REQUIRED: Single vector similarity search."""
         
-    async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[QueryResult]:
+    async def _do_batch_query(
+        self,
+        spec: BatchQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> List[QueryResult]:
         """REQUIRED: Batch queries: ALL OR NOTHING atomic."""
         
-    async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
+    async def _do_upsert(
+        self,
+        spec: UpsertSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
         """REQUIRED: Insert/update vectors with namespace authority enforcement."""
         
-    async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
+    async def _do_delete(
+        self,
+        spec: DeleteSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
         """REQUIRED: Delete vectors: IDEMPOTENT, no error on missing."""
         
-    async def _do_create_namespace(self, spec: NamespaceSpec, *, ctx=None) -> NamespaceResult:
+    async def _do_create_namespace(
+        self,
+        spec: NamespaceSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
         """REQUIRED: Create namespace with dimensions and metric."""
         
-    async def _do_delete_namespace(self, namespace: str, *, ctx=None) -> NamespaceResult:
+    async def _do_delete_namespace(
+        self,
+        namespace: str,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> NamespaceResult:
         """REQUIRED: Delete namespace and all its vectors."""
         
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Dict[str, Any]:
         """REQUIRED: Health with per-namespace status."""
 ```
 
@@ -1575,6 +2628,7 @@ async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
 **RULE:** `UpsertSpec.namespace` is authoritative. If any `Vector.namespace` is provided and does not match, raise `BadRequest` with complete details. Do not silently correct. Do not allow per-vector namespaces.
 
 **SAME RULE APPLIES TO BATCH QUERY:**
+
 ```python
 async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[QueryResult]:
     """MANDATORY: Batch namespace authority."""
@@ -1682,14 +2736,29 @@ async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[Query
     for i, q in enumerate(spec.queries):
         # Validate namespace
         if q.namespace != spec.namespace:
-            raise BadRequest(...)  # Fail entire batch
+            raise BadRequest(
+                f"query[{i}].namespace must match batch namespace",
+                details={
+                    "index": i,
+                    "batch_namespace": spec.namespace,
+                    "query_namespace": q.namespace
+                }
+            )
         
         # Validate filter dialect
         self._validate_filter_dialect(q.filter, spec.namespace)
         
         # Validate dimensions
         if len(q.vector) != ns_info.dimensions:
-            raise DimensionMismatch(...)  # Fail entire batch
+            raise DimensionMismatch(
+                f"query[{i}] vector dimension {len(q.vector)} does not match namespace {ns_info.dimensions}",
+                details={
+                    "index": i,
+                    "expected": ns_info.dimensions,
+                    "actual": len(q.vector),
+                    "namespace": spec.namespace
+                }
+            )
     
     # ✅ ONLY after ALL validations pass, execute queries
     results = []
@@ -1792,7 +2861,10 @@ async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
         
         raise BadRequest(
             f"batch size {len(spec.vectors)} exceeds maximum of {self._max_batch_size}",
-            details={"max_batch_size": self._max_batch_size, "namespace": ns},
+            details={
+                "max_batch_size": self._max_batch_size, 
+                "namespace": spec.namespace
+            },
             suggested_batch_reduction=reduction_pct  # ✅ PERCENTAGE, not absolute
         )
 ```
@@ -1887,35 +2959,631 @@ async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
 
 **RULE:** Vector health response MUST include per-namespace status with dimensions, metric, count, and status. This is required by conformance tests.
 
-### 9.14 Complete Vector Example: Production Ready
+### 9.14 Complete Vector Example (Production Ready)
 
 ```python
 from typing import Dict, Any, List, Optional, Tuple
 import asyncio
 import math
+import time
+from dataclasses import dataclass
 from corpus_sdk.vector.vector_base import BaseVectorAdapter
 from corpus_sdk.vector.vector_base import (
     VectorCapabilities, QuerySpec, BatchQuerySpec,
     UpsertSpec, DeleteSpec, NamespaceSpec,
     QueryResult, UpsertResult, DeleteResult, NamespaceResult,
-    Vector, VectorMatch, VectorID
+    Vector, VectorMatch, VectorID, OperationContext
 )
 from corpus_sdk.vector.vector_base import (
-    BadRequest, DimensionMismatch, IndexNotReady,
-    NotSupported, ResourceExhausted, DeadlineExceeded
+    BadRequest, AuthError, ResourceExhausted, TransientNetwork,
+    Unavailable, NotSupported, DeadlineExceeded,
+    DimensionMismatch, IndexNotReady
 )
 
+# EXACT metric strings: DO NOT CHANGE
+METRIC_COSINE = "cosine"
+METRIC_EUCLIDEAN = "euclidean"
+METRIC_DOTPRODUCT = "dotproduct"
+SUPPORTED_METRICS = (METRIC_COSINE, METRIC_EUCLIDEAN, METRIC_DOTPRODUCT)
+
+
 class ProductionVectorAdapter(BaseVectorAdapter):
-    # ... (implementation) ...
+    """
+    Production-ready vector adapter with 100% conformance.
     
-    def _map_error(self, e: Exception):
-        """Map provider errors to canonical errors from vector_base."""
+    BATCH QUERY: Atomic (all or nothing): any invalid query fails entire batch.
+    DELETE: Idempotent: no error on missing IDs.
+    NAMESPACE: Spec.namespace is authoritative; mismatches raise BadRequest.
+    FILTERS: Strict validation: unknown operators raise BadRequest.
+    """
+    
+    def __init__(self, client, **kwargs):
+        super().__init__(**kwargs)
+        self._client = client
+        self._max_dimensions = 2048
+        self._max_batch_size = 1000
+        self._max_top_k = 1000
+        self._max_filter_terms = 10
+        
+        # namespace -> {id -> Vector}
+        self._store: Dict[str, Dict[str, Vector]] = {}
+        # namespace -> NamespaceInfo
+        self._namespaces: Dict[str, _NamespaceInfo] = {}
+        
+        # Stats (adapter-owned only)
+        self._stats = {
+            "query_calls": 0,
+            "batch_query_calls": 0,
+            "upsert_calls": 0,
+            "delete_calls": 0,
+            "create_namespace_calls": 0,
+            "delete_namespace_calls": 0,
+            "total_vectors_upserted": 0,
+            "total_vectors_deleted": 0,
+            "total_processing_time_ms": 0.0,
+            "error_count": 0
+        }
+    
+    # ----------------------------------------------------------------------
+    # CAPABILITIES
+    # ----------------------------------------------------------------------
+    
+    async def _do_capabilities(self) -> VectorCapabilities:
+        """Advertise true capabilities - HARDCODED, not configurable."""
+        return VectorCapabilities(
+            server="my-vector-provider",
+            version="1.0.0",
+            protocol="vector/v1.0",
+            max_dimensions=self._max_dimensions,
+            supported_metrics=SUPPORTED_METRICS,  # EXACT strings
+            supports_namespaces=True,
+            supports_metadata_filtering=True,
+            supports_batch_operations=True,
+            max_batch_size=self._max_batch_size,
+            supports_index_management=True,
+            idempotent_writes=False,
+            supports_multi_tenant=False,
+            supports_deadline=True,
+            max_top_k=self._max_top_k,
+            max_filter_terms=self._max_filter_terms,
+            supports_batch_queries=True,
+            text_storage_strategy="none"
+        )
+    
+    # ----------------------------------------------------------------------
+    # NAMESPACE MANAGEMENT
+    # ----------------------------------------------------------------------
+    
+    async def _do_create_namespace(
+        self, spec: NamespaceSpec, *, ctx=None
+    ) -> NamespaceResult:
+        """Create namespace: idempotent."""
+        self._stats["create_namespace_calls"] += 1
+        t0 = time.monotonic()
+        
+        if spec.distance_metric not in SUPPORTED_METRICS:
+            raise NotSupported(
+                f"distance_metric must be one of: {', '.join(SUPPORTED_METRICS)}"
+            )
+        
+        # Idempotent: if exists, succeed
+        if spec.namespace not in self._namespaces:
+            self._namespaces[spec.namespace] = _NamespaceInfo(
+                dimensions=spec.dimensions,
+                distance_metric=spec.distance_metric
+            )
+            self._store.setdefault(spec.namespace, {})
+            created = True
+        else:
+            created = False
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return NamespaceResult(
+            success=True,
+            namespace=spec.namespace,
+            details={"created": created}
+        )
+    
+    async def _do_delete_namespace(self, namespace: str, *, ctx=None) -> NamespaceResult:
+        """Delete namespace: idempotent."""
+        self._stats["delete_namespace_calls"] += 1
+        t0 = time.monotonic()
+        
+        existed = namespace in self._namespaces
+        self._namespaces.pop(namespace, None)
+        self._store.pop(namespace, None)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return NamespaceResult(
+            success=True,
+            namespace=namespace,
+            details={"existed": existed}
+        )
+    
+    # ----------------------------------------------------------------------
+    # QUERY (Single)
+    # ----------------------------------------------------------------------
+    
+    async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
+        """Single vector similarity search."""
+        self._stats["query_calls"] += 1
+        t0 = time.monotonic()
+        
+        # Validate namespace exists
+        if spec.namespace not in self._namespaces:
+            raise BadRequest(f"unknown namespace '{spec.namespace}'")
+        
+        # Validate filter dialect
+        self._validate_filter_dialect(spec.filter, spec.namespace)
+        
+        # Validate dimensions
+        ns_info = self._namespaces[spec.namespace]
+        if len(spec.vector) != ns_info.dimensions:
+            raise DimensionMismatch(
+                f"query vector dimension {len(spec.vector)} does not match namespace {ns_info.dimensions}",
+                details={
+                    "expected": ns_info.dimensions,
+                    "actual": len(spec.vector),
+                    "namespace": spec.namespace
+                }
+            )
+        
+        # Check if index is ready
+        if not self._store.get(spec.namespace):
+            raise IndexNotReady(
+                "index not ready (no data in namespace)",
+                retry_after_ms=500,
+                details={"namespace": spec.namespace}
+            )
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.query(
+                vector=spec.vector,
+                top_k=spec.top_k,
+                namespace=spec.namespace,
+                filter=self._convert_filter(spec.filter),
+                include_metadata=spec.include_metadata,
+                include_vectors=spec.include_vectors,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        matches = self._render_matches(
+            matches=response.matches,
+            include_vectors=spec.include_vectors,
+            include_metadata=spec.include_metadata
+        )
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return QueryResult(
+            matches=matches,
+            query_vector=spec.vector,
+            namespace=spec.namespace,
+            total_matches=response.total_matches
+        )
+    
+    # ----------------------------------------------------------------------
+    # BATCH QUERY (ATOMIC: All or Nothing)
+    # ----------------------------------------------------------------------
+    
+    async def _do_batch_query(
+        self, spec: BatchQuerySpec, *, ctx=None
+    ) -> List[QueryResult]:
+        """MANDATORY: Batch query is ATOMIC: all or nothing."""
+        self._stats["batch_query_calls"] += 1
+        t0 = time.monotonic()
+        
+        # Validate namespace exists
+        if spec.namespace not in self._namespaces:
+            raise BadRequest(f"unknown namespace '{spec.namespace}'")
+        
+        ns_info = self._namespaces[spec.namespace]
+        
+        # ✅ PHASE 1: VALIDATE ALL QUERIES
+        for i, q in enumerate(spec.queries):
+            # Validate namespace authority
+            if q.namespace != spec.namespace:
+                raise BadRequest(
+                    f"query[{i}].namespace must match batch namespace",
+                    details={
+                        "index": i,
+                        "batch_namespace": spec.namespace,
+                        "query_namespace": q.namespace
+                    }
+                )
+            
+            # Validate filter dialect
+            self._validate_filter_dialect(q.filter, spec.namespace)
+            
+            # Validate dimensions
+            if len(q.vector) != ns_info.dimensions:
+                raise DimensionMismatch(
+                    f"query[{i}] vector dimension {len(q.vector)} does not match namespace {ns_info.dimensions}",
+                    details={
+                        "index": i,
+                        "expected": ns_info.dimensions,
+                        "actual": len(q.vector),
+                        "namespace": spec.namespace
+                    }
+                )
+        
+        # ✅ PHASE 2: EXECUTE ALL QUERIES (atomic)
+        timeout = self._get_timeout(ctx)
+        results = []
+        
+        try:
+            responses = await self._client.batch_query(
+                queries=[
+                    {
+                        "vector": q.vector,
+                        "top_k": q.top_k,
+                        "filter": self._convert_filter(q.filter),
+                        "include_metadata": q.include_metadata,
+                        "include_vectors": q.include_vectors
+                    }
+                    for q in spec.queries
+                ],
+                namespace=spec.namespace,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        for i, q in enumerate(spec.queries):
+            matches = self._render_matches(
+                matches=responses[i].matches,
+                include_vectors=q.include_vectors,
+                include_metadata=q.include_metadata
+            )
+            
+            results.append(QueryResult(
+                matches=matches,
+                query_vector=q.vector,
+                namespace=spec.namespace,
+                total_matches=responses[i].total_matches
+            ))
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        return results
+    
+    # ----------------------------------------------------------------------
+    # UPSERT (with Namespace Authority)
+    # ----------------------------------------------------------------------
+    
+    async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
+        """Upsert vectors with namespace authority enforcement."""
+        self._stats["upsert_calls"] += 1
+        t0 = time.monotonic()
+        
+        ns = spec.namespace
+        
+        # Validate namespace exists
+        if ns not in self._namespaces:
+            raise BadRequest(f"unknown namespace '{ns}'")
+        
+        # Enforce batch size limit
+        if len(spec.vectors) > self._max_batch_size:
+            reduction_pct = self._suggested_batch_reduction_percent(
+                len(spec.vectors),
+                self._max_batch_size
+            )
+            raise BadRequest(
+                f"batch size {len(spec.vectors)} exceeds maximum of {self._max_batch_size}",
+                details={"max_batch_size": self._max_batch_size, "namespace": ns},
+                suggested_batch_reduction=reduction_pct
+            )
+        
+        # ✅ ENFORCE NAMESPACE AUTHORITY
+        for i, v in enumerate(spec.vectors):
+            if v.namespace is not None and v.namespace != ns:
+                raise BadRequest(
+                    "vector.namespace must match UpsertSpec.namespace",
+                    details={
+                        "index": i,
+                        "spec_namespace": ns,
+                        "vector_namespace": v.namespace,
+                        "vector_id": str(v.id)
+                    }
+                )
+        
+        # Validate dimensions
+        dims = self._namespaces[ns].dimensions
+        for i, v in enumerate(spec.vectors):
+            if len(v.vector) != dims:
+                raise DimensionMismatch(
+                    f"vector dimension {len(v.vector)} does not match namespace {dims}",
+                    details={
+                        "index": i,
+                        "expected": dims,
+                        "actual": len(v.vector),
+                        "namespace": ns,
+                        "vector_id": str(v.id)
+                    }
+                )
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.upsert(
+                vectors=[
+                    {
+                        "id": str(v.id),
+                        "vector": v.vector,
+                        "metadata": v.metadata
+                    }
+                    for v in spec.vectors
+                ],
+                namespace=ns,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        # Update local cache
+        bucket = self._store.setdefault(ns, {})
+        for v in spec.vectors:
+            bucket[str(v.id)] = v
+        
+        self._stats["total_vectors_upserted"] += len(spec.vectors)
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return UpsertResult(
+            upserted_count=len(spec.vectors),
+            failed_count=0,
+            failures=[]
+        )
+    
+    # ----------------------------------------------------------------------
+    # DELETE (Idempotent: No Error on Missing)
+    # ----------------------------------------------------------------------
+    
+    async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
+        """MANDATORY: Delete is IDEMPOTENT: no error on missing IDs."""
+        self._stats["delete_calls"] += 1
+        t0 = time.monotonic()
+        
+        ns = spec.namespace
+        
+        # Validate namespace exists
+        if ns not in self._namespaces:
+            raise BadRequest(f"unknown namespace '{ns}'")
+        
+        # ✅ Enforce IDs XOR Filter
+        has_ids = bool(spec.ids)
+        has_filter = bool(spec.filter)
+        
+        if has_ids and has_filter:
+            raise BadRequest(
+                "must provide either ids OR filter, not both",
+                details={"namespace": ns}
+            )
+        
+        if not has_ids and not has_filter:
+            raise BadRequest(
+                "must provide either ids or filter for deletion",
+                details={"namespace": ns}
+            )
+        
+        # Validate filter if provided
+        if has_filter:
+            self._validate_filter_dialect(spec.filter, ns)
+        
+        bucket = self._store.get(ns, {})
+        deleted = 0
+        
+        if has_ids:
+            for vid in spec.ids:
+                key = str(vid)
+                if key in bucket:
+                    del bucket[key]
+                    deleted += 1
+                # ✅ ID not found: continue silently, no error
+        
+        elif has_filter:
+            to_delete = []
+            for vid, v in bucket.items():
+                if self._filter_match(v.metadata, spec.filter):
+                    to_delete.append(vid)
+            
+            for vid in to_delete:
+                del bucket[vid]
+                deleted += 1
+        
+        self._stats["total_vectors_deleted"] += deleted
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return DeleteResult(
+            deleted_count=deleted,  # Actual deletions, not attempts
+            failed_count=0,
+            failures=[]
+        )
+    
+    # ----------------------------------------------------------------------
+    # FILTER VALIDATION (Strict: No Silent Ignore)
+    # ----------------------------------------------------------------------
+    
+    def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
+        """MANDATORY: Validate filter operators before execution."""
+        from corpus_sdk.vector.vector_base import BadRequest
+        
+        if filter is None:
+            return
+        
+        if not isinstance(filter, dict):
+            raise BadRequest(
+                "filter must be an object",
+                details={
+                    "namespace": namespace,
+                    "type": type(filter).__name__
+                }
+            )
+        
+        for field, condition in filter.items():
+            if isinstance(condition, dict):
+                # Check for unsupported operators
+                unknown_ops = [op for op in condition.keys() if op != "$in"]
+                if unknown_ops:
+                    raise BadRequest(
+                        "unsupported filter operator",
+                        details={
+                            "namespace": namespace,
+                            "field": field,
+                            "operator": unknown_ops[0],
+                            "supported": ["$in"]  # REQUIRED
+                        }
+                    )
+                
+                # Validate $in operand
+                if "$in" in condition:
+                    allowed = condition["$in"]
+                    if not isinstance(allowed, list):
+                        raise BadRequest(
+                            "invalid '$in' operand: must be list",
+                            details={
+                                "namespace": namespace,
+                                "field": field,
+                                "type": type(allowed).__name__
+                            }
+                        )
+    
+    def _filter_match(self, metadata: Optional[Dict], filter: Optional[Dict]) -> bool:
+        """Match metadata against filter."""
+        if not filter:
+            return True
+        if not metadata:
+            return False
+        
+        for k, v in filter.items():
+            if isinstance(v, dict):
+                if "$in" in v:
+                    if metadata.get(k) not in v["$in"]:
+                        return False
+            else:
+                if metadata.get(k) != v:
+                    return False
+        return True
+    
+    def _convert_filter(self, filter: Optional[Dict]) -> Optional[Dict]:
+        """Convert Corpus filter to provider-specific filter format."""
+        if filter is None:
+            return None
+        # Implement provider-specific conversion
+        return filter
+    
+    # ----------------------------------------------------------------------
+    # HEALTH (with Namespace Status)
+    # ----------------------------------------------------------------------
+    
+    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+        """MANDATORY: Health with per-namespace status."""
+        
+        try:
+            healthy = await self._client.health_check()
+        except Exception:
+            return {
+                "ok": False,
+                "status": "down",
+                "server": "my-vector-provider",
+                "version": "1.0.0"
+            }
+        
+        return {
+            "ok": healthy,
+            "status": "ok" if healthy else "degraded",
+            "server": "my-vector-provider",
+            "version": "1.0.0",
+            "namespaces": {
+                ns: {
+                    "dimensions": info.dimensions,
+                    "metric": info.distance_metric,
+                    "count": len(self._store.get(ns, {})),
+                    "status": "ok" if healthy else "degraded"
+                }
+                for ns, info in self._namespaces.items()
+            }
+        }
+    
+    # ----------------------------------------------------------------------
+    # UTILITIES
+    # ----------------------------------------------------------------------
+    
+    def _suggested_batch_reduction_percent(self, requested: int, maximum: int) -> Optional[int]:
+        """PERCENTAGE reduction hint, not absolute."""
+        if requested <= 0 or maximum < 0 or requested <= maximum:
+            return None
+        return int(100 * (requested - maximum) / requested)
+    
+    def _render_matches(self, matches, include_vectors: bool, include_metadata: bool):
+        """include_vectors=False → [] (empty list), not null."""
+        rendered = []
+        for m in matches:
+            out_vec = list(m.vector) if include_vectors else []
+            out_meta = dict(m.metadata) if (include_metadata and m.metadata) else None
+            
+            rendered.append(VectorMatch(
+                vector=Vector(
+                    id=VectorID(m.id),
+                    vector=out_vec,
+                    metadata=out_meta,
+                    namespace=m.namespace
+                ),
+                score=m.score,
+                distance=m.distance
+            ))
+        return rendered
+    
+    def _get_timeout(self, ctx):
+        if ctx is None:
+            return None
+        rem = ctx.remaining_ms()
+        if rem is None or rem <= 0:
+            return None
+        return rem / 1000.0
+    
+    def _map_provider_error(self, e: Exception):
+        """Map provider errors to canonical Corpus errors."""
         from corpus_sdk.vector.vector_base import (
             BadRequest, AuthError, ResourceExhausted,
             TransientNetwork, Unavailable, DimensionMismatch,
             IndexNotReady, DeadlineExceeded
         )
-        # Mapping logic...
+        
+        if "rate limit" in str(e).lower():
+            return ResourceExhausted("Rate limit exceeded", retry_after_ms=5000)
+        if "auth" in str(e).lower() or "key" in str(e).lower():
+            return AuthError("Authentication failed")
+        if "timeout" in str(e).lower():
+            return TransientNetwork("Request timeout")
+        if "dimension" in str(e).lower():
+            return DimensionMismatch(str(e))
+        if "not ready" in str(e).lower():
+            return IndexNotReady(str(e), retry_after_ms=500)
+        
+        return Unavailable(f"Provider error: {type(e).__name__}")
+    
+    def _execute_single_query(self, q, namespace, ctx):
+        """Execute a single query (helper for batch)."""
+        # Implementation depends on provider
+        pass
+    
+    def _get_namespace_info(self, namespace):
+        """Get namespace info."""
+        return self._namespaces.get(namespace)
+
+
+@dataclass
+class _NamespaceInfo:
+    dimensions: int
+    distance_metric: str
 ```
 
 ---
@@ -1934,52 +3602,110 @@ from corpus_sdk.graph.graph_base import (
     BulkVerticesSpec, BulkVerticesResult,
     BatchOperation, BatchResult,
     QueryResult, QueryChunk, TraversalResult,
-    GraphSchema
+    GraphSchema, OperationContext
 )
 from corpus_sdk.graph.graph_base import (
-    BadRequest, NotSupported, AuthError,
-    ResourceExhausted, TransientNetwork, 
-    Unavailable, DeadlineExceeded
+    BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported,
+    DeadlineExceeded
 )
 
 class MyGraphAdapter(BaseGraphAdapter):
     async def _do_capabilities(self) -> GraphCapabilities:
         """REQUIRED: Describe dialects, features, limits."""
     
-    async def _do_query(self, spec: GraphQuerySpec, *, ctx=None) -> QueryResult:
+    async def _do_query(
+        self,
+        spec: GraphQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> QueryResult:
         """REQUIRED: Unary graph query."""
     
-    async def _do_stream_query(self, spec: GraphQuerySpec, *, ctx=None) -> AsyncIterator[QueryChunk]:
+    async def _do_stream_query(
+        self,
+        spec: GraphQuerySpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> AsyncIterator[QueryChunk]:
         """REQUIRED: Streaming graph query."""
     
-    async def _do_bulk_vertices(self, spec: BulkVerticesSpec, *, ctx=None) -> BulkVerticesResult:
+    async def _do_bulk_vertices(
+        self,
+        spec: BulkVerticesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BulkVerticesResult:
         """REQUIRED: Bulk vertex scan with pagination."""
     
-    async def _do_batch(self, ops: List[BatchOperation], *, ctx=None) -> BatchResult:
+    async def _do_batch(
+        self,
+        ops: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
         """REQUIRED: Batch operations with per-op result envelopes."""
     
-    async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -> BatchResult:
+    async def _do_transaction(
+        self,
+        operations: List[BatchOperation],
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> BatchResult:
         """REQUIRED if supports_transaction=True: Atomic transaction."""
     
-    async def _do_traversal(self, spec: GraphTraversalSpec, *, ctx=None) -> TraversalResult:
+    async def _do_traversal(
+        self,
+        spec: GraphTraversalSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> TraversalResult:
         """REQUIRED if supports_traversal=True: Graph traversal."""
     
-    async def _do_get_schema(self, *, ctx=None) -> GraphSchema:
-        """REQUIRED if supports_schema_ops=True: Schema retrieval."""
+    async def _do_get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
+        """REQUIRED if supports_schema=True: Schema retrieval."""
     
-    async def _do_upsert_nodes(self, spec: UpsertNodesSpec, *, ctx=None) -> UpsertResult:
+    async def _do_upsert_nodes(
+        self,
+        spec: UpsertNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
         """REQUIRED: Node upsert."""
     
-    async def _do_upsert_edges(self, spec: UpsertEdgesSpec, *, ctx=None) -> UpsertResult:
+    async def _do_upsert_edges(
+        self,
+        spec: UpsertEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> UpsertResult:
         """REQUIRED: Edge upsert."""
     
-    async def _do_delete_nodes(self, spec: DeleteNodesSpec, *, ctx=None) -> DeleteResult:
+    async def _do_delete_nodes(
+        self,
+        spec: DeleteNodesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
         """REQUIRED: Node delete (idempotent)."""
     
-    async def _do_delete_edges(self, spec: DeleteEdgesSpec, *, ctx=None) -> DeleteResult:
+    async def _do_delete_edges(
+        self,
+        spec: DeleteEdgesSpec,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> DeleteResult:
         """REQUIRED: Edge delete (idempotent)."""
     
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> Dict[str, Any]:
         """REQUIRED: Health check."""
 ```
 
@@ -1997,6 +3723,30 @@ async def _do_batch(self, ops: List[BatchOperation], *, ctx=None) -> BatchResult
                 spec = UpsertNodesSpec(**op.args)
                 res = await self._do_upsert_nodes(spec, ctx=ctx)
                 # ✅ CORRECT: {ok: true, result: {...}} envelope
+                results.append({
+                    "ok": True,
+                    "result": asdict(res)
+                })
+            
+            elif op.op == "graph.upsert_edges":
+                spec = UpsertEdgesSpec(**op.args)
+                res = await self._do_upsert_edges(spec, ctx=ctx)
+                results.append({
+                    "ok": True,
+                    "result": asdict(res)
+                })
+            
+            elif op.op == "graph.delete_nodes":
+                spec = DeleteNodesSpec(**op.args)
+                res = await self._do_delete_nodes(spec, ctx=ctx)
+                results.append({
+                    "ok": True,
+                    "result": asdict(res)
+                })
+            
+            elif op.op == "graph.delete_edges":
+                spec = DeleteEdgesSpec(**op.args)
+                res = await self._do_delete_edges(spec, ctx=ctx)
                 results.append({
                     "ok": True,
                     "result": asdict(res)
@@ -2046,7 +3796,7 @@ async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -
         results=results,
         success=all_ok,  # Atomic success/failure
         error=None if all_ok else "transaction failed",
-        transaction_id=f"tx_{uuid.uuid4().hex[:16]}"
+        transaction_id=f"tx_{uuid.uuid4().hex[:16]}" if all_ok else None
     )
 ```
 
@@ -2144,7 +3894,7 @@ class MyGraphAdapter(BaseGraphAdapter):
         results = await self._execute_ops_as_envelopes(operations, ctx)
         
         all_ok = all(r.get("ok") for r in results)
-        tx_id = f"tx_{self._stable_id(operations)}" if all_ok else None
+        tx_id = f"tx_{uuid.uuid4().hex[:16]}" if all_ok else None
         
         return BatchResult(
             results=results,
@@ -2174,6 +3924,24 @@ async def _do_query(self, spec: GraphQuerySpec, *, ctx=None) -> QueryResult:
             )
     
     # Proceed with query...
+
+async def _execute_ops_as_envelopes(self, ops, ctx):
+    """LAYER 2: RE-VALIDATE dialect in batch/transaction."""
+    
+    caps = await self._do_capabilities()
+    
+    for op in ops:
+        if op.op == "graph.query":
+            args = op.args or {}
+            dialect = args.get("dialect")
+            
+            # ✅ RE-VALIDATE: batch bypasses base validation
+            if dialect and caps.supported_query_dialects:
+                if dialect not in caps.supported_query_dialects:
+                    raise NotSupported(
+                        f"dialect '{dialect}' not supported",
+                        details={"supported": caps.supported_query_dialects}
+                    )
 ```
 
 **RULE:** You MUST validate dialect in TWO places:
@@ -2323,6 +4091,19 @@ async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -
         )
     
     # Proceed with transaction...
+
+async def _do_traversal(self, spec: GraphTraversalSpec, *, ctx=None) -> TraversalResult:
+    """MANDATORY: Enforce capabilities before proceeding."""
+    
+    caps = await self._do_capabilities()
+    
+    if not caps.supports_traversal:
+        raise NotSupported(
+            "traversal operations are not supported by this adapter",
+            details={"capability": "supports_traversal"}
+        )
+    
+    # Proceed with traversal...
 ```
 
 **RULE:** If `caps.supports_X = False`, `_do_X` MUST raise `NotSupported`. Do not silently no-op.
@@ -2354,12 +4135,13 @@ class MyGraphAdapter(BaseGraphAdapter):
 
 **RULE:** Core capabilities MUST be hardcoded based on your provider's actual capabilities. Do NOT make them configurable constructor parameters.
 
-### 10.10 Complete Graph Example: Production Ready
+### 10.10 Complete Graph Example (Production Ready)
 
 ```python
-from typing import AsyncIterator, Dict, Any, List, Optional
+from typing import AsyncIterator, Dict, Any, List, Optional, Tuple
 import asyncio
 import uuid
+import time
 from dataclasses import asdict
 from corpus_sdk.graph.graph_base import BaseGraphAdapter
 from corpus_sdk.graph.graph_base import (
@@ -2370,24 +4152,744 @@ from corpus_sdk.graph.graph_base import (
     BulkVerticesSpec, BulkVerticesResult,
     BatchOperation, BatchResult,
     QueryResult, QueryChunk, TraversalResult,
-    GraphSchema
+    GraphSchema, OperationContext
 )
 from corpus_sdk.graph.graph_base import (
-    BadRequest, NotSupported, Unavailable,
-    ResourceExhausted, TransientNetwork, DeadlineExceeded
+    BadRequest, AuthError, ResourceExhausted,
+    TransientNetwork, Unavailable, NotSupported,
+    DeadlineExceeded
 )
 
 class ProductionGraphAdapter(BaseGraphAdapter):
-    # ... (implementation) ...
+    """
+    Production-ready graph adapter with 100% conformance.
     
-    def _map_error(self, e: Exception):
-        """Map provider errors to canonical errors from graph_base."""
+    DIALECTS: Supported dialects hardcoded in capabilities.
+    DELETE: Idempotent: no error on missing IDs.
+    BATCH/TRANSACTION: Shared op executor with {ok, result} envelopes.
+    CAPABILITIES: Hardcoded, NOT configurable at runtime.
+    """
+    
+    def __init__(self, client, **kwargs):
+        super().__init__(**kwargs)
+        self._client = client
+        
+        # HARDCODED capabilities: NOT configurable
+        self._supported_dialects = ("cypher", "opencypher")
+        self._supports_stream = True
+        self._supports_bulk = True
+        self._supports_batch = True
+        self._supports_schema = True
+        self._supports_transaction = True
+        self._supports_traversal = True
+        self._max_traversal_depth = 10
+        self._max_batch_ops = 1000
+        
+        # In-memory store (replace with real client calls)
+        self._store: Dict[str, Dict[str, Node]] = {}
+        self._edge_store: Dict[str, Dict[str, Edge]] = {}
+        self._namespaces: set = set()
+        
+        # Stats (adapter-owned only)
+        self._stats = {
+            "query_calls": 0,
+            "stream_query_calls": 0,
+            "bulk_vertices_calls": 0,
+            "batch_calls": 0,
+            "transaction_calls": 0,
+            "traversal_calls": 0,
+            "get_schema_calls": 0,
+            "upsert_nodes_calls": 0,
+            "upsert_edges_calls": 0,
+            "delete_nodes_calls": 0,
+            "delete_edges_calls": 0,
+            "total_nodes_upserted": 0,
+            "total_edges_upserted": 0,
+            "total_nodes_deleted": 0,
+            "total_edges_deleted": 0,
+            "total_processing_time_ms": 0.0,
+            "error_count": 0
+        }
+    
+    # ----------------------------------------------------------------------
+    # CAPABILITIES (Hardcoded - NOT configurable)
+    # ----------------------------------------------------------------------
+    
+    async def _do_capabilities(self) -> GraphCapabilities:
+        """Advertise true capabilities - NEVER configurable."""
+        return GraphCapabilities(
+            server="my-graph-provider",
+            version="1.0.0",
+            protocol="graph/v1.0",
+            supported_query_dialects=self._supported_dialects,
+            supports_stream_query=self._supports_stream,
+            supports_namespaces=True,
+            supports_property_filters=True,
+            supports_bulk_vertices=self._supports_bulk,
+            supports_batch=self._supports_batch,
+            supports_schema=self._supports_schema,
+            idempotent_writes=False,
+            supports_multi_tenant=True,
+            supports_deadline=True,
+            max_batch_ops=self._max_batch_ops,
+            supports_transaction=self._supports_transaction,
+            supports_traversal=self._supports_traversal,
+            max_traversal_depth=self._max_traversal_depth,
+            supports_path_queries=False
+        )
+    
+    # ----------------------------------------------------------------------
+    # QUERY (Unary)
+    # ----------------------------------------------------------------------
+    
+    async def _do_query(self, spec: GraphQuerySpec, *, ctx=None) -> QueryResult:
+        """Unary graph query with dialect validation."""
+        self._stats["query_calls"] += 1
+        t0 = time.monotonic()
+        
+        # ✅ VALIDATE dialect
+        if spec.dialect and spec.dialect not in self._supported_dialects:
+            raise NotSupported(
+                f"dialect '{spec.dialect}' not supported",
+                details={
+                    "supported_query_dialects": self._supported_dialects
+                }
+            )
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.query(
+                dialect=spec.dialect or "cypher",
+                query=spec.text,
+                params=spec.params or {},
+                namespace=spec.namespace,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return QueryResult(
+            records=response.records,
+            summary={
+                "rows": len(response.records),
+                "consumed_ms": response.latency_ms
+            },
+            dialect=spec.dialect,
+            namespace=spec.namespace
+        )
+    
+    # ----------------------------------------------------------------------
+    # STREAM QUERY
+    # ----------------------------------------------------------------------
+    
+    async def _do_stream_query(
+        self, spec: GraphQuerySpec, *, ctx=None
+    ) -> AsyncIterator[QueryChunk]:
+        """Streaming graph query."""
+        self._stats["stream_query_calls"] += 1
+        t0 = time.monotonic()
+        
+        # Enforce capabilities
+        caps = await self._do_capabilities()
+        if not caps.supports_stream_query:
+            raise NotSupported("stream_query is not supported")
+        
+        # ✅ VALIDATE dialect
+        if spec.dialect and spec.dialect not in self._supported_dialects:
+            raise NotSupported(
+                f"dialect '{spec.dialect}' not supported",
+                details={"supported": self._supported_dialects}
+            )
+        
+        timeout = self._get_timeout(ctx)
+        chunk_count = 0
+        
+        try:
+            stream = await self._client.stream_query(
+                dialect=spec.dialect or "cypher",
+                query=spec.text,
+                params=spec.params or {},
+                namespace=spec.namespace,
+                timeout=timeout
+            )
+            
+            async for chunk in stream:
+                chunk_count += 1
+                yield QueryChunk(
+                    records=chunk.records,
+                    is_final=chunk.is_final
+                )
+                
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+    
+    # ----------------------------------------------------------------------
+    # BULK VERTICES (Pagination Contract)
+    # ----------------------------------------------------------------------
+    
+    async def _do_bulk_vertices(
+        self, spec: BulkVerticesSpec, *, ctx=None
+    ) -> BulkVerticesResult:
+        """Bulk vertex scan with pagination."""
+        self._stats["bulk_vertices_calls"] += 1
+        t0 = time.monotonic()
+        
+        caps = await self._do_capabilities()
+        if not caps.supports_bulk_vertices:
+            raise NotSupported("bulk_vertices is not supported")
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.scan_vertices(
+                namespace=spec.namespace,
+                limit=spec.limit,
+                cursor=spec.cursor,
+                filter=spec.filter,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        nodes = [
+            Node(
+                id=GraphID(n["id"]),
+                labels=tuple(n.get("labels", [])),
+                properties=n.get("properties", {}),
+                namespace=spec.namespace
+            )
+            for n in response.vertices
+        ]
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        # ✅ REQUIRED pagination fields
+        return BulkVerticesResult(
+            nodes=nodes,
+            next_cursor=response.next_cursor,  # None if no more
+            has_more=response.has_more         # bool
+        )
+    
+    # ----------------------------------------------------------------------
+    # SHARED OP EXECUTOR (Single Kernel)
+    # ----------------------------------------------------------------------
+    
+    async def _execute_ops_as_envelopes(
+        self,
+        ops: List[BatchOperation],
+        ctx: Optional[OperationContext]
+    ) -> List[Dict[str, Any]]:
+        """SHARED executor for BATCH and TRANSACTION."""
+        
+        results = []
+        caps = await self._do_capabilities()
+        
+        for idx, op in enumerate(ops):
+            try:
+                kind = op.op
+                args = dict(op.args or {})
+                
+                if kind == "graph.upsert_nodes":
+                    spec = UpsertNodesSpec(**args)
+                    res = await self._do_upsert_nodes(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
+                
+                elif kind == "graph.upsert_edges":
+                    spec = UpsertEdgesSpec(**args)
+                    res = await self._do_upsert_edges(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
+                
+                elif kind == "graph.delete_nodes":
+                    spec = DeleteNodesSpec(**args)
+                    res = await self._do_delete_nodes(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
+                
+                elif kind == "graph.delete_edges":
+                    spec = DeleteEdgesSpec(**args)
+                    res = await self._do_delete_edges(spec, ctx=ctx)
+                    results.append({"ok": True, "result": asdict(res)})
+                
+                elif kind == "graph.query":
+                    # ✅ RE-VALIDATE dialect (batch bypasses base)
+                    dialect = args.get("dialect")
+                    if dialect and caps.supported_query_dialects:
+                        if dialect not in caps.supported_query_dialects:
+                            raise NotSupported(
+                                f"dialect '{dialect}' not supported",
+                                details={"supported": caps.supported_query_dialects}
+                            )
+                    
+                    spec = GraphQuerySpec(**args)
+                    res = await self._do_query(spec, ctx=ctx)
+                    results.append({
+                        "ok": True,
+                        "result": {
+                            "rows": len(res.records),
+                            "dialect": res.dialect or dialect
+                        }
+                    })
+                
+                else:
+                    results.append({
+                        "ok": False,
+                        "error": "NotSupported",
+                        "code": "NOT_SUPPORTED",
+                        "message": f"unknown batch op '{kind}'",
+                        "index": idx
+                    })
+                    
+            except Exception as e:
+                results.append({
+                    "ok": False,
+                    "error": type(e).__name__,
+                    "code": getattr(e, "code", None) or type(e).__name__.upper(),
+                    "message": str(e),
+                    "index": idx
+                })
+        
+        return results
+    
+    # ----------------------------------------------------------------------
+    # BATCH
+    # ----------------------------------------------------------------------
+    
+    async def _do_batch(
+        self, ops: List[BatchOperation], *, ctx=None
+    ) -> BatchResult:
+        """Batch operations: uses shared executor."""
+        self._stats["batch_calls"] += 1
+        t0 = time.monotonic()
+        
+        caps = await self._do_capabilities()
+        if not caps.supports_batch:
+            raise NotSupported("batch is not supported")
+        
+        results = await self._execute_ops_as_envelopes(ops, ctx)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        return BatchResult(results=results)
+    
+    # ----------------------------------------------------------------------
+    # TRANSACTION (Atomic)
+    # ----------------------------------------------------------------------
+    
+    async def _do_transaction(
+        self, operations: List[BatchOperation], *, ctx=None
+    ) -> BatchResult:
+        """Transaction: uses SAME shared executor."""
+        self._stats["transaction_calls"] += 1
+        t0 = time.monotonic()
+        
+        caps = await self._do_capabilities()
+        if not caps.supports_transaction:
+            raise NotSupported("transactions are not supported")
+        
+        results = await self._execute_ops_as_envelopes(operations, ctx)
+        
+        # Atomicity: success = ALL ops succeeded
+        all_ok = all(r.get("ok") for r in results)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return BatchResult(
+            results=results,
+            success=all_ok,
+            error=None if all_ok else "transaction failed",
+            transaction_id=f"tx_{uuid.uuid4().hex[:16]}" if all_ok else None
+        )
+    
+    # ----------------------------------------------------------------------
+    # TRAVERSAL
+    # ----------------------------------------------------------------------
+    
+    async def _do_traversal(
+        self, spec: GraphTraversalSpec, *, ctx=None
+    ) -> TraversalResult:
+        """Graph traversal: returns nodes, edges, paths."""
+        self._stats["traversal_calls"] += 1
+        t0 = time.monotonic()
+        
+        caps = await self._do_capabilities()
+        if not caps.supports_traversal:
+            raise NotSupported("traversal is not supported")
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            response = await self._client.traverse(
+                start_nodes=[str(n) for n in spec.start_nodes],
+                max_depth=spec.max_depth,
+                direction=spec.direction,
+                relationship_types=spec.relationship_types,
+                namespace=spec.namespace,
+                timeout=timeout
+            )
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        # Convert to Node/Edge objects
+        nodes = [
+            Node(
+                id=GraphID(n["id"]),
+                labels=tuple(n.get("labels", [])),
+                properties=n.get("properties", {}),
+                namespace=spec.namespace
+            )
+            for n in response.nodes
+        ]
+        
+        edges = [
+            Edge(
+                id=GraphID(e["id"]),
+                src=GraphID(e["src"]),
+                dst=GraphID(e["dst"]),
+                label=e["label"],
+                properties=e.get("properties", {}),
+                namespace=spec.namespace
+            )
+            for e in response.edges
+        ]
+        
+        # ✅ REQUIRED: paths array
+        paths = response.paths
+        
+        # Deduplicate nodes
+        seen = set()
+        unique_nodes = []
+        for n in nodes:
+            if str(n.id) not in seen:
+                seen.add(str(n.id))
+                unique_nodes.append(n)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return TraversalResult(
+            nodes=unique_nodes,
+            relationships=edges,
+            paths=paths,
+            summary={
+                "start_nodes": list(spec.start_nodes),
+                "max_depth": spec.max_depth,
+                "direction": spec.direction,
+                "nodes": len(unique_nodes),
+                "relationships": len(edges)
+            },
+            namespace=spec.namespace
+        )
+    
+    # ----------------------------------------------------------------------
+    # SCHEMA
+    # ----------------------------------------------------------------------
+    
+    async def _do_get_schema(self, *, ctx=None) -> GraphSchema:
+        """Retrieve graph schema."""
+        self._stats["get_schema_calls"] += 1
+        t0 = time.monotonic()
+        
+        caps = await self._do_capabilities()
+        if not caps.supports_schema:
+            raise NotSupported("get_schema is not supported")
+        
+        timeout = self._get_timeout(ctx)
+        
+        try:
+            schema = await self._client.get_schema(timeout=timeout)
+        except Exception as e:
+            self._stats["error_count"] += 1
+            raise self._map_provider_error(e)
+        
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return GraphSchema(
+            nodes=schema.node_labels,
+            edges=schema.relationship_types,
+            metadata={
+                "version": schema.version,
+                "generated_by": "my-graph-provider"
+            }
+        )
+    
+    # ----------------------------------------------------------------------
+    # NODE/UPSERT
+    # ----------------------------------------------------------------------
+    
+    async def _do_upsert_nodes(self, spec: UpsertNodesSpec, *, ctx=None) -> UpsertResult:
+        """Upsert nodes."""
+        self._stats["upsert_nodes_calls"] += 1
+        t0 = time.monotonic()
+        
+        upserted = 0
+        failures = []
+        
+        # Initialize namespace if needed
+        if spec.namespace not in self._store:
+            self._store[spec.namespace] = {}
+            self._namespaces.add(spec.namespace)
+        
+        for idx, node in enumerate(spec.nodes):
+            try:
+                # Validate
+                if node.labels:
+                    if any(not isinstance(l, str) or not l for l in node.labels):
+                        raise BadRequest("node.labels must be non-empty strings")
+                
+                # Upsert
+                await self._client.upsert_node(
+                    id=str(node.id),
+                    labels=node.labels,
+                    properties=node.properties or {},
+                    namespace=spec.namespace
+                )
+                
+                # Update local cache
+                self._store[spec.namespace][str(node.id)] = node
+                upserted += 1
+                
+            except Exception as e:
+                failures.append({
+                    "index": idx,
+                    "id": str(node.id),
+                    "error": type(e).__name__,
+                    "code": getattr(e, "code", None) or type(e).__name__.upper(),
+                    "message": str(e)
+                })
+                self._stats["error_count"] += 1
+        
+        self._stats["total_nodes_upserted"] += upserted
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return UpsertResult(
+            upserted_count=upserted,
+            failed_count=len(failures),
+            failures=failures
+        )
+    
+    # ----------------------------------------------------------------------
+    # EDGE/UPSERT
+    # ----------------------------------------------------------------------
+    
+    async def _do_upsert_edges(self, spec: UpsertEdgesSpec, *, ctx=None) -> UpsertResult:
+        """Upsert edges."""
+        self._stats["upsert_edges_calls"] += 1
+        t0 = time.monotonic()
+        
+        upserted = 0
+        failures = []
+        
+        # Initialize namespace if needed
+        if spec.namespace not in self._edge_store:
+            self._edge_store[spec.namespace] = {}
+            self._namespaces.add(spec.namespace)
+        
+        for idx, edge in enumerate(spec.edges):
+            try:
+                # Validate
+                if not edge.label:
+                    raise BadRequest("edge.label must be non-empty")
+                
+                # Upsert
+                await self._client.upsert_edge(
+                    id=str(edge.id),
+                    src=str(edge.src),
+                    dst=str(edge.dst),
+                    label=edge.label,
+                    properties=edge.properties or {},
+                    namespace=spec.namespace
+                )
+                
+                # Update local cache
+                self._edge_store[spec.namespace][str(edge.id)] = edge
+                upserted += 1
+                
+            except Exception as e:
+                failures.append({
+                    "index": idx,
+                    "id": str(edge.id),
+                    "error": type(e).__name__,
+                    "code": getattr(e, "code", None) or type(e).__name__.upper(),
+                    "message": str(e)
+                })
+                self._stats["error_count"] += 1
+        
+        self._stats["total_edges_upserted"] += upserted
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return UpsertResult(
+            upserted_count=upserted,
+            failed_count=len(failures),
+            failures=failures
+        )
+    
+    # ----------------------------------------------------------------------
+    # DELETE NODES (Idempotent)
+    # ----------------------------------------------------------------------
+    
+    async def _do_delete_nodes(self, spec: DeleteNodesSpec, *, ctx=None) -> DeleteResult:
+        """MANDATORY: Delete is IDEMPOTENT: no error on missing IDs."""
+        self._stats["delete_nodes_calls"] += 1
+        t0 = time.monotonic()
+        
+        deleted = 0
+        
+        if spec.ids:
+            for node_id in spec.ids:
+                key = str(node_id)
+                if spec.namespace in self._store and key in self._store[spec.namespace]:
+                    del self._store[spec.namespace][key]
+                    deleted += 1
+                # ✅ ID not found: continue silently, no error
+        
+        elif spec.filter:
+            # Delete by filter
+            if spec.namespace in self._store:
+                to_delete = []
+                for vid, v in self._store[spec.namespace].items():
+                    if self._filter_match(v.properties, spec.filter):
+                        to_delete.append(vid)
+                
+                for vid in to_delete:
+                    del self._store[spec.namespace][vid]
+                    deleted += 1
+        
+        self._stats["total_nodes_deleted"] += deleted
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return DeleteResult(
+            deleted_count=deleted,
+            failed_count=0,
+            failures=[]
+        )
+    
+    # ----------------------------------------------------------------------
+    # DELETE EDGES (Idempotent)
+    # ----------------------------------------------------------------------
+    
+    async def _do_delete_edges(self, spec: DeleteEdgesSpec, *, ctx=None) -> DeleteResult:
+        """MANDATORY: Delete is IDEMPOTENT: no error on missing IDs."""
+        self._stats["delete_edges_calls"] += 1
+        t0 = time.monotonic()
+        
+        deleted = 0
+        
+        if spec.ids:
+            for edge_id in spec.ids:
+                key = str(edge_id)
+                if spec.namespace in self._edge_store and key in self._edge_store[spec.namespace]:
+                    del self._edge_store[spec.namespace][key]
+                    deleted += 1
+                # ✅ ID not found: continue silently, no error
+        
+        elif spec.filter:
+            # Delete by filter
+            if spec.namespace in self._edge_store:
+                to_delete = []
+                for eid, e in self._edge_store[spec.namespace].items():
+                    if self._filter_match(e.properties, spec.filter):
+                        to_delete.append(eid)
+                
+                for eid in to_delete:
+                    del self._edge_store[spec.namespace][eid]
+                    deleted += 1
+        
+        self._stats["total_edges_deleted"] += deleted
+        self._stats["total_processing_time_ms"] += (time.monotonic() - t0) * 1000
+        
+        return DeleteResult(
+            deleted_count=deleted,
+            failed_count=0,
+            failures=[]
+        )
+    
+    # ----------------------------------------------------------------------
+    # HEALTH
+    # ----------------------------------------------------------------------
+    
+    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+        """Health check."""
+        try:
+            healthy = await self._client.health_check()
+            return {
+                "ok": healthy,
+                "status": "ok" if healthy else "degraded",
+                "server": "my-graph-provider",
+                "version": "1.0.0",
+                "namespaces": {
+                    ns: "ok" if healthy else "degraded"
+                    for ns in self._namespaces
+                }
+            }
+        except Exception:
+            return {
+                "ok": False,
+                "status": "down",
+                "server": "my-graph-provider",
+                "version": "1.0.0"
+            }
+    
+    # ----------------------------------------------------------------------
+    # UTILITIES
+    # ----------------------------------------------------------------------
+    
+    def _get_timeout(self, ctx):
+        if ctx is None:
+            return None
+        rem = ctx.remaining_ms()
+        if rem is None or rem <= 0:
+            return None
+        return rem / 1000.0
+    
+    def _map_provider_error(self, e: Exception):
+        """Map provider errors to canonical Corpus errors."""
         from corpus_sdk.graph.graph_base import (
             BadRequest, AuthError, ResourceExhausted,
             TransientNetwork, Unavailable, NotSupported,
             DeadlineExceeded
         )
-        # Mapping logic...
+        
+        if "rate limit" in str(e).lower():
+            return ResourceExhausted("Rate limit exceeded", retry_after_ms=5000)
+        if "auth" in str(e).lower() or "key" in str(e).lower():
+            return AuthError("Authentication failed")
+        if "timeout" in str(e).lower():
+            return TransientNetwork("Request timeout")
+        if "not found" in str(e).lower():
+            return BadRequest(str(e))
+        if "not supported" in str(e).lower():
+            return NotSupported(str(e))
+        
+        return Unavailable(f"Provider error: {type(e).__name__}")
+    
+    def _filter_match(self, properties: Optional[Dict], filter: Optional[Dict]) -> bool:
+        """Match properties against filter."""
+        if not filter:
+            return True
+        if not properties:
+            return False
+        
+        for k, v in filter.items():
+            if properties.get(k) != v:
+                return False
+        return True
+    
+    async def _get_vertex_count(self, namespace: str) -> int:
+        """Get vertex count for namespace."""
+        return len(self._store.get(namespace, {}))
+    
+    async def _get_vertex_by_index(self, index: int, namespace: str) -> Node:
+        """Get vertex by index (for pagination)."""
+        items = list(self._store.get(namespace, {}).items())
+        if index < len(items):
+            return items[index][1]
+        raise IndexError("vertex not found")
 ```
 
 ---
