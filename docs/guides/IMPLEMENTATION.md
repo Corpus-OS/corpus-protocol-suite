@@ -22,9 +22,10 @@
 - Tool calls **only in final**
 - Do not emit multiple finals or partial terminal states
 
-### Determinism
-- Identical inputs → identical outputs
-- Do not introduce RNG, probabilistic behavior, artificial jitter, or test-only randomness inside adapters
+### Adapter determinism
+- Adapters must not introduce additional randomness or non-deterministic behavior beyond the underlying provider/model
+- Do not add RNG, probabilistic failures, artificial jitter, or test-only randomness inside adapters
+- Given the same inputs and provider behavior, the adapter should behave consistently
 
 ### Schema fidelity
 - All responses and examples must **match canonical Schema exactly**
