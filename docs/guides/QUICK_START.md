@@ -87,22 +87,6 @@ An **adapter** is a thin translation layer that:
 pip install corpus-sdk
 pip install pytest pytest-asyncio pysqlite3-binary  # Certification dependencies
 ```
-
-### Project Layout
-
-```
-your-adapter/
-├── adapters/
-│   ├── __init__.py
-│   └── hello_embedding.py        # Your adapter
-├── tests/                        # Conformance tests (copied)
-│   ├── conftest.py              # Your fixture
-│   ├── embedding/               # Copied from SDK
-│   ├── live/                    # Copied from SDK
-│   └── schema/                  # Copied from SDK
-└── pyproject.toml
-```
-
 ---
 
 ## 2. Conformance-First Development (The Right Way)
