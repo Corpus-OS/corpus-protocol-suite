@@ -1,4 +1,4 @@
-# Adapter Quickstart
+# Corpus OS Quickstart
 
 **Build Production-Ready Corpus Protocol Adapters in Minutes**
 
