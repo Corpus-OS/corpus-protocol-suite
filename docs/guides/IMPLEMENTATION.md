@@ -1,45 +1,45 @@
 # Corpus OS IMPLEMENTATION GUIDE
 
-**Production Requirements for LLM • Embedding • Vector • Graph**
+## ⚠️ Implementation Ground Rules (READ FIRST)
 
-⚠️ Implementation Ground Rules (READ FIRST)
+### Document role
+- This guide is **non-normative implementation guidance** for adapter authors.
+- **Spec / Protocols / Schema are canonical.** If any conflict exists, those documents take precedence.
+- This guide explains **how to implement behavior inside `_do_*` hooks**, not protocol rules.
 
-Document role
-	•	This guide is non-normative implementation guidance for adapter authors.
-	•	Spec / Protocols / Schema are canonical. If any conflict exists, those documents take precedence.
-	•	This guide explains how to implement behavior inside _do_* hooks, not protocol rules.
+### Modes & deadlines
 
-Modes & deadlines
+| Mode        | Base enforces deadlines | Adapter should propagate `ctx.remaining_ms()` to provider |
+|-------------|-------------------------|-----------------------------------------------------------|
+| thin        | No                      | Yes (recommended best practice)                           |
+| standalone  | Yes                     | Yes (required)                                            |
 
-Mode	Base enforces deadlines	Adapter should propagate ctx.remaining_ms() to provider
-thin	No	Yes (recommended best practice)
-standalone	Yes	Yes (required)
+- Always pass remaining budget to upstream/provider timeouts when available.
 
-	•	Always pass remaining budget to upstream timeouts when available.
+### Streaming invariants (LLM & Graph)
+- Emit **exactly one** terminal (final/end or error)
+- **No data after terminal**
+- Tool calls **only in final**
+- Do not emit multiple finals or partial terminal states
 
-Streaming invariants (LLM & Graph)
-	•	Emit exactly one terminal (final/end or error)
-	•	No data after terminal
-	•	Tool calls only in final
-	•	Do not emit multiple finals or partial terminal states
+### Determinism
+- Identical inputs → identical outputs
+- Do not introduce RNG, probabilistic behavior, artificial jitter, or test-only randomness inside adapters
 
-Determinism
-	•	Identical inputs → identical outputs
-	•	Do not introduce RNG, probabilistic behavior, artificial jitter, or test-only randomness inside adapters
+### Schema fidelity
+- All responses and examples must **match canonical Schema exactly**
+- Use correct field names/types
+- Use **`[]` not `null`** for empty collections
+- Do not invent ad-hoc dict shapes when typed objects are defined (e.g., failures)
 
-Schema fidelity
-	•	All responses and examples must match canonical Schema exactly
-	•	Use correct field names/types
-	•	Use [] not null for empty collections
-	•	Do not invent ad-hoc dict shapes when typed objects are defined (e.g., failures)
+### Capabilities caching
+- Capabilities may be cached with a short TTL
+- Cached values are acceptable while fresh
+- Refresh periodically; avoid long-lived or permanently stale capability data
 
-Capabilities caching
-	•	Capabilities may be cached with a short TTL
-	•	Cached values are acceptable while fresh
-	•	Refresh periodically; avoid long-lived or permanently stale capability data
+### Consistency rule
+- Do not duplicate or reinterpret protocol rules here; when unsure, defer to the canonical docs
 
-Consistency rule
-	•	Do not duplicate or reinterpret protocol rules here; when unsure, defer to the canonical docs.
 ---
 
 ## TABLE OF CONTENTS
