@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Corpus OS SDK — Graph Protocol V1.0
+Corpus OS — Graph Protocol V1.0
 
 Purpose
 -------
