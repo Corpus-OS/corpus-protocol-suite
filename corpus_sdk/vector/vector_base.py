@@ -1,6 +1,8 @@
 # corpus_sdk/vector/vector_base.py
 # SPDX-License-Identifier: Apache-2.0
 """
+Corpus OS — Vector Protocol V1 (public contract + production-grade base)
+
 Purpose
 -------
 A stable, vendor-neutral API for vector similarity search and operations — with
