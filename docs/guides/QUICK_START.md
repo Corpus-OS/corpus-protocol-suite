@@ -121,130 +121,45 @@ pip install redis msgpack          # Optional: for RedisDocStore
 
 **Stop writing code before you have a failing test.**
 
-The Corpus certification suite evaluates adapters against the protocol specification. **You already have the tests—they ship with the SDK.**
+The Corpus certification suite evaluates adapters against the protocol specification. **You already have the tests—they ship with Corpus SDK.
 
-### Step 1: Locate Your Protocol's Conformance Tests
+## 2. Testing Your Adapter (Certification Suite)
 
-```bash
-# Find where corpus_sdk is installed
-python -c "import corpus_sdk; print(corpus_sdk.__path__[0])"
+The CORPUS certification suite ships with the SDK. You do not need to create test files or conftest.py—they are already installed with `corpus-sdk`.
 
-# This returns something like:
-# /usr/local/lib/python3.11/site-packages/corpus_sdk
-```
-
-The conformance tests live in that directory under `tests/`:
-- `tests/embedding/` - Embedding Protocol V1
-- `tests/llm/` - LLM Protocol V1  
-- `tests/vector/` - Vector Protocol V1
-- `tests/graph/` - Graph Protocol V1
-- `tests/live/` - Wire protocol conformance
-- `tests/schema/` - JSON schema validation
-
-**You do not need to copy these tests.** They are already on your system.
-
-### Step 2: Create Your Test Fixture (One Per Project)
-
-If you don't already have a `conftest.py`, create one in your project's `tests/` directory:
-
-```python
-# tests/conftest.py
-import pytest
-from your_adapter_module import YourAdapter  # Import YOUR adapter
-
-@pytest.fixture
-def adapter():
-    """Return your adapter instance for certification testing."""
-    return YourAdapter(mode="thin")  # MUST use "thin" for certification
-```
-
-**That's it.** One fixture. No test files to copy. No modifications to the SDK.
-
-### Step 3: Run Tests Against Your Adapter
+### Step 1: Set Your Adapter
 
 ```bash
-# Tell pytest where to find the SDK's tests
-export PYTHONPATH=/usr/local/lib/python3.11/site-packages:$PYTHONPATH
-
-# Run your protocol's conformance suite
-pytest -v corpus_sdk/tests/embedding/
-
-# Or with the actual path (easier)
-pytest -v $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/embedding/
+export CORPUS_ADAPTER=my_project.adapters:MyEmbeddingAdapter
 ```
 
-**Pro tip:** Add this to your `pyproject.toml`:
+This tells the conformance suite which adapter to test. The format is `module:ClassName`.
 
-```toml
-[tool.pytest.ini_options]
-testpaths = [
-    "tests",
-    "corpus_sdk/tests/embedding",
-    "corpus_sdk/tests/llm",
-    "corpus_sdk/tests/vector",
-    "corpus_sdk/tests/graph",
-    "corpus_sdk/tests/live",
-    "corpus_sdk/tests/schema",
-]
-```
-
-Then simply run:
-```bash
-pytest -v
-```
-
-### Step 4: Watch Your Adapter Fail (This Is Good)
+### Step 2: Run the Tests
 
 ```bash
-pytest -v $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/embedding/test_capabilities.py -k test_capabilities_basic
+# Run embedding protocol tests directly from the installed SDK
+pytest $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/embedding/ -v
+
+# Or run all protocols
+pytest $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/ -v
 ```
 
-**Expected output:**
-```
+### Step 3: Watch It Fail
+
+```bash
 _________________________________ FAILURE __________________________________
 NotImplementedError: _do_capabilities not implemented
 ```
 
-**This is perfect.** You now have:
-- ✅ A defined target (all tests passing)
-- ✅ Immediate feedback on what's missing
-- ✅ The exact specification requirements in the test assertions
-
-### Why This Works
-
-| What you DO | Why |
-|------------|-----|
-| ✅ One `conftest.py` fixture | Pytest automatically discovers it |
-| ✅ Run tests directly from SDK | Tests are the normative specification—unmodified, authoritative |
-| ✅ No test files in your repo | Zero maintenance, always up-to-date with SDK version |
-| ✅ `mode="thin"` in fixture | Disables base class policies that would interfere with testing |
-
-**The conformance tests are the source of truth.** They ship with every SDK installation. Your job is to make them pass—not to copy, maintain, or rewrite them.
-
-### Environment Variables (Optional)
-
-```bash
-# Explicitly specify which adapter to test
-export CORPUS_ADAPTER=your_adapter_module:YourAdapter
-
-# Point to a live endpoint for wire tests
-export CORPUS_ENDPOINT=http://localhost:8000
-
-# Then run tests normally
-pytest -v corpus_sdk/tests/embedding/
-```
-
-### What Success Looks Like
+Each failure tells you exactly what to implement next. Keep running tests until you see:
 
 ```
-corpus_sdk/tests/embedding/test_capabilities.py ✓✓✓✓
-corpus_sdk/tests/embedding/test_embed.py ✓✓✓✓✓✓✓✓
-corpus_sdk/tests/embedding/test_streaming.py ✓✓✓✓✓
-corpus_sdk/tests/embedding/test_batch.py ✓✓✓✓✓✓
-corpus_sdk/tests/embedding/test_deadlines.py ✓✓✓
-corpus_sdk/tests/embedding/test_errors.py ✓✓✓✓✓
-
 ================== 47 passed in 1.2s ==================
+CORPUS PROTOCOL SUITE - GOLD CERTIFIED
+```
+
+**That's it.** No conftest.py to write. No test files to copy. The certification framework is already installed and ready to test your adapter.
 ```
 
 **That's Gold certification.** Your adapter is now CORPUS-compatible.
