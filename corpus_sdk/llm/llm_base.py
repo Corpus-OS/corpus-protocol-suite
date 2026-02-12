@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """
-Adapter SDK — LLM Protocol V1 (public contract + production-grade base)
+Corpus OS — LLM Protocol V1 (public contract + production-grade base)
 
 Purpose
 -------
