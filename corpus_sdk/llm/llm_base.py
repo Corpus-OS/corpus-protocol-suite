@@ -9,7 +9,7 @@ Purpose
 A stable, vendor-neutral API for calling Large Language Models — with:
 
 - Structured, normalized error taxonomy (SIEM-safe, machine-actionable)
-- Streaming support for low-latency partial responses
+- Streaming support for low-latency responses
 - Token usage accounting for cost/quota management
 - Deadline propagation and cooperative cancellation
 - Built-in hooks for circuit breaking, rate limiting, and caching
