@@ -339,9 +339,7 @@ async def _do_embed(self, spec, *, ctx=None):
 
 ### 3.3 Tenant Hashing: MANDATORY
 
-```python
-from corpus_sdk.utils import tenant_hash
-
+```
 # NEVER log or emit raw tenant IDs
 tenant_id = ctx.tenant if ctx else None
 metric_tenant = tenant_hash(tenant_id) if tenant_id else "global"
