@@ -2131,10 +2131,9 @@ if await txn.commit():
 
 | Document | Purpose | When to Read |
 |----------|---------|--------------|
-| [`spec/CORPUS_SPECIFICATION.md`](../spec/CORPUS_SPECIFICATION.md) | Full specification (normative) | Before production deploy |
-| [`spec/IMPLEMENTATION.md`](../spec/IMPLEMENTATION.md) | Full `_do_*` semantics, all edge cases | After quickstart works |
-| [`spec/BEHAVIORAL_CONFORMANCE.md`](../spec/BEHAVIORAL_CONFORMANCE.md) | What "correct" means normatively | Before production deploy |
-| [`spec/ERRORS.md`](../spec/ERRORS.md) | Complete error taxonomy | When adding new error types |
+| [`docs/spec/CORPUS_SPECIFICATION.md`](../spec/CORPUS_SPECIFICATION.md) | Full specification (normative) | Before production deploy |
+| [`docs/spec/IMPLEMENTATION.md`](../spec/IMPLEMENTATION.md) | Full `_do_*` semantics, all edge cases | After quickstart works |
+| [`docs/spec/ERRORS.md`](../spec/ERRORS.md) | Complete error taxonomy | When adding new error types |
 | [`tests/embedding/`](./tests/embedding/) | Embedding conformance tests | Source of truth for Embedding |
 | [`tests/llm/`](./tests/llm/) | LLM conformance tests | Source of truth for LLM |
 | [`tests/vector/`](./tests/vector/) | Vector conformance tests | Source of truth for Vector |
