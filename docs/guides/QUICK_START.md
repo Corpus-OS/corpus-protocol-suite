@@ -93,6 +93,12 @@ An **adapter** is a thin translation layer that converts between Corpus Protocol
 
 **Critical insight:** The base class is *not* abstract—it provides working fallbacks. You only override what your provider does *better* than the default.
 
+The full protocol specification is embedded in the docstrings of each base class:
+- [`corpus_sdk/embedding/embedding_base.py`](../corpus_sdk/embedding/embedding_base.py) — Embedding Protocol V1
+- [`corpus_sdk/llm/llm_base.py`](../corpus_sdk/llm/llm_base.py) — LLM Protocol V1
+- [`corpus_sdk/vector/vector_base.py`](../corpus_sdk/vector/vector_base.py) — Vector Protocol V1
+- [`corpus_sdk/graph/graph_base.py`](../corpus_sdk/graph/graph_base.py) — Graph Protocol V1
+
 ---
 
 ## 1. Prerequisites & Setup
@@ -106,7 +112,9 @@ An **adapter** is a thin translation layer that converts between Corpus Protocol
 
 ```bash
 pip install corpus-sdk
-pip install pytest pytest-asyncio pysqlite3-binary msgpack redis  # Certification + optional dependencies
+pip install pytest pytest-asyncio  # Certification dependencies
+pip install fastapi uvicorn        # Optional: for HTTP services
+pip install redis msgpack          # Optional: for RedisDocStore
 ```
 
 ---
@@ -122,8 +130,6 @@ The Corpus certification suite evaluates adapters against the protocol specifica
 ```bash
 # For Embedding adapters
 cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/embedding ./tests/
-cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/live ./tests/
-cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/schema ./tests/
 
 # For LLM adapters
 cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/llm ./tests/
@@ -133,6 +139,10 @@ cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/vect
 
 # For Graph adapters
 cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/graph ./tests/
+
+# Copy live endpoint tests and schema validation (all protocols)
+cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/live ./tests/
+cp -r $(python -c "import corpus_sdk; print(corpus_sdk.__path__[0])")/tests/schema ./tests/
 ```
 
 Your `tests/` directory now contains the official, unmodified certification suite for your chosen protocol.
@@ -188,6 +198,8 @@ This is **GOOD**. You now have a target.
 
 **The conformance tests are the source of truth.** When they all pass, your adapter is done.
 
+For detailed guidance on running and interpreting conformance tests, see [`CONFORMANCE_GUIDE.md`](CONFORMANCE_GUIDE.md).
+
 ---
 
 ## 3. Hello World: Complete Reference Adapters
@@ -203,6 +215,8 @@ Create `adapters/hello_embedding.py`:
 ```python
 import asyncio
 import time
+import hashlib
+import secrets
 from typing import AsyncIterator, Optional, List, Dict, Any
 from corpus_sdk.embedding.embedding_base import (
     BaseEmbeddingAdapter,
@@ -274,14 +288,18 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> EmbedResult:
         """Generate embedding for a single text."""
-        # Idempotency check
+        # --------------------------------------------------------------------
+        # IDEMPOTENCY CHECK (Required per specification §6.1)
+        # --------------------------------------------------------------------
         if ctx and ctx.idempotency_key and ctx.tenant:
             cache_key = f"idem:{ctx.tenant}:{ctx.idempotency_key}"
             cached = self._idempotency_cache.get(cache_key)
             if cached:
                 return cached
         
-        # Deadline propagation
+        # --------------------------------------------------------------------
+        # DEADLINE PROPAGATION (Required per specification §6.1)
+        # --------------------------------------------------------------------
         timeout = None
         if ctx and ctx.deadline_ms:
             remaining = ctx.remaining_ms()
@@ -291,7 +309,10 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
                 raise DeadlineExceeded("deadline already expired")
 
         try:
+            # Simulate provider call with deadline
             await asyncio.sleep(0.01)
+            
+            # Generate embedding
             vec = [float(len(spec.text))] + [0.0] * 7
 
             result = EmbedResult(
@@ -307,9 +328,12 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
                 truncated=False,
             )
             
-            # Store idempotency result
+            # --------------------------------------------------------------------
+            # IDEMPOTENCY STORE (24-hour retention)
+            # --------------------------------------------------------------------
             if ctx and ctx.idempotency_key and ctx.tenant:
                 self._idempotency_cache[cache_key] = result
+                # In production: await redis.setex(cache_key, 86400, result)
             
             return result
             
@@ -324,15 +348,20 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Stream embedding generation in chunks."""
+        """
+        Stream embedding generation in chunks.
+        
+        ⚠️ CRITICAL: Must use canonical streaming envelope format:
+        { "ok": true, "code": "STREAMING", "ms": 12.3, "chunk": { ... } }
+        """
         base_vec = [float(len(spec.text))] + [0.0] * 7
         start_time = time.time()
         
-        # Chunk 1
+        # Chunk 1: first 2 dimensions
         elapsed_ms = (time.time() - start_time) * 1000
         yield {
             "ok": True,
-            "code": "STREAMING",
+            "code": "STREAMING",  # ✅ REQUIRED - must be exactly "STREAMING"
             "ms": elapsed_ms,
             "chunk": {
                 "embeddings": [
@@ -348,7 +377,7 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         }
         await asyncio.sleep(0.005)
         
-        # Final chunk
+        # Final chunk: complete vector + usage
         elapsed_ms = (time.time() - start_time) * 1000
         yield {
             "ok": True,
@@ -375,15 +404,25 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> BatchEmbedResult:
-        """Batch embedding with partial success."""
+        """
+        Batch embedding with partial success.
+        
+        ⚠️ CRITICAL: 
+        - Field name MUST be "failures" (not "failed_texts")
+        - Each success MUST include "index" for correlation
+        """
         embeddings = []
         failures = []
 
         for idx, text in enumerate(spec.texts):
             try:
+                # Validate each item
                 if not text or len(text) > 1000:
                     raise BadRequest(f"text too long or empty")
+
+                # Generate embedding
                 vec = [float(len(text))] + [0.0] * 7
+                
                 embeddings.append(
                     EmbeddingVector(
                         vector=vec,
@@ -409,79 +448,252 @@ class HelloEmbeddingAdapter(BaseEmbeddingAdapter):
             failures=failures,  # ✅ REQUIRED field name
         )
 
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
+    async def _do_count_tokens(
+        self,
+        text: str,
+        model: str,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> int:
+        """Token counting approximation."""
         return len(text) // 4
 
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None
+    ) -> Dict[str, Any]:
+        """
+        Liveness probe with graded status.
+        
+        Status MUST be one of: "ok", "degraded", "down"
+        """
         return {
             "ok": True,
-            "status": "ok",
+            "status": "ok",  # ✅ REQUIRED - one of: ok, degraded, down
             "server": "hello-embedding",
             "version": "1.0.0",
             "reason": None,
         }
 
-    async def _do_get_stats(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_get_stats(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None
+    ) -> Dict[str, Any]:
+        """
+        Retrieve embedding service statistics.
+        
+        Optional but recommended per specification.
+        """
         return {
             "total_requests": 12345,
             "total_tokens": 987654,
             "total_errors": 42,
             "uptime_ms": 86400000,
+            "models": {
+                "hello-1": {
+                    "requests": 10000,
+                    "tokens": 800000,
+                    "errors": 30,
+                },
+                "hello-2": {
+                    "requests": 2345,
+                    "tokens": 187654,
+                    "errors": 12,
+                }
+            },
+            "cache_hit_rate": 0.85,
         }
 
-    # --- Test fixture support (REQUIRED) ---
-    def build_embedding_embed_envelope(self, model="hello-1", text="Hello world", truncate=True, normalize=False, **kwargs):
+    # ------------------------------------------------------------------------
+    # TEST FIXTURE SUPPORT (REQUIRED FOR CERTIFICATION)
+    # ------------------------------------------------------------------------
+    
+    def build_embedding_embed_envelope(
+        self,
+        model: str = "hello-1",
+        text: str = "Hello world",
+        truncate: bool = True,
+        normalize: bool = False,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for single embedding operation."""
         return {
             "op": "embedding.embed",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000, "idempotency_key": "test-idem-123"},
-            "args": {"model": model, "text": text, "truncate": truncate, "normalize": normalize, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+                "idempotency_key": "test-idem-123",
+            },
+            "args": {
+                "model": model,
+                "text": text,
+                "truncate": truncate,
+                "normalize": normalize,
+                **kwargs
+            }
         }
 
-    def build_embedding_stream_embed_envelope(self, model="hello-1", text="Hello world", truncate=True, **kwargs):
+    def build_embedding_stream_embed_envelope(
+        self,
+        model: str = "hello-1",
+        text: str = "Hello world",
+        truncate: bool = True,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for streaming embedding operation."""
         return {
             "op": "embedding.stream_embed",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"model": model, "text": text, "truncate": truncate, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "model": model,
+                "text": text,
+                "truncate": truncate,
+                **kwargs
+            }
         }
 
-    def build_embedding_batch_embed_envelope(self, model="hello-1", texts=None, truncate=True, normalize=False, **kwargs):
+    def build_embedding_batch_embed_envelope(
+        self,
+        model: str = "hello-1",
+        texts: List[str] = None,
+        truncate: bool = True,
+        normalize: bool = False,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for batch embedding operation."""
         if texts is None:
             texts = ["Hello", "world", "test"]
         return {
             "op": "embedding.embed_batch",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"model": model, "texts": texts, "truncate": truncate, "normalize": normalize, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "model": model,
+                "texts": texts,
+                "truncate": truncate,
+                "normalize": normalize,
+                **kwargs
+            }
         }
 
-    def build_embedding_capabilities_envelope(self, **kwargs):
-        return {"op": "embedding.capabilities", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_embedding_capabilities_envelope(
+        self,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for capabilities discovery."""
+        return {
+            "op": "embedding.capabilities",
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+            },
+            "args": {}
+        }
 
-    def build_embedding_health_envelope(self, **kwargs):
-        return {"op": "embedding.health", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_embedding_health_envelope(
+        self,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for health check."""
+        return {
+            "op": "embedding.health",
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+            },
+            "args": {}
+        }
 
-    def build_embedding_count_tokens_envelope(self, text="Hello world", model="hello-1", **kwargs):
+    def build_embedding_count_tokens_envelope(
+        self,
+        text: str = "Hello world",
+        model: str = "hello-1",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for token counting."""
         return {
             "op": "embedding.count_tokens",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
-            "args": {"text": text, "model": model, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+            },
+            "args": {
+                "text": text,
+                "model": model,
+                **kwargs
+            }
         }
 
-    def build_embedding_get_stats_envelope(self, **kwargs):
-        return {"op": "embedding.get_stats", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_embedding_get_stats_envelope(
+        self,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for stats retrieval."""
+        return {
+            "op": "embedding.get_stats",
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+            },
+            "args": {}
+        }
+
+    # ------------------------------------------------------------------------
+    # ERROR MAPPING
+    # ------------------------------------------------------------------------
 
     def _map_provider_error(self, e: Exception) -> Exception:
         """Map provider exceptions to canonical Corpus errors."""
         if hasattr(e, "status_code"):
             if e.status_code == 429:
-                return ResourceExhausted("rate limit exceeded", retry_after_ms=5000)
+                retry = getattr(e, "retry_after", 5000)
+                return ResourceExhausted(
+                    "rate limit exceeded",
+                    retry_after_ms=retry,
+                    throttle_scope="model",
+                )
             elif e.status_code == 401:
                 return AuthError("invalid credentials")
             elif e.status_code == 400:
                 return BadRequest(str(e))
             elif e.status_code >= 500:
-                return Unavailable("provider unavailable", retry_after_ms=1000)
+                return Unavailable(
+                    "provider unavailable",
+                    retry_after_ms=1000,
+                )
         return e
+
+    # ------------------------------------------------------------------------
+    # TENANT HASHING (SIEM-Safe)
+    # ------------------------------------------------------------------------
+    
+    def _tenant_hash(self, tenant: Optional[str]) -> Optional[str]:
+        """Return irreversible hash of tenant identifier."""
+        if not tenant:
+            return None
+        salt = "corpus-salt"  # In production: os.environ.get("CORPUS_TENANT_SALT")
+        return hashlib.sha256(f"{salt}:{tenant}".encode()).hexdigest()[:16]
 ```
+
+**What makes this specification-compliant:**
+- ✅ **REQUIRED** `protocol="embedding/v1.0"` in capabilities
+- ✅ **REQUIRED** `idempotent_writes=True` in capabilities
+- ✅ **REQUIRED** Canonical streaming envelope `{ok, code, ms, chunk}`
+- ✅ **REQUIRED** Batch field name `failures` (not `failed_texts`)
+- ✅ **REQUIRED** Idempotency key deduplication (24-hour retention)
+- ✅ **REQUIRED** Constructor accepts `endpoint=None`
+- ✅ **REQUIRED** All `build_*_envelope()` methods for test fixture
+- ✅ **REQUIRED** Graded health status (`ok`/`degraded`/`down`)
 
 ---
 
@@ -492,7 +704,8 @@ Create `adapters/hello_llm.py`:
 ```python
 import asyncio
 import time
-from typing import AsyncIterator, Optional, List, Dict, Any, Union
+import secrets
+from typing import AsyncIterator, Optional, List, Dict, Any, Union, Mapping
 from corpus_sdk.llm.llm_base import (
     BaseLLMAdapter,
     LLMCapabilities,
@@ -535,7 +748,7 @@ class HelloLLMAdapter(BaseLLMAdapter):
             server="hello-llm",
             protocol="llm/v1.0",  # ✅ REQUIRED
             version="1.0.0",
-            model_family="hello-family",
+            model_family="hello-family",  # ✅ REQUIRED
             max_context_length=8192,
             supports_streaming=True,
             supports_roles=True,
@@ -582,7 +795,7 @@ class HelloLLMAdapter(BaseLLMAdapter):
         if tools:
             tool_calls = [
                 ToolCall(
-                    id="call_123",
+                    id=f"call_{secrets.token_hex(8)}",  # ✅ REQUIRED: generated ID
                     type="function",
                     function=ToolCallFunction(
                         name=tools[0].get("function", {}).get("name", "unknown"),
@@ -630,7 +843,7 @@ class HelloLLMAdapter(BaseLLMAdapter):
             await asyncio.sleep(0.01)
             yield chunk
         
-        # Final chunk with usage
+        # Final chunk with usage (✅ REQUIRED)
         yield LLMChunk(
             text="",
             is_final=True,
@@ -638,10 +851,22 @@ class HelloLLMAdapter(BaseLLMAdapter):
             usage_so_far=TokenUsage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
         )
 
-    async def _do_count_tokens(self, text: str, model: Optional[str] = None, *, ctx=None) -> int:
+    async def _do_count_tokens(
+        self,
+        text: str,
+        model: Optional[str] = None,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> int:
+        """Count tokens in text."""
         return len(text) // 4
 
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None
+    ) -> Dict[str, Any]:
+        """Health check with graded status."""
         return {
             "ok": True,
             "status": "ok",
@@ -650,32 +875,79 @@ class HelloLLMAdapter(BaseLLMAdapter):
             "reason": None,
         }
 
-    # --- Test fixture support (REQUIRED) ---
-    def build_llm_complete_envelope(self, model="hello-1", messages=None, **kwargs):
+    # ------------------------------------------------------------------------
+    # TEST FIXTURE SUPPORT (REQUIRED FOR CERTIFICATION)
+    # ------------------------------------------------------------------------
+    
+    def build_llm_complete_envelope(
+        self,
+        model: str = "hello-1",
+        messages: List[Dict[str, str]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for LLM completion."""
         if messages is None:
             messages = [{"role": "user", "content": "Hello"}]
         return {
             "op": "llm.complete",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"model": model, "messages": messages, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "model": model,
+                "messages": messages,
+                **kwargs
+            }
         }
 
-    def build_llm_stream_envelope(self, model="hello-1", messages=None, **kwargs):
+    def build_llm_stream_envelope(
+        self,
+        model: str = "hello-1",
+        messages: List[Dict[str, str]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for streaming LLM completion."""
         if messages is None:
             messages = [{"role": "user", "content": "Hello"}]
         return {
             "op": "llm.stream",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"model": model, "messages": messages, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "model": model,
+                "messages": messages,
+                **kwargs
+            }
         }
 
-    def build_llm_capabilities_envelope(self, **kwargs):
-        return {"op": "llm.capabilities", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_llm_capabilities_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for capabilities discovery."""
+        return {
+            "op": "llm.capabilities",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 
-    def build_llm_health_envelope(self, **kwargs):
-        return {"op": "llm.health", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_llm_health_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for health check."""
+        return {
+            "op": "llm.health",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 
-    def build_llm_count_tokens_envelope(self, text="Hello world", model="hello-1", **kwargs):
+    def build_llm_count_tokens_envelope(
+        self,
+        text: str = "Hello world",
+        model: str = "hello-1",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for token counting."""
         return {
             "op": "llm.count_tokens",
             "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
@@ -809,8 +1081,11 @@ class HelloVectorAdapter(BaseVectorAdapter):
         *,
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
-        """Upsert vectors with namespace canonicalization."""
-        # Namespace footgun prevention already handled by base class
+        """
+        Upsert vectors with namespace canonicalization.
+        
+        ⚠️ CRITICAL: Namespace footgun prevention already handled by base class.
+        """
         upserted = 0
         failures = []
 
@@ -826,6 +1101,10 @@ class HelloVectorAdapter(BaseVectorAdapter):
                     "code": "UPSERT_FAILED",
                     "message": str(e),
                 })
+
+        # ✅ CORRECT: Invalidate AFTER successful write
+        if upserted > 0:
+            await self._invalidate_namespace_cache(spec.namespace)
 
         return UpsertResult(
             upserted_count=upserted,
@@ -857,6 +1136,10 @@ class HelloVectorAdapter(BaseVectorAdapter):
                     "message": f"Vector {vid} not found",
                 })
 
+        # ✅ CORRECT: Invalidate AFTER successful delete
+        if deleted > 0:
+            await self._invalidate_namespace_cache(spec.namespace)
+
         return DeleteResult(
             deleted_count=deleted,
             failed_count=len(failures),
@@ -883,13 +1166,24 @@ class HelloVectorAdapter(BaseVectorAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> NamespaceResult:
         """Delete namespace/collection."""
-        return NamespaceResult(
+        result = NamespaceResult(
             success=True,
             namespace=namespace,
             details={},
         )
+        
+        # ✅ CORRECT: Invalidate AFTER successful delete
+        if result.success:
+            await self._invalidate_namespace_cache(namespace)
+            
+        return result
 
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None
+    ) -> Dict[str, Any]:
+        """Health check with graded status."""
         return {
             "ok": True,
             "status": "ok",
@@ -898,52 +1192,168 @@ class HelloVectorAdapter(BaseVectorAdapter):
             "namespaces": {"default": "ready"},
         }
 
-    # --- Test fixture support (REQUIRED) ---
-    def build_vector_query_envelope(self, namespace="default", vector=None, top_k=10, **kwargs):
+    # ------------------------------------------------------------------------
+    # TEST FIXTURE SUPPORT (REQUIRED FOR CERTIFICATION)
+    # ------------------------------------------------------------------------
+    
+    def build_vector_query_envelope(
+        self,
+        namespace: str = "default",
+        vector: List[float] = None,
+        top_k: int = 10,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for vector query."""
         if vector is None:
             vector = [1.0, 0.0, 0.0, 0.0]
         return {
             "op": "vector.query",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "vector": vector, "top_k": top_k, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "vector": vector,
+                "top_k": top_k,
+                **kwargs
+            }
         }
 
-    def build_vector_upsert_envelope(self, namespace="default", vectors=None, **kwargs):
+    def build_vector_upsert_envelope(
+        self,
+        namespace: str = "default",
+        vectors: List[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for vector upsert."""
         if vectors is None:
-            vectors = [{"id": "vec-1", "vector": [1.0, 0.0, 0.0, 0.0], "text": "Hello"}]
+            vectors = [{
+                "id": "vec-1",
+                "vector": [1.0, 0.0, 0.0, 0.0],
+                "text": "Hello",
+                "metadata": {"source": "test"}
+            }]
         return {
             "op": "vector.upsert",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "vectors": vectors, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "vectors": vectors,
+                **kwargs
+            }
         }
 
-    def build_vector_delete_envelope(self, namespace="default", ids=None, **kwargs):
+    def build_vector_delete_envelope(
+        self,
+        namespace: str = "default",
+        ids: List[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for vector delete."""
         if ids is None:
             ids = ["vec-1"]
         return {
             "op": "vector.delete",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "ids": ids, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "ids": ids,
+                **kwargs
+            }
         }
 
-    def build_vector_capabilities_envelope(self, **kwargs):
-        return {"op": "vector.capabilities", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_vector_capabilities_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for capabilities discovery."""
+        return {
+            "op": "vector.capabilities",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 
-    def build_vector_health_envelope(self, **kwargs):
-        return {"op": "vector.health", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_vector_health_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for health check."""
+        return {
+            "op": "vector.health",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 
-    def build_vector_create_namespace_envelope(self, namespace="test", dimensions=8, distance_metric="cosine", **kwargs):
+    def build_vector_create_namespace_envelope(
+        self,
+        namespace: str = "test",
+        dimensions: int = 8,
+        distance_metric: str = "cosine",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for namespace creation."""
         return {
             "op": "vector.create_namespace",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "dimensions": dimensions, "distance_metric": distance_metric, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "dimensions": dimensions,
+                "distance_metric": distance_metric,
+                **kwargs
+            }
         }
 
-    def build_vector_delete_namespace_envelope(self, namespace="test", **kwargs):
+    def build_vector_delete_namespace_envelope(
+        self,
+        namespace: str = "test",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for namespace deletion."""
         return {
             "op": "vector.delete_namespace",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                **kwargs
+            }
+        }
+
+    def build_vector_batch_query_envelope(
+        self,
+        namespace: str = "default",
+        queries: List[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for batch query."""
+        if queries is None:
+            queries = [
+                {"vector": [1.0, 0.0, 0.0, 0.0], "top_k": 5},
+                {"vector": [0.0, 1.0, 0.0, 0.0], "top_k": 5}
+            ]
+        return {
+            "op": "vector.batch_query",
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "queries": queries,
+                **kwargs
+            }
         }
 ```
 
@@ -956,7 +1366,7 @@ Create `adapters/hello_graph.py`:
 ```python
 import asyncio
 import time
-from typing import AsyncIterator, Optional, List, Dict, Any, Union
+from typing import AsyncIterator, Optional, List, Dict, Any, Union, Mapping
 from corpus_sdk.graph.graph_base import (
     BaseGraphAdapter,
     GraphCapabilities,
@@ -975,6 +1385,7 @@ from corpus_sdk.graph.graph_base import (
     BulkVerticesResult,
     BatchResult,
     TraversalResult,
+    GraphSchema,
     Node,
     Edge,
     GraphID,
@@ -998,6 +1409,8 @@ class HelloGraphAdapter(BaseGraphAdapter):
     def __init__(self, endpoint: Optional[str] = None, mode: str = "standalone"):
         super().__init__(mode=mode)
         self.endpoint = endpoint
+        self._nodes = {}
+        self._edges = {}
 
     async def _do_capabilities(self) -> GraphCapabilities:
         """
@@ -1072,10 +1485,18 @@ class HelloGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
         """Upsert nodes."""
+        upserted = 0
+        failures = []
+        
+        for node in spec.nodes:
+            key = f"{spec.namespace}:{node.id}"
+            self._nodes[key] = node
+            upserted += 1
+            
         return UpsertResult(
-            upserted_count=len(spec.nodes),
-            failed_count=0,
-            failures=[],
+            upserted_count=upserted,
+            failed_count=len(failures),
+            failures=failures,
         )
 
     async def _do_upsert_edges(
@@ -1085,10 +1506,18 @@ class HelloGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> UpsertResult:
         """Upsert edges."""
+        upserted = 0
+        failures = []
+        
+        for edge in spec.edges:
+            key = f"{spec.namespace}:{edge.id}"
+            self._edges[key] = edge
+            upserted += 1
+            
         return UpsertResult(
-            upserted_count=len(spec.edges),
-            failed_count=0,
-            failures=[],
+            upserted_count=upserted,
+            failed_count=len(failures),
+            failures=failures,
         )
 
     async def _do_delete_nodes(
@@ -1098,10 +1527,27 @@ class HelloGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> DeleteResult:
         """Delete nodes."""
+        deleted = 0
+        failures = []
+        
+        for node_id in spec.ids:
+            key = f"{spec.namespace}:{node_id}"
+            if key in self._nodes:
+                del self._nodes[key]
+                deleted += 1
+            else:
+                failures.append({
+                    "index": len(failures),
+                    "id": str(node_id),
+                    "error": "NotFound",
+                    "code": "NOT_FOUND",
+                    "message": f"Node {node_id} not found",
+                })
+                
         return DeleteResult(
-            deleted_count=len(spec.ids),
-            failed_count=0,
-            failures=[],
+            deleted_count=deleted,
+            failed_count=len(failures),
+            failures=failures,
         )
 
     async def _do_delete_edges(
@@ -1111,10 +1557,27 @@ class HelloGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> DeleteResult:
         """Delete edges."""
+        deleted = 0
+        failures = []
+        
+        for edge_id in spec.ids:
+            key = f"{spec.namespace}:{edge_id}"
+            if key in self._edges:
+                del self._edges[key]
+                deleted += 1
+            else:
+                failures.append({
+                    "index": len(failures),
+                    "id": str(edge_id),
+                    "error": "NotFound",
+                    "code": "NOT_FOUND",
+                    "message": f"Edge {edge_id} not found",
+                })
+                
         return DeleteResult(
-            deleted_count=len(spec.ids),
-            failed_count=0,
-            failures=[],
+            deleted_count=deleted,
+            failed_count=len(failures),
+            failures=failures,
         )
 
     async def _do_batch(
@@ -1124,10 +1587,31 @@ class HelloGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> BatchResult:
         """Execute batch operations."""
+        results = []
+        success = True
+        
+        for op in ops:
+            try:
+                if op.op == "upsert_nodes":
+                    nodes = [Node(**n) for n in op.args.get("nodes", [])]
+                    spec = UpsertNodesSpec(nodes=nodes, namespace=op.args.get("namespace"))
+                    result = await self._do_upsert_nodes(spec, ctx=ctx)
+                    results.append(result)
+                elif op.op == "upsert_edges":
+                    edges = [Edge(**e) for e in op.args.get("edges", [])]
+                    spec = UpsertEdgesSpec(edges=edges, namespace=op.args.get("namespace"))
+                    result = await self._do_upsert_edges(spec, ctx=ctx)
+                    results.append(result)
+                else:
+                    results.append({"success": True})
+            except Exception as e:
+                success = False
+                results.append({"error": str(e)})
+                
         return BatchResult(
-            results=[{"success": True} for _ in ops],
-            success=True,
-            transaction_id="tx-123",
+            results=results,
+            success=success,
+            transaction_id="batch-123" if success else None,
         )
 
     async def _do_transaction(
@@ -1137,11 +1621,20 @@ class HelloGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext] = None,
     ) -> BatchResult:
         """Execute atomic transaction."""
-        return BatchResult(
-            results=[{"success": True} for _ in operations],
-            success=True,
-            transaction_id="tx-123",
-        )
+        # Simulate atomic commit
+        result = await self._do_batch(operations, ctx=ctx)
+        
+        # ✅ CORRECT: Invalidate AFTER successful commit
+        if result.success:
+            namespaces = set()
+            for op in operations:
+                ns = op.args.get("namespace")
+                if ns:
+                    namespaces.add(ns)
+            for ns in namespaces:
+                await self._invalidate_namespace_cache(ns)
+                
+        return result
 
     async def _do_traversal(
         self,
@@ -1177,16 +1670,24 @@ class HelloGraphAdapter(BaseGraphAdapter):
             namespace=spec.namespace,
         )
 
-    async def _do_get_schema(self, *, ctx=None) -> GraphSchema:
+    async def _do_get_schema(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None,
+    ) -> GraphSchema:
         """Return graph schema."""
-        from corpus_sdk.graph.graph_base import GraphSchema
         return GraphSchema(
             nodes={"Person": {"properties": ["name", "age"]}},
             edges={"KNOWS": {"properties": ["since"]}},
             metadata={"version": "1.0"},
         )
 
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    async def _do_health(
+        self,
+        *,
+        ctx: Optional[OperationContext] = None
+    ) -> Dict[str, Any]:
+        """Health check with graded status."""
         return {
             "ok": True,
             "status": "ok",
@@ -1195,92 +1696,256 @@ class HelloGraphAdapter(BaseGraphAdapter):
             "namespaces": {"default": "ready"},
         }
 
-    # --- Test fixture support (REQUIRED) ---
-    def build_graph_query_envelope(self, query="MATCH (n) RETURN n", dialect="cypher", **kwargs):
+    # ------------------------------------------------------------------------
+    # TEST FIXTURE SUPPORT (REQUIRED FOR CERTIFICATION)
+    # ------------------------------------------------------------------------
+    
+    def build_graph_query_envelope(
+        self,
+        query: str = "MATCH (n) RETURN n",
+        dialect: str = "cypher",
+        namespace: str = "default",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for graph query."""
         return {
             "op": "graph.query",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"text": query, "dialect": dialect, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "text": query,
+                "dialect": dialect,
+                "namespace": namespace,
+                **kwargs
+            }
         }
 
-    def build_graph_stream_query_envelope(self, query="MATCH (n) RETURN n", dialect="cypher", **kwargs):
+    def build_graph_stream_query_envelope(
+        self,
+        query: str = "MATCH (n) RETURN n",
+        dialect: str = "cypher",
+        namespace: str = "default",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for streaming graph query."""
         return {
             "op": "graph.stream_query",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"text": query, "dialect": dialect, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "text": query,
+                "dialect": dialect,
+                "namespace": namespace,
+                **kwargs
+            }
         }
 
-    def build_graph_upsert_nodes_envelope(self, namespace="default", nodes=None, **kwargs):
+    def build_graph_upsert_nodes_envelope(
+        self,
+        namespace: str = "default",
+        nodes: List[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for node upsert."""
         if nodes is None:
-            nodes = [{"id": "node-1", "labels": ["Person"], "properties": {"name": "Alice"}}]
+            nodes = [{
+                "id": "node-1",
+                "labels": ["Person"],
+                "properties": {"name": "Alice"}
+            }]
         return {
             "op": "graph.upsert_nodes",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "nodes": nodes, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "nodes": nodes,
+                **kwargs
+            }
         }
 
-    def build_graph_upsert_edges_envelope(self, namespace="default", edges=None, **kwargs):
+    def build_graph_upsert_edges_envelope(
+        self,
+        namespace: str = "default",
+        edges: List[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for edge upsert."""
         if edges is None:
-            edges = [{"id": "edge-1", "src": "node-1", "dst": "node-2", "label": "KNOWS"}]
+            edges = [{
+                "id": "edge-1",
+                "src": "node-1",
+                "dst": "node-2",
+                "label": "KNOWS",
+                "properties": {"since": 2020}
+            }]
         return {
             "op": "graph.upsert_edges",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "edges": edges, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "edges": edges,
+                **kwargs
+            }
         }
 
-    def build_graph_delete_nodes_envelope(self, namespace="default", ids=None, **kwargs):
+    def build_graph_delete_nodes_envelope(
+        self,
+        namespace: str = "default",
+        ids: List[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for node deletion."""
         if ids is None:
             ids = ["node-1"]
         return {
             "op": "graph.delete_nodes",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "ids": ids, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "ids": ids,
+                **kwargs
+            }
         }
 
-    def build_graph_delete_edges_envelope(self, namespace="default", ids=None, **kwargs):
+    def build_graph_delete_edges_envelope(
+        self,
+        namespace: str = "default",
+        ids: List[str] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for edge deletion."""
         if ids is None:
             ids = ["edge-1"]
         return {
             "op": "graph.delete_edges",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"namespace": namespace, "ids": ids, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "namespace": namespace,
+                "ids": ids,
+                **kwargs
+            }
         }
 
-    def build_graph_capabilities_envelope(self, **kwargs):
-        return {"op": "graph.capabilities", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_graph_capabilities_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for capabilities discovery."""
+        return {
+            "op": "graph.capabilities",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 
-    def build_graph_health_envelope(self, **kwargs):
-        return {"op": "graph.health", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_graph_health_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for health check."""
+        return {
+            "op": "graph.health",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 
-    def build_graph_batch_envelope(self, ops=None, **kwargs):
+    def build_graph_batch_envelope(
+        self,
+        ops: List[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for batch operations."""
         if ops is None:
-            ops = [{"op": "upsert_nodes", "args": {"nodes": [{"id": "node-1"}]}}]
+            ops = [{
+                "op": "upsert_nodes",
+                "args": {"nodes": [{"id": "node-1"}]}
+            }]
         return {
             "op": "graph.batch",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"ops": ops, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "ops": ops,
+                **kwargs
+            }
         }
 
-    def build_graph_transaction_envelope(self, operations=None, **kwargs):
+    def build_graph_transaction_envelope(
+        self,
+        operations: List[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for atomic transaction."""
         if operations is None:
-            operations = [{"op": "upsert_nodes", "args": {"nodes": [{"id": "node-1"}]}}]
+            operations = [{
+                "op": "upsert_nodes",
+                "args": {"nodes": [{"id": "node-1"}]}
+            }]
         return {
             "op": "graph.transaction",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"operations": operations, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "operations": operations,
+                **kwargs
+            }
         }
 
-    def build_graph_traversal_envelope(self, start_nodes=None, max_depth=2, direction="OUTGOING", **kwargs):
+    def build_graph_traversal_envelope(
+        self,
+        start_nodes: List[str] = None,
+        max_depth: int = 2,
+        direction: str = "OUTGOING",
+        namespace: str = "default",
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Return wire envelope for graph traversal."""
         if start_nodes is None:
             start_nodes = ["node-1"]
         return {
             "op": "graph.traversal",
-            "ctx": {"request_id": "test-123", "tenant": "test-tenant", "deadline_ms": 5000},
-            "args": {"start_nodes": start_nodes, "max_depth": max_depth, "direction": direction, **kwargs}
+            "ctx": {
+                "request_id": "test-123",
+                "tenant": "test-tenant",
+                "deadline_ms": 5000,
+            },
+            "args": {
+                "start_nodes": start_nodes,
+                "max_depth": max_depth,
+                "direction": direction,
+                "namespace": namespace,
+                **kwargs
+            }
         }
 
-    def build_graph_get_schema_envelope(self, **kwargs):
-        return {"op": "graph.get_schema", "ctx": {"request_id": "test-123", "tenant": "test-tenant"}, "args": {}}
+    def build_graph_get_schema_envelope(self, **kwargs) -> Dict[str, Any]:
+        """Return wire envelope for schema retrieval."""
+        return {
+            "op": "graph.get_schema",
+            "ctx": {"request_id": "test-123", "tenant": "test-tenant"},
+            "args": {}
+        }
 ```
 
 ---
@@ -1314,6 +1979,9 @@ pytest tests/embedding/ -v
 
 # Test wire envelope conformance
 pytest tests/live/ -v
+
+# Test schema validation
+pytest tests/schema/ -v
 
 # Incremental test order
 pytest tests/embedding/test_capabilities.py -v
@@ -1464,6 +2132,8 @@ Embedding Protocol V1.0:
 
 **Do not guess.** The error guidance is authoritative.
 
+For complete certification requirements, see [`CONFORMANCE_GUIDE.md`](CONFORMANCE_GUIDE.md).
+
 ---
 
 ## 6. Expose It Over HTTP
@@ -1512,27 +2182,38 @@ async def handle_embedding(request: Request):
         if "ms" not in response:
             response["ms"] = (time.time() - start) * 1000
         return response
-    except Exception:
-        return {"ok": False, "code": "UNAVAILABLE", "error": "Unavailable", 
-                "message": "internal error", "ms": 0}
+    except Exception as e:
+        return {
+            "ok": False,
+            "code": "UNAVAILABLE",
+            "error": "Unavailable",
+            "message": "internal error",
+            "ms": (time.time() - start) * 1000,
+            "retry_after_ms": None,
+            "details": None,
+        }
 
 @app.post("/v1/embedding/stream")
 async def handle_embedding_stream(request: Request):
     """Handle streaming embedding operations."""
     protocol = request.headers.get("x-adapter-protocol")
     if protocol and protocol != "embedding/v1.0":
-        return JSONResponse(status_code=400, content={"ok": False, "code": "NOT_SUPPORTED"})
+        return JSONResponse(status_code=400, content={
+            "ok": False, "code": "NOT_SUPPORTED",
+            "message": f"Protocol {protocol} not supported"
+        })
     
     try:
         envelope = await request.json()
+        
         async def stream_generator():
-            start = time.time()
+            start_time = time.time()
             async for chunk in handler.handle_stream(envelope):
                 if isinstance(chunk, dict) and "chunk" not in chunk:
                     chunk = {
                         "ok": True,
                         "code": "STREAMING",
-                        "ms": (time.time() - start) * 1000,
+                        "ms": (time.time() - start_time) * 1000,
                         "chunk": chunk
                     }
                 yield json.dumps(chunk) + "\n"
@@ -1540,20 +2221,39 @@ async def handle_embedding_stream(request: Request):
         return StreamingResponse(
             stream_generator(),
             media_type="application/x-ndjson",
-            headers={"X-Adapter-Protocol": "embedding/v1.0", "Cache-Control": "no-cache"}
+            headers={
+                "X-Adapter-Protocol": "embedding/v1.0",
+                "Cache-Control": "no-cache"
+            }
         )
-    except Exception:
-        return {"ok": False, "code": "UNAVAILABLE", "error": "Unavailable", "message": "internal error", "ms": 0}
+    except Exception as e:
+        return {
+            "ok": False,
+            "code": "UNAVAILABLE",
+            "error": "Unavailable",
+            "message": "internal error",
+            "ms": 0,
+        }
 
 @app.get("/v1/health")
 async def health_check():
+    """Health endpoint with graded status."""
     health = await adapter.health()
     status_code = 200 if health.get("status") in ["ok", "degraded"] else 503
     return JSONResponse(status_code=status_code, content=health)
 
 @app.get("/v1/stats")
 async def get_stats():
-    return await adapter._do_get_stats()
+    """Service statistics endpoint."""
+    stats = await adapter._do_get_stats()
+    return stats
+
+@app.get("/v1/capabilities")
+async def get_capabilities():
+    """Capabilities discovery endpoint."""
+    caps = await adapter.capabilities()
+    from dataclasses import asdict
+    return asdict(caps)
 ```
 
 ---
@@ -1579,7 +2279,7 @@ async def handle_complete(request: Request):
     protocol = request.headers.get("x-adapter-protocol")
     if protocol and protocol != "llm/v1.0":
         return JSONResponse(status_code=400, content={
-            "ok": False, "code": "NOT_SUPPORTED", 
+            "ok": False, "code": "NOT_SUPPORTED",
             "message": f"Protocol {protocol} not supported"
         })
     
@@ -1598,6 +2298,7 @@ async def handle_stream(request: Request):
     """Handle streaming LLM completions."""
     try:
         envelope = await request.json()
+        
         async def stream_generator():
             start = time.time()
             async for chunk in handler.handle_stream(envelope):
@@ -1631,6 +2332,12 @@ async def count_tokens(request: Request):
         return response
     except Exception:
         return {"ok": False, "code": "UNAVAILABLE", "ms": 0}
+
+@app.get("/v1/capabilities")
+async def get_capabilities():
+    caps = await adapter.capabilities()
+    from dataclasses import asdict
+    return asdict(caps)
 ```
 
 ---
@@ -1789,6 +2496,7 @@ async def handle_stream_query(request: Request):
     """Stream graph query results."""
     try:
         envelope = await request.json()
+        
         async def stream_generator():
             start = time.time()
             async for chunk in handler.handle_stream(envelope):
@@ -1928,15 +2636,22 @@ async def get_capabilities():
 ```bash
 # Start your service (choose the right one)
 uvicorn services.embedding_service:app --port 8000
+# OR
 uvicorn services.llm_service:app --port 8000
+# OR
 uvicorn services.vector_service:app --port 8000
+# OR
 uvicorn services.graph_service:app --port 8000
 
 # Test with protocol header
 curl -X POST http://localhost:8000/v1/embedding \
   -H "X-Adapter-Protocol: embedding/v1.0" \
   -H "Content-Type: application/json" \
-  -d '{"op": "embedding.embed", "ctx": {"request_id": "test"}, "args": {"model": "hello-1", "text": "Hello"}}'
+  -d '{
+    "op": "embedding.embed",
+    "ctx": {"request_id": "test-123", "tenant": "acme"},
+    "args": {"model": "hello-1", "text": "Hello world"}
+  }'
 
 # Test against wire conformance suite
 export CORPUS_ENDPOINT=http://localhost:8000
@@ -1976,6 +2691,10 @@ if ctx.idempotency_key:
     if cached: return cached
 ```
 
+Full specification: [`corpus_sdk/embedding/embedding_base.py`](../corpus_sdk/embedding/embedding_base.py)
+
+---
+
 ### 7.2 LLM Protocol
 
 ```python
@@ -1999,6 +2718,10 @@ ToolCall(id=f"call_{secrets.token_hex(8)}", ...)
 if not caps.supports_system_message:
     raise NotSupported("system_message not supported")
 ```
+
+Full specification: [`corpus_sdk/llm/llm_base.py`](../corpus_sdk/llm/llm_base.py)
+
+---
 
 ### 7.3 Vector Protocol
 
@@ -2028,6 +2751,10 @@ except Exception:
     text = None  # Graceful degradation
 ```
 
+Full specification: [`corpus_sdk/vector/vector_base.py`](../corpus_sdk/vector/vector_base.py)
+
+---
+
 ### 7.4 Graph Protocol
 
 ```python
@@ -2054,6 +2781,8 @@ if spec.dialect and caps.supported_query_dialects:
     if spec.dialect not in caps.supported_query_dialects:
         raise NotSupported(f"dialect '{spec.dialect}' not supported")
 ```
+
+Full specification: [`corpus_sdk/graph/graph_base.py`](../corpus_sdk/graph/graph_base.py)
 
 ---
 
@@ -2115,12 +2844,12 @@ logger.debug(f"tenant_hash={self._tenant_hash(ctx.tenant)}")
 ### Cache Invalidation (Vector/Graph Only)
 
 ```python
-# ✅ CORRECT: Invalidate AFTER successful write
+# ✅ CORRECT: Invalidate AFTER successful write (Vector)
 result = await self._do_upsert(spec, ctx)
 if result.upserted_count > 0:
     await self._invalidate_namespace_cache(spec.namespace)
 
-# ✅ CORRECT: Transaction - invalidate AFTER commit
+# ✅ CORRECT: Transaction - invalidate AFTER commit (Graph)
 if await txn.commit():
     await self._invalidate_namespace_cache(namespace)
 ```
@@ -2129,15 +2858,14 @@ if await txn.commit():
 
 ## 9. What to Read Next
 
-| Document | Purpose | When to Read |
-|----------|---------|--------------|
-| [`docs/spec/CORPUS_SPECIFICATION.md`](../spec/CORPUS_SPECIFICATION.md) | Full specification (normative) | Before production deploy |
-| [`docs/spec/IMPLEMENTATION.md`](../spec/IMPLEMENTATION.md) | Full `_do_*` semantics, all edge cases | After quickstart works |
-| [`docs/spec/ERRORS.md`](../spec/ERRORS.md) | Complete error taxonomy | When adding new error types |
-| [`tests/embedding/`](./tests/embedding/) | Embedding conformance tests | Source of truth for Embedding |
-| [`tests/llm/`](./tests/llm/) | LLM conformance tests | Source of truth for LLM |
-| [`tests/vector/`](./tests/vector/) | Vector conformance tests | Source of truth for Vector |
-| [`tests/graph/`](./tests/graph/) | Graph conformance tests | Source of truth for Graph |
+| Document | Purpose | Location |
+|----------|---------|----------|
+| **Protocol Specifications** | Normative behavior for each protocol | [`corpus_sdk/embedding/embedding_base.py`](../corpus_sdk/embedding/embedding_base.py)<br>[`corpus_sdk/llm/llm_base.py`](../corpus_sdk/llm/llm_base.py)<br>[`corpus_sdk/vector/vector_base.py`](../corpus_sdk/vector/vector_base.py)<br>[`corpus_sdk/graph/graph_base.py`](../corpus_sdk/graph/graph_base.py) |
+| **Implementation Guide** | Deep dive on `_do_*` semantics | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) |
+| **Conformance Guide** | Running certification suites | [`CONFORMANCE_GUIDE.md`](CONFORMANCE_GUIDE.md) |
+| **Adapter Recipes** | Multi-cloud and RAG scenarios | [`ADAPTER_RECIPES.md`](ADAPTER_RECIPES.md) *(coming soon)* |
+| **Error Taxonomy** | Complete error hierarchy | [`ERRORS.md`](ERRORS.md) *(in spec docstrings)* |
+| **Metrics Schema** | SIEM-safe observability | [`METRICS.md`](METRICS.md) *(in `MetricsSink` protocol)* |
 
 **The conformance tests in `tests/` are the source of truth.** When this document and the tests disagree, **the tests are correct.**
 
@@ -2312,24 +3040,24 @@ if "cypher" not in caps.supported_query_dialects:
 
 ## Appendix B: Glossary
 
-| Term | Definition |
-|------|------------|
-| **Adapter** | A class that implements `_do_*` hooks and `build_*_envelope()` methods |
-| **Base Class** | `BaseEmbeddingAdapter`, `BaseLLMAdapter`, `BaseVectorAdapter`, `BaseGraphAdapter` |
-| **Certification Suite** | The conformance tests in `tests/embedding/`, `tests/llm/`, etc. |
-| **Gold Certification** | 100% pass rate in a single protocol |
-| **build_*_envelope()** | Test fixture methods that return wire envelopes (REQUIRED) |
-| **Wire Envelope** | The JSON `{op, ctx, args}` structure all Corpus services speak |
-| **Canonical Streaming Envelope** | `{ok: true, code: "STREAMING", ms: number, chunk: object}` |
-| **Protocol Field** | REQUIRED field in capabilities: `"protocol": "{component}/v1.0"` |
-| **Idempotent Writes** | REQUIRED capability for embedding: `idempotent_writes: true` |
-| **Failures Field** | REQUIRED field name for embedding batch errors (not `failed_texts`) |
-| **Model Family** | REQUIRED field in LLM capabilities: `model_family` |
-| **Namespace Canonicalization** | REQUIRED behavior for Vector: enforce namespace match |
-| **Transaction Atomicity** | REQUIRED for Graph: all or nothing |
-| **CORPUS_ADAPTER** | Environment variable: `module:ClassName` for dynamic loading |
-| **CORPUS_ENDPOINT** | Environment variable: URL for live endpoint testing |
-| **X-Adapter-Protocol** | Header for protocol version negotiation |
+| Term | Definition | Location |
+|------|------------|----------|
+| **Adapter** | A class that implements `_do_*` hooks and `build_*_envelope()` methods | This guide |
+| **Base Class** | `BaseEmbeddingAdapter`, `BaseLLMAdapter`, `BaseVectorAdapter`, `BaseGraphAdapter` | `corpus_sdk/*/*_base.py` |
+| **Certification Suite** | The conformance tests in `tests/embedding/`, `tests/llm/`, etc. | `tests/` directory |
+| **Gold Certification** | 100% pass rate in a single protocol | Section 5 |
+| **build_*_envelope()** | Test fixture methods that return wire envelopes (REQUIRED) | Section 3 |
+| **Wire Envelope** | The JSON `{op, ctx, args}` structure all Corpus services speak | Base class docstrings |
+| **Canonical Streaming Envelope** | `{ok: true, code: "STREAMING", ms: number, chunk: object}` | `*_base.py` |
+| **Protocol Field** | REQUIRED field in capabilities: `"protocol": "{component}/v1.0"` | `*Capabilities` classes |
+| **Idempotent Writes** | REQUIRED capability for embedding: `idempotent_writes: true` | `EmbeddingCapabilities` |
+| **Failures Field** | REQUIRED field name for embedding batch errors (not `failed_texts`) | `BatchEmbedResult` |
+| **Model Family** | REQUIRED field in LLM capabilities: `model_family` | `LLMCapabilities` |
+| **Namespace Canonicalization** | REQUIRED behavior for Vector: enforce namespace match | `BaseVectorAdapter` |
+| **Transaction Atomicity** | REQUIRED for Graph: all or nothing | `BaseGraphAdapter` |
+| **CORPUS_ADAPTER** | Environment variable: `module:ClassName` for dynamic loading | Section 4 |
+| **CORPUS_ENDPOINT** | Environment variable: URL for live endpoint testing | Section 6 |
+| **X-Adapter-Protocol** | Header for protocol version negotiation | Section 6 |
 
 ---
 
@@ -2413,7 +3141,7 @@ Specification: §4.2.2 Version Identification
 Quick fix: Capabilities missing required field 'protocol'
 ```
 
-**Do not search the internet.** Open the specification and read §4.2.2. The answer is there.
+**Do not search the internet.** Open the specification in the base class docstring and read §4.2.2. The answer is there.
 
 ---
 
@@ -2422,3 +3150,5 @@ Quick fix: Capabilities missing required field 'protocol'
 **Scope:** Complete adapter authoring reference for all Corpus Protocols v1.0 (Embedding, LLM, Vector, Graph).
 
 **The conformance tests in `tests/` are the source of truth.** When this document and the tests disagree, **the tests are correct.**
+
+---
