@@ -5,7 +5,7 @@
 **Table of Contents**
 - [0. Mental Model (What You're Actually Building)](#0-mental-model-what-youre-actually-building)
 - [1. Prerequisites & Setup](#1-prerequisites--setup)
-- [2. Conformance-First Development (The Right Way)](#2-conformance-first-development-the-right-way)
+- [2. Testing Your Adapter (Certification Suite)](#2-testing-your-adapter-certification-suite)
 - [3. Hello World: Complete Reference Adapters](#3-hello-world-complete-reference-adapters)
   - [3.1 Embedding Adapter (OpenAI/Cohere Style)](#31-embedding-adapter-openaicohere-style)
   - [3.2 LLM Adapter (Chat Completion Style)](#32-llm-adapter-chat-completion-style)
