@@ -1,4 +1,4 @@
-# IMPLEMENTATION GUIDE — CORPUS PROTOCOL ADAPTERS v1.0
+# Corpus OS IMPLEMENTATION GUIDE
 
 **Production Requirements for LLM • Embedding • Vector • Graph**
 
