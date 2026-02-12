@@ -149,17 +149,7 @@ Your `tests/` directory now contains the official, unmodified certification suit
 
 ### Step 2: Create Your Test Fixture
 
-Create `tests/conftest.py`:
-
-```python
-import pytest
-from adapters.my_adapter import MyAdapter  # Your adapter
-
-@pytest.fixture
-def adapter():
-    """Return your adapter instance for certification testing."""
-    return MyAdapter(mode="thin")  # Use "thin" for certification
-```
+Utilze `tests/conftest.
 
 **Do not modify the copied test files.** They are the source of truth.
 
