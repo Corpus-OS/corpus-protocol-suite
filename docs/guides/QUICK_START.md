@@ -149,7 +149,7 @@ Your `tests/` directory now contains the official, unmodified certification suit
 
 ### Step 2: Create Your Test Fixture
 
-Utilze `tests/conftest.
+Utilze `tests/conftest and please read CONFTEST.md
 
 **Do not modify the copied test files.** They are the source of truth.
 
