@@ -85,7 +85,7 @@
     - 15.3 [Vector Adapter Checklist](#153-vector-adapter-checklist)
     - 15.4 [Graph Adapter Checklist](#154-graph-adapter-checklist)
 16. [COMMON PITFALLS — 55+ CONFORMANCE FAILURES](#16-common-pitfalls--55-conformance-failures)
-17. [WHAT CHANGED — COMPLETE DELTA FROM PREVIOUS VERSION](#17-what-changed--complete-delta-from-previous-version)
+
 
 ---
 
