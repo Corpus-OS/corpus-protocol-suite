@@ -365,6 +365,17 @@ ctx.attrs.get("health") == "degraded"  # Mock health forcing
 self.failure_rate = 0.0  # No probabilistic failures
 self._rng = random.Random()  # No RNG in production adapters
 self.simulate_latency = False  # No latency simulation flags
+
+# ✅ ALLOWED: Client-provided extensions
+ctx.attrs.get("client_version")  # OK
+ctx.attrs.get("source")          # OK
+ctx.attrs.get("workflow_id")     # OK
+
+# ❌ FORBIDDEN: Mock error injection
+ctx.attrs.get("simulate_error")  # NO
+ctx.attrs.get("fail")            # NO
+ctx.attrs.get("sleep_ms")        # NO
+ctx.attrs.get("health")          # NO - use real health checks
 ```
 
 **PRODUCTION ADAPTERS MUST:**
