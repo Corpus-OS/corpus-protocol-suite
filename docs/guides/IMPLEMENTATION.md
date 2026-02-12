@@ -4240,7 +4240,7 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 
 ## 16. COMMON PITFALLS: 55+ CONFORMANCE FAILURES
 
-### LLM PITFALLS (12)
+### LLM PITFALLS 
 
 1. **Mismatched complete/stream output**: `_do_complete()` and `_do_stream()` return different text ❌
 2. **No tool choice validation**: Accepts `tool_choice` with unknown tool name ❌
@@ -4255,7 +4255,7 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 11. **Context attribute error injection**: Reads `ctx.attrs["simulate_error"]` ❌
 12. **Temperature simulation**: Manually duplicates/drops tokens ❌
 
-### EMBEDDING PITFALLS (14)
+### EMBEDDING PITFALLS 
 
 13. **No validation in _do_embed**: Assumes base validated non-empty string ❌
 14. **Configurable batch failure mode**: `collect_failures_in_native_batch` flag ❌
@@ -4272,7 +4272,7 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 25. **No model validation**: Accepts unsupported models ❌
 26. **Normalizes_at_source misreporting**: Returns normalized vectors but sets `normalizes_at_source=False` ❌
 
-### VECTOR PITFALLS (18)
+### VECTOR PITFALLS 
 
 27. **No namespace authority**: Allows vector.namespace != spec.namespace ❌
 28. **Silent namespace correction**: Overwrites vector.namespace to match spec ❌
@@ -4293,7 +4293,7 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 43. **Context attribute failure injection**: Reads `ctx.attrs["fail"]` ❌
 44. **Environment test seeding**: `VECTOR_SEED_DEFAULT` env var ❌
 
-### GRAPH PITFALLS (13)
+### GRAPH PITFALLS
 
 45. **Wrong batch result format**: Returns raw provider response, not `{"ok": True, "result": ...}` ❌
 46. **Duplicated batch/transaction logic**: Separate implementations for batch and transaction ❌
