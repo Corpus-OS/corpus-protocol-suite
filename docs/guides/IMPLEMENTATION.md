@@ -132,7 +132,7 @@
 
 This document specifies the mandatory implementation requirements for building production adapters that pass Corpus Protocol conformance suites.
 
-You are a CORPUS ADAPTER IMPLEMENTER. Your job is to write `_do_*` methods that map your provider's API to the Corpus base classes.
+You are a Corpus OS Implementer. Your job is to write `_do_*` methods that map your provider's API to the Corpus base classes.
 
 These requirements are DERIVED FROM WORKING MOCKS that pass 100% conformance. Every rule below exists because a mock implements it and conformance tests enforce it.
 
