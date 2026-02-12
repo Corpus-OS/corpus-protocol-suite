@@ -117,11 +117,6 @@ pip install fastapi uvicorn        # Optional: for HTTP services
 pip install redis msgpack          # Optional: for RedisDocStore
 ```
 ---
-## 2. Conformance-First Development (The Right Way)
-
-**Stop writing code before you have a failing test.**
-
-The Corpus certification suite evaluates adapters against the protocol specification. **You already have the tests—they ship with Corpus SDK.
 
 ## 2. Testing Your Adapter (Certification Suite)
 
