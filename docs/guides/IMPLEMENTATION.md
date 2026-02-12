@@ -45,85 +45,85 @@
 
 ## TABLE OF CONTENTS
 
-1. [PURPOSE & SCOPE](#1-purpose--scope)
+1. [PURPOSE & SCOPE](#1-purpose-scope)
 2. [SYSTEM LAYOUT](#2-system-layout)
-    - 2.1 [Base Classes (Provided)](#21-base-classes-provided)
-    - 2.2 [What You Implement](#22-what-you-implement)
-    - 2.3 [What You NEVER Implement](#23-what-you-never-implement)
-3. [CONTEXT & IDENTITY — PRODUCTION RULES](#3-context--identity--production-rules)
-    - 3.1 [OperationContext Structure](#31-operationcontext-structure)
-    - 3.2 [Deadline Propagation — MANDATORY](#32-deadline-propagation--mandatory)
-    - 3.3 [Tenant Hashing — MANDATORY](#33-tenant-hashing--mandatory)
-    - 3.4 [⚠️ CRITICAL: Context Attributes Are TEST ONLY](#34-⚠️-critical-context-attributes-are-test-only)
-4. [ERROR TAXONOMY & MAPPING](#4-error-taxonomy--mapping)
-    - 4.1 [Canonical Error Hierarchy](#41-canonical-error-hierarchy)
-    - 4.2 [Provider Error Mapping — MANDATORY](#42-provider-error-mapping--mandatory)
-    - 4.3 [Error Detail Schemas — PER ERROR TYPE — MANDATORY](#43-error-detail-schemas--per-error-type--mandatory)
-    - 4.4 [Retry Semantics — MANDATORY](#44-retry-semantics--mandatory)
+    2.1 [Base Classes (Provided)](#21-base-classes-provided)
+    2.2 [What You Implement](#22-what-you-implement)
+    2.3 [What You NEVER Implement](#23-what-you-never-implement)
+3. [CONTEXT & IDENTITY: PRODUCTION RULES](#3-context-identity-production-rules)
+    3.1 [OperationContext Structure](#31-operationcontext-structure)
+    3.2 [Deadline Propagation: MANDATORY](#32-deadline-propagation-mandatory)
+    3.3 [Tenant Hashing: MANDATORY](#33-tenant-hashing-mandatory)
+    3.4 [⚠️ CRITICAL: Context Attributes Are TEST ONLY](#34-⚠️-critical-context-attributes-are-test-only)
+4. [ERROR TAXONOMY & MAPPING](#4-error-taxonomy-mapping)
+    4.1 [Canonical Error Hierarchy](#41-canonical-error-hierarchy)
+    4.2 [Provider Error Mapping: MANDATORY](#42-provider-error-mapping-mandatory)
+    4.3 [Error Detail Schemas: PER ERROR TYPE: MANDATORY](#43-error-detail-schemas-per-error-type-mandatory)
+    4.4 [Retry Semantics: MANDATORY](#44-retry-semantics-mandatory)
 5. [MODES: THIN vs STANDALONE](#5-modes-thin-vs-standalone)
-6. [DEADLINES & CANCELLATION](#6-deadlines--cancellation)
-7. [LLM ADAPTER — IMPLEMENTATION REQUIREMENTS](#7-llm-adapter--implementation-requirements)
-    - 7.1 [Required Methods](#71-required-methods)
-    - 7.2 [Shared Planning Path — COMPLETE and STREAM — MANDATORY](#72-shared-planning-path--complete-and-stream--mandatory)
-    - 7.3 [Tool Calling — Validation and Accounting — MANDATORY](#73-tool-calling--validation-and-accounting--mandatory)
-    - 7.4 [Token Counting & Usage Accounting — TOOL CALLS — MANDATORY](#74-token-counting--usage-accounting--tool-calls--mandatory)
-    - 7.5 [Stop Sequences — FIRST Occurrence Rule — MANDATORY](#75-stop-sequences--first-occurrence-rule--mandatory)
-    - 7.6 [Streaming Rules — Tool Calls — MANDATORY](#76-streaming-rules--tool-calls--mandatory)
-    - 7.7 [Capabilities Enforcement — Operation Coupling — MANDATORY](#77-capabilities-enforcement--operation-coupling--mandatory)
-    - 7.8 [Role Validation — Permissive, Not Restrictive — MANDATORY](#78-role-validation--permissive-not-restrictive--mandatory)
-    - 7.9 [Complete LLM Example — Production Ready](#79-complete-llm-example--production-ready)
-8. [EMBEDDING ADAPTER — IMPLEMENTATION REQUIREMENTS](#8-embedding-adapter--implementation-requirements)
-    - 8.1 [Required Methods](#81-required-methods)
-    - 8.2 [Validation Placement — _do_embed MUST Validate — MANDATORY](#82-validation-placement--_do_embed-must-validate--mandatory)
-    - 8.3 [Batch Failure Mode — CHOOSE ONE — MANDATORY](#83-batch-failure-mode--choose-one--mandatory)
-    - 8.4 [Batch Failure Mode — CONFIGURABILITY FORBIDDEN — MANDATORY](#84-batch-failure-mode--configurability-forbidden--mandatory)
-    - 8.5 [Truncation & Normalization — Base Owns, You Report](#85-truncation--normalization--base-owns-you-report)
-    - 8.6 [Cache Stats Ownership — CRITICAL BOUNDARY — MANDATORY](#86-cache-stats-ownership--critical-boundary--mandatory)
-    - 8.7 [Streaming Pattern — CHOOSE ONE — MANDATORY](#87-streaming-pattern--choose-one--mandatory)
-    - 8.8 [Capabilities — NO RUNTIME CONFIGURATION — MANDATORY](#88-capabilities--no-runtime-configuration--mandatory)
-    - 8.9 [Token Counting — NO APPROXIMATIONS — MANDATORY](#89-token-counting--no-approximations--mandatory)
-    - 8.10 [Complete Embedding Example — Production Ready](#810-complete-embedding-example--production-ready)
-9. [VECTOR ADAPTER — IMPLEMENTATION REQUIREMENTS](#9-vector-adapter--implementation-requirements)
-    - 9.1 [Required Methods](#91-required-methods)
-    - 9.2 [Namespace Authority — Spec.namespace is Authoritative — MANDATORY](#92-namespace-authority--specnamespace-is-authoritative--mandatory)
-    - 9.3 [Include Vectors Contract — [] NOT null — MANDATORY](#93-include-vectors-contract---not-null--mandatory)
-    - 9.4 [Filter Dialect Validation — Strict, No Silent Ignore — MANDATORY](#94-filter-dialect-validation--strict-no-silent-ignore--mandatory)
-    - 9.5 [Filter Operator Error Details — CANONICAL SHAPE — MANDATORY](#95-filter-operator-error-details--canonical-shape--mandatory)
-    - 9.6 [Batch Query Atomicity — All-or-Nothing — MANDATORY](#96-batch-query-atomicity--all-or-nothing--mandatory)
-    - 9.7 [Delete Idempotency — No Error on Missing — MANDATORY](#97-delete-idempotency--no-error-on-missing--mandatory)
-    - 9.8 [Delete Parameter Rule — IDs XOR Filter — MANDATORY](#98-delete-parameter-rule--ids-xor-filter--mandatory)
-    - 9.9 [Distance Metric Strings — EXACT VALUES — MANDATORY](#99-distance-metric-strings--exact-values--mandatory)
-    - 9.10 [Suggested Batch Reduction — Percentage Semantics — MANDATORY](#910-suggested-batch-reduction--percentage-semantics--mandatory)
-    - 9.11 [IndexNotReady — Retry Semantics — MANDATORY](#911-indexnotready--retry-semantics--mandatory)
-    - 9.12 [Namespace Mismatch Error Details — CANONICAL SHAPE — MANDATORY](#912-namespace-mismatch-error-details--canonical-shape--mandatory)
-    - 9.13 [Dimension Mismatch Error Details — CANONICAL SHAPE — MANDATORY](#913-dimension-mismatch-error-details--canonical-shape--mandatory)
-    - 9.14 [Health Response — Namespace Status — MANDATORY](#914-health-response--namespace-status--mandatory)
-    - 9.15 [Complete Vector Example — Production Ready](#915-complete-vector-example--production-ready)
-10. [GRAPH ADAPTER — IMPLEMENTATION REQUIREMENTS](#10-graph-adapter--implementation-requirements)
-    - 10.1 [Required Methods](#101-required-methods)
-    - 10.2 [Batch/Transaction Result Envelope — {ok, result} — MANDATORY](#102-batchtransaction-result-envelope--ok-result--mandatory)
-    - 10.3 [Shared Op Executor — Single Kernel for Batch + Transaction — MANDATORY](#103-shared-op-executor--single-kernel-for-batch--transaction--mandatory)
-    - 10.4 [Dialect Validation — TWO Layers — MANDATORY](#104-dialect-validation--two-layers--mandatory)
-    - 10.5 [Delete Idempotency — No Error on Missing — MANDATORY](#105-delete-idempotency--no-error-on-missing--mandatory)
-    - 10.6 [Bulk Vertices Pagination — Cursor Contract — MANDATORY](#106-bulk-vertices-pagination--cursor-contract--mandatory)
-    - 10.7 [Traversal Result Shape — Nodes, Edges, Paths — MANDATORY](#107-traversal-result-shape--nodes-edges-paths--mandatory)
-    - 10.8 [Capabilities Enforcement — Operation Coupling — MANDATORY](#108-capabilities-enforcement--operation-coupling--mandatory)
-    - 10.9 [Capabilities — NO RUNTIME CONFIGURATION — MANDATORY](#109-capabilities--no-runtime-configuration--mandatory)
-    - 10.10 [Complete Graph Example — Production Ready](#1010-complete-graph-example--production-ready)
-11. [CACHE OWNERSHIP BOUNDARY — CRITICAL](#11-cache-ownership-boundary--critical)
-    - 11.1 [Embedding Stats — NO Cache Metrics — MANDATORY](#111-embedding-stats--no-cache-metrics--mandatory)
-    - 11.2 [Capabilities Caching — Allowed, With Rules — MANDATORY](#112-capabilities-caching--allowed-with-rules--mandatory)
-12. [BATCH FAILURE MODE — DECISION MATRIX](#12-batch-failure-mode--decision-matrix)
-13. [STREAMING PATTERN — DECISION MATRIX](#13-streaming-pattern--decision-matrix)
-14. [PRODUCTION HARDENING — REMOVE ALL MOCK-ONLY CODE](#14-production-hardening--remove-all-mock-only-code)
-    - 14.1 [Patterns to DELETE Entirely](#141-patterns-to-delete-entirely)
-    - 14.2 [Patterns to TRANSFORM](#142-patterns-to-transform)
-15. [PER-DOMAIN IMPLEMENTATION CHECKLISTS](#15-per-domain-implementation-checklists)
-    - 15.1 [LLM Adapter Checklist](#151-llm-adapter-checklist)
-    - 15.2 [Embedding Adapter Checklist](#152-embedding-adapter-checklist)
-    - 15.3 [Vector Adapter Checklist](#153-vector-adapter-checklist)
-    - 15.4 [Graph Adapter Checklist](#154-graph-adapter-checklist)
-16. [COMMON PITFALLS — 55+ CONFORMANCE FAILURES](#16-common-pitfalls--55-conformance-failures)
+6. [DEADLINES & CANCELLATION](#6-deadlines-cancellation)
+7. [LLM ADAPTER: IMPLEMENTATION REQUIREMENTS](#7-llm-adapter-implementation-requirements)
+    7.1 [Required Methods](#71-required-methods)
+    7.2 [Shared Planning Path: COMPLETE and STREAM: MANDATORY](#72-shared-planning-path-complete-and-stream-mandatory)
+    7.3 [Tool Calling: Validation and Accounting: MANDATORY](#73-tool-calling-validation-and-accounting-mandatory)
+    7.4 [Token Counting & Usage Accounting: TOOL CALLS: MANDATORY](#74-token-counting-usage-accounting-tool-calls-mandatory)
+    7.5 [Stop Sequences: FIRST Occurrence Rule: MANDATORY](#75-stop-sequences-first-occurrence-rule-mandatory)
+    7.6 [Streaming Rules: Tool Calls: MANDATORY](#76-streaming-rules-tool-calls-mandatory)
+    7.7 [Capabilities Enforcement: Operation Coupling: MANDATORY](#77-capabilities-enforcement-operation-coupling-mandatory)
+    7.8 [Role Validation: Permissive, Not Restrictive: MANDATORY](#78-role-validation-permissive-not-restrictive-mandatory)
+    7.9 [Complete LLM Example: Production Ready](#79-complete-llm-example-production-ready)
+8. [EMBEDDING ADAPTER: IMPLEMENTATION REQUIREMENTS](#8-embedding-adapter-implementation-requirements)
+    8.1 [Required Methods](#81-required-methods)
+    8.2 [Validation Placement: _do_embed MUST Validate: MANDATORY](#82-validation-placement-_do_embed-must-validate-mandatory)
+    8.3 [Batch Failure Mode: CHOOSE ONE: MANDATORY](#83-batch-failure-mode-choose-one-mandatory)
+    8.4 [Batch Failure Mode: CONFIGURABILITY FORBIDDEN: MANDATORY](#84-batch-failure-mode-configurability-forbidden-mandatory)
+    8.5 [Truncation & Normalization: Base Owns, You Report](#85-truncation-normalization-base-owns-you-report)
+    8.6 [Cache Stats Ownership: CRITICAL BOUNDARY: MANDATORY](#86-cache-stats-ownership-critical-boundary-mandatory)
+    8.7 [Streaming Pattern: CHOOSE ONE: MANDATORY](#87-streaming-pattern-choose-one-mandatory)
+    8.8 [Capabilities: NO RUNTIME CONFIGURATION: MANDATORY](#88-capabilities-no-runtime-configuration-mandatory)
+    8.9 [Token Counting: NO APPROXIMATIONS: MANDATORY](#89-token-counting-no-approximations-mandatory)
+    8.10 [Complete Embedding Example: Production Ready](#810-complete-embedding-example-production-ready)
+9. [VECTOR ADAPTER: IMPLEMENTATION REQUIREMENTS](#9-vector-adapter-implementation-requirements)
+    9.1 [Required Methods](#91-required-methods)
+    9.2 [Namespace Authority: Spec.namespace is Authoritative: MANDATORY](#92-namespace-authority-specnamespace-is-authoritative-mandatory)
+    9.3 [Include Vectors Contract: [] NOT null: MANDATORY](#93-include-vectors-contract--not-null-mandatory)
+    9.4 [Filter Dialect Validation: Strict, No Silent Ignore: MANDATORY](#94-filter-dialect-validation-strict-no-silent-ignore-mandatory)
+    9.5 [Filter Operator Error Details: CANONICAL SHAPE: MANDATORY](#95-filter-operator-error-details-canonical-shape-mandatory)
+    9.6 [Batch Query Atomicity: All or Nothing: MANDATORY](#96-batch-query-atomicity-all-or-nothing-mandatory)
+    9.7 [Delete Idempotency: No Error on Missing: MANDATORY](#97-delete-idempotency-no-error-on-missing-mandatory)
+    9.8 [Delete Parameter Rule: IDs XOR Filter: MANDATORY](#98-delete-parameter-rule-ids-xor-filter-mandatory)
+    9.9 [Distance Metric Strings: EXACT VALUES: MANDATORY](#99-distance-metric-strings-exact-values-mandatory)
+    9.10 [Suggested Batch Reduction: Percentage Semantics: MANDATORY](#910-suggested-batch-reduction-percentage-semantics-mandatory)
+    9.11 [IndexNotReady: Retry Semantics: MANDATORY](#911-indexnotready-retry-semantics-mandatory)
+    9.12 [Namespace Mismatch Error Details: CANONICAL SHAPE: MANDATORY](#912-namespace-mismatch-error-details-canonical-shape-mandatory)
+    9.13 [Dimension Mismatch Error Details: CANONICAL SHAPE: MANDATORY](#913-dimension-mismatch-error-details-canonical-shape-mandatory)
+    9.14 [Health Response: Namespace Status: MANDATORY](#914-health-response-namespace-status-mandatory)
+    9.15 [Complete Vector Example: Production Ready](#915-complete-vector-example-production-ready)
+10. [GRAPH ADAPTER: IMPLEMENTATION REQUIREMENTS](#10-graph-adapter-implementation-requirements)
+    10.1 [Required Methods](#101-required-methods)
+    10.2 [Batch/Transaction Result Envelope: {ok, result}: MANDATORY](#102-batchtransaction-result-envelope-ok-result-mandatory)
+    10.3 [Shared Op Executor: Single Kernel for Batch + Transaction: MANDATORY](#103-shared-op-executor-single-kernel-for-batch-transaction-mandatory)
+    10.4 [Dialect Validation: TWO Layers: MANDATORY](#104-dialect-validation-two-layers-mandatory)
+    10.5 [Delete Idempotency: No Error on Missing: MANDATORY](#105-delete-idempotency-no-error-on-missing-mandatory)
+    10.6 [Bulk Vertices Pagination: Cursor Contract: MANDATORY](#106-bulk-vertices-pagination-cursor-contract-mandatory)
+    10.7 [Traversal Result Shape: Nodes, Edges, Paths: MANDATORY](#107-traversal-result-shape-nodes-edges-paths-mandatory)
+    10.8 [Capabilities Enforcement: Operation Coupling: MANDATORY](#108-capabilities-enforcement-operation-coupling-mandatory)
+    10.9 [Capabilities: NO RUNTIME CONFIGURATION: MANDATORY](#109-capabilities-no-runtime-configuration-mandatory)
+    10.10 [Complete Graph Example: Production Ready](#1010-complete-graph-example-production-ready)
+11. [CACHE OWNERSHIP BOUNDARY: CRITICAL](#11-cache-ownership-boundary-critical)
+    11.1 [Embedding Stats: NO Cache Metrics: MANDATORY](#111-embedding-stats-no-cache-metrics-mandatory)
+    11.2 [Capabilities Caching: Allowed, With Rules: MANDATORY](#112-capabilities-caching-allowed-with-rules-mandatory)
+12. [BATCH FAILURE MODE: DECISION MATRIX](#12-batch-failure-mode-decision-matrix)
+13. [STREAMING PATTERN: DECISION MATRIX](#13-streaming-pattern-decision-matrix)
+14. [PRODUCTION HARDENING: REMOVE ALL MOCK ONLY CODE](#14-production-hardening-remove-all-mock-only-code)
+    14.1 [Patterns to DELETE Entirely](#141-patterns-to-delete-entirely)
+    14.2 [Patterns to TRANSFORM](#142-patterns-to-transform)
+15. [PER DOMAIN IMPLEMENTATION CHECKLISTS](#15-per-domain-implementation-checklists)
+    15.1 [LLM Adapter Checklist](#151-llm-adapter-checklist)
+    15.2 [Embedding Adapter Checklist](#152-embedding-adapter-checklist)
+    15.3 [Vector Adapter Checklist](#153-vector-adapter-checklist)
+    15.4 [Graph Adapter Checklist](#154-graph-adapter-checklist)
+16. [COMMON PITFALLS: 55+ CONFORMANCE FAILURES](#16-common-pitfalls-55-conformance-failures)
 
 
 ---
@@ -179,7 +179,7 @@ from corpus_sdk.graph.graph_base import BaseGraphAdapter
 - Implement idempotent delete semantics (no error on missing)
 - Choose your batch failure mode (collect vs fail-fast)
 - Define your streaming pattern (single/progressive/multi-vector)
-- Remove mock-only code (ctx.attrs, RNG, latency simulation)
+- Remove mock-only code (`ctx.attrs`, RNG, latency simulation)
 - Enforce capability-operation coupling
 - Handle tool call token accounting
 - Define error detail schemas per error type
@@ -201,31 +201,31 @@ from corpus_sdk.graph.graph_base import BaseGraphAdapter
 ### 2.3 What You NEVER Implement
 
 ```python
-# ❌ NEVER IMPLEMENT THESE — BASE OWNS THEM
+# ❌ NEVER IMPLEMENT THESE: BASE OWNS THEM
 def capabilities(self): ...  # Base implements
 def complete(self): ...      # Base implements
 def query(self): ...         # Base implements
 def upsert(self): ...        # Base implements
 
 # ❌ NEVER CALL PUBLIC METHODS FROM _do_* METHODS
-await self.capabilities()    # WRONG — causes deadlock
-await self._do_capabilities()  # CORRECT — call hook directly
+await self.capabilities()    # WRONG: causes deadlock
+await self._do_capabilities()  # CORRECT: call hook directly
 
 # ❌ NEVER IMPLEMENT YOUR OWN CACHE
-self._my_cache = {}  # WRONG — base owns caching
+self._my_cache = {}  # WRONG: base owns caching
 
 # ❌ NEVER OVERRIDE BASE STATS WITH CACHE METRICS
 def _do_get_stats(self, ctx=None):
     return {
         "total_requests": ...,
-        "cache_hits": ...,  # ❌ WRONG — base owns cache stats
-        "cache_misses": ... # ❌ WRONG — base owns cache stats
+        "cache_hits": ...,  # ❌ WRONG: base owns cache stats
+        "cache_misses": ... # ❌ WRONG: base owns cache stats
     }
 ```
 
 ---
 
-## 3. CONTEXT & IDENTITY — PRODUCTION RULES
+## 3. CONTEXT & IDENTITY: PRODUCTION RULES
 
 ### 3.1 OperationContext Structure
 
@@ -242,7 +242,7 @@ class OperationContext:
     attrs: Mapping[str, Any] = field(default_factory=dict)
 ```
 
-### 3.2 Deadline Propagation — MANDATORY
+### 3.2 Deadline Propagation: MANDATORY
 
 ```python
 async def _do_embed(self, spec, *, ctx=None):
@@ -261,7 +261,7 @@ async def _do_embed(self, spec, *, ctx=None):
 
 **RULE:** Always convert `ctx.remaining_ms()` to provider timeouts. Never call provider if deadline already expired.
 
-### 3.3 Tenant Hashing — MANDATORY
+### 3.3 Tenant Hashing: MANDATORY
 
 ```python
 from corpus_sdk.utils import tenant_hash
@@ -327,7 +327,7 @@ from corpus_sdk.vector.exceptions import DimensionMismatch, IndexNotReady
 from corpus_sdk.graph.exceptions import DialectNotSupported, InvalidQuery
 ```
 
-### 4.2 Provider Error Mapping — MANDATORY
+### 4.2 Provider Error Mapping: MANDATORY
 
 ```python
 def map_provider_error(e: Exception) -> AdapterError:
@@ -400,9 +400,9 @@ def map_provider_error(e: Exception) -> AdapterError:
 
 **RULE:** Every provider error MUST map to the same canonical error type every time. No conditional mapping based on context.
 
-### 4.3 Error Detail Schemas — PER ERROR TYPE — MANDATORY
+### 4.3 Error Detail Schemas: PER ERROR TYPE: MANDATORY
 
-**DimensionMismatch — REQUIRED fields:**
+**DimensionMismatch: REQUIRED fields:**
 
 ```python
 raise DimensionMismatch(
@@ -417,7 +417,7 @@ raise DimensionMismatch(
 )
 ```
 
-**NamespaceMismatch — REQUIRED fields:**
+**NamespaceMismatch: REQUIRED fields:**
 
 ```python
 raise BadRequest(
@@ -431,7 +431,7 @@ raise BadRequest(
 )
 ```
 
-**FilterValidation — REQUIRED fields:**
+**FilterValidation: REQUIRED fields:**
 
 ```python
 raise BadRequest(
@@ -439,13 +439,13 @@ raise BadRequest(
     details={
         "operator": "$regex",        # REQUIRED
         "field": "title",           # REQUIRED
-        "supported": ["$in"],       # REQUIRED — array of supported operators
+        "supported": ["$in"],       # REQUIRED: array of supported operators
         "namespace": "docs"         # REQUIRED
     }
 )
 ```
 
-**ModelNotAvailable — REQUIRED fields:**
+**ModelNotAvailable: REQUIRED fields:**
 
 ```python
 raise ModelNotAvailable(
@@ -457,19 +457,19 @@ raise ModelNotAvailable(
 )
 ```
 
-**IndexNotReady — REQUIRED fields:**
+**IndexNotReady: REQUIRED fields:**
 
 ```python
 raise IndexNotReady(
     "index not ready (no data in namespace)",
-    retry_after_ms=500,  # REQUIRED — MUST provide retry hint
+    retry_after_ms=500,  # REQUIRED: MUST provide retry hint
     details={
         "namespace": "docs"  # REQUIRED
     }
 )
 ```
 
-**TextTooLong — REQUIRED fields:**
+**TextTooLong: REQUIRED fields:**
 
 ```python
 raise TextTooLong(
@@ -483,7 +483,7 @@ raise TextTooLong(
 
 **RULE:** Every error MUST include ALL required detail fields shown above. Conformance tests verify these exact field names and presence.
 
-### 4.4 Retry Semantics — MANDATORY
+### 4.4 Retry Semantics: MANDATORY
 
 | Error Class | Retryable | Condition |
 |-------------|-----------|-----------|
@@ -554,7 +554,7 @@ Base classes call `_fail_if_expired(ctx)` before your `_do_*` method:
 
 **You do not need to implement this. Base does it.**
 
-### 6.2 Deadline Propagation — YOU MUST DO THIS
+### 6.2 Deadline Propagation: YOU MUST DO THIS
 
 ```python
 async def _do_complete(self, request, *, ctx=None):
@@ -575,7 +575,7 @@ async def _do_complete(self, request, *, ctx=None):
 
 ---
 
-## 7. LLM ADAPTER — IMPLEMENTATION REQUIREMENTS
+## 7. LLM ADAPTER: IMPLEMENTATION REQUIREMENTS
 
 ### 7.1 Required Methods
 
@@ -587,25 +587,25 @@ from corpus_sdk.llm.types import (
 
 class MyLLMAdapter(BaseLLMAdapter):
     async def _do_capabilities(self) -> LLMCapabilities:
-        """REQUIRED - Describe your models and features."""
+        """REQUIRED: Describe your models and features."""
         
     async def _do_complete(self, request, *, ctx=None) -> LLMCompletion:
-        """REQUIRED - Unary completion."""
+        """REQUIRED: Unary completion."""
         
     async def _do_stream(self, request, *, ctx=None) -> AsyncIterator[LLMChunk]:
-        """REQUIRED - Streaming completion."""
+        """REQUIRED: Streaming completion."""
         
     async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
-        """REQUIRED - Accurate token counting."""
+        """REQUIRED: Accurate token counting."""
         
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        """REQUIRED - Health check."""
+        """REQUIRED: Health check."""
 ```
 
-### 7.2 Shared Planning Path — COMPLETE and STREAM — MANDATORY
+### 7.2 Shared Planning Path: COMPLETE and STREAM: MANDATORY
 
 ```python
-# ❌ WRONG - Separate logic causes mismatched output
+# ❌ WRONG: Separate logic causes mismatched output
 async def _do_complete(self, request, *, ctx=None):
     return "Hello"  # Stream returns different text ❌
 
@@ -614,7 +614,7 @@ async def _do_stream(self, request, *, ctx=None):
     yield "e"
     yield "llo"  # Different from complete ❌
 
-# ✅ CORRECT - Single planning function for both
+# ✅ CORRECT: Single planning function for both
 def _plan_response(self, request) -> Tuple[str, str, List[ToolCall]]:
     """Single source of truth for both complete() and stream()."""
     # Deterministic logic based ONLY on request + ctx
@@ -634,7 +634,7 @@ async def _do_stream(self, request, *, ctx=None):
 
 **RULE:** The text returned by `_do_complete()` MUST be identical to the concatenated text streamed by `_do_stream()` for the same request. Conformance tests verify this.
 
-### 7.3 Tool Calling — Validation and Accounting — MANDATORY
+### 7.3 Tool Calling: Validation and Accounting: MANDATORY
 
 ```python
 def _validate_tool_choice(self, tool_choice, tools):
@@ -668,9 +668,9 @@ def _validate_tool_choice(self, tool_choice, tools):
             )
 ```
 
-**RULE:** You MUST validate `tool_choice` against available tools. Do not rely on provider to reject. Do not make strictness configurable — choose one behavior and document it.
+**RULE:** You MUST validate `tool_choice` against available tools. Do not rely on provider to reject. Do not make strictness configurable: choose one behavior and document it.
 
-### 7.4 Token Counting & Usage Accounting — TOOL CALLS — MANDATORY
+### 7.4 Token Counting & Usage Accounting: TOOL CALLS: MANDATORY
 
 ```python
 def _calculate_usage(self, prompt_text: str, completion: LLMCompletion) -> TokenUsage:
@@ -720,11 +720,11 @@ def _calculate_usage(self, prompt_text: str, completion: LLMCompletion) -> Token
 
 **RULE:** If your provider returns tool calls with zero completion tokens, you MUST synthesize usage from the tool call payload. Tool-calling turns MUST report non-zero `completion_tokens`.
 
-### 7.5 Stop Sequences — FIRST Occurrence Rule — MANDATORY
+### 7.5 Stop Sequences: FIRST Occurrence Rule: MANDATORY
 
 ```python
 def _apply_stop_sequences(self, text: str, stop_sequences: List[str]) -> str:
-    """Apply stop sequences - cut at FIRST occurrence."""
+    """Apply stop sequences: cut at FIRST occurrence."""
     if not stop_sequences:
         return text
     
@@ -743,7 +743,7 @@ def _apply_stop_sequences(self, text: str, stop_sequences: List[str]) -> str:
 
 **RULE:** Stop sequences MUST cut at the FIRST occurrence of ANY stop sequence. Do not cut at the last occurrence. Do not include the stop sequence itself in the output.
 
-### 7.6 Streaming Rules — Tool Calls — MANDATORY
+### 7.6 Streaming Rules: Tool Calls: MANDATORY
 
 ```python
 async def _do_stream(self, request, *, ctx=None):
@@ -804,7 +804,7 @@ async def _do_stream(self, request, *, ctx=None):
 - MUST NOT emit tool calls incrementally
 - MUST NOT emit tool calls in non-final chunks
 
-### 7.7 Capabilities Enforcement — Operation Coupling — MANDATORY
+### 7.7 Capabilities Enforcement: Operation Coupling: MANDATORY
 
 ```python
 async def _do_stream(self, request, *, ctx=None):
@@ -822,26 +822,26 @@ async def _do_stream(self, request, *, ctx=None):
 
 **RULE:** If `caps.supports_X = False`, `_do_X` MUST raise `NotSupported`. Do not silently no-op. Do not implement operations advertised as unsupported.
 
-### 7.8 Role Validation — Permissive, Not Restrictive — MANDATORY
+### 7.8 Role Validation: Permissive, Not Restrictive: MANDATORY
 
 ```python
-# ✅ CORRECT - Permissive, allows future roles
+# ✅ CORRECT: Permissive, allows future roles
 ALLOWED_ROLES = {"system", "user", "assistant", "tool", "function", "developer"}
 
 def _validate_roles(self, messages):
-    """Validate roles - be permissive, not restrictive."""
+    """Validate roles: be permissive, not restrictive."""
     for msg in messages:
         role = msg.get("role")
         if role and role not in ALLOWED_ROLES:
             # Only reject roles the provider ACTUALLY doesn't support
             if not self._provider_supports_role(role):
                 raise BadRequest(f"role '{role}' not supported by provider")
-        # Otherwise, allow it - don't block protocol evolution
+        # Otherwise, allow it: don't block protocol evolution
 ```
 
 **RULE:** Do not hard-block roles not in your allowlist. Only reject roles your provider explicitly cannot handle. Be permissive to support future protocol extensions.
 
-### 7.9 Complete LLM Example — Production Ready
+### 7.9 Complete LLM Example: Production Ready
 
 ```python
 from typing import AsyncIterator, Dict, Any, List, Optional, Tuple
@@ -866,7 +866,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
         self._caps_cache_time = 0
         
     async def _do_capabilities(self) -> LLMCapabilities:
-        """Advertise true capabilities - never configurable at runtime."""
+        """Advertise true capabilities: never configurable at runtime."""
         return LLMCapabilities(
             server="my-llm-provider",
             version="1.0.0",
@@ -911,7 +911,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
             tool_call = self._create_tool_call(tool_name, request, ctx)
             return prompt, "", "tool_calls", [tool_call]
         
-        # Normal completion - call provider
+        # Normal completion: call provider
         timeout = self._get_timeout(ctx)
         response = self._client.complete(
             model=request.model,
@@ -993,7 +993,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
             if name:
                 return True, name
         
-        # auto/none - trigger-based
+        # auto/none: trigger-based
         last_msg = request.messages[-1] if request.messages else {}
         content = last_msg.get("content", "").lower()
         trigger = "call:" in content or "tool:" in content
@@ -1046,7 +1046,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
     # ---------- COMPLETE (Unary) ----------
     
     async def _do_complete(self, request, *, ctx=None):
-        """Unary completion - uses shared planning."""
+        """Unary completion: uses shared planning."""
         prompt, text, finish_reason, tool_calls = self._plan_response(request, ctx)
         
         # Calculate usage with tool call accounting
@@ -1096,7 +1096,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
     # ---------- STREAM ----------
     
     async def _do_stream(self, request, *, ctx=None) -> AsyncIterator[LLMChunk]:
-        """Streaming completion - uses same planning as complete()."""
+        """Streaming completion: uses same planning as complete()."""
         # Enforce capabilities
         caps = await self._do_capabilities()
         if not caps.supports_streaming:
@@ -1153,7 +1153,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
     # ---------- TOKEN COUNTING (ACCURATE, NOT APPROXIMATE) ----------
     
     async def _do_count_tokens(self, text: str, model: str, *, ctx=None):
-        """MANDATORY: Accurate token counting - NO approximations."""
+        """MANDATORY: Accurate token counting: NO approximations."""
         if model not in self._supported_models:
             raise ModelNotAvailable(f"Model '{model}' not supported")
         
@@ -1179,7 +1179,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
     # ---------- HEALTH ----------
     
     async def _do_health(self, *, ctx=None):
-        """Health check - NO ctx.attrs-driven forcing."""
+        """Health check: NO ctx.attrs-driven forcing."""
         try:
             # Real provider health check
             healthy = await self._client.health_check()
@@ -1262,7 +1262,7 @@ class ProductionLLMAdapter(BaseLLMAdapter):
 
 ---
 
-## 8. EMBEDDING ADAPTER — IMPLEMENTATION REQUIREMENTS
+## 8. EMBEDDING ADAPTER: IMPLEMENTATION REQUIREMENTS
 
 ### 8.1 Required Methods
 
@@ -1276,34 +1276,34 @@ from corpus_sdk.embedding.types import (
 
 class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     async def _do_capabilities(self) -> EmbeddingCapabilities:
-        """REQUIRED - Describe your models, limits, normalization behavior."""
+        """REQUIRED: Describe your models, limits, normalization behavior."""
         
     async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
-        """REQUIRED - Single text embedding with validation."""
+        """REQUIRED: Single text embedding with validation."""
         
     async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
-        """REQUIRED - Batch embedding with chosen failure mode."""
+        """REQUIRED: Batch embedding with chosen failure mode."""
         
     async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None) -> AsyncIterator[EmbedChunk]:
-        """REQUIRED - Streaming embedding with chosen pattern."""
+        """REQUIRED: Streaming embedding with chosen pattern."""
         
     async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
-        """REQUIRED if supports_token_counting=True - Accurate token counting."""
+        """REQUIRED if supports_token_counting=True: Accurate token counting."""
         
     async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
-        """REQUIRED - Adapter-owned stats only. NO cache metrics."""
+        """REQUIRED: Adapter-owned stats only. NO cache metrics."""
         
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        """REQUIRED - Health check."""
+        """REQUIRED: Health check."""
 ```
 
-### 8.2 Validation Placement — _do_embed MUST Validate — MANDATORY
+### 8.2 Validation Placement: _do_embed MUST Validate: MANDATORY
 
 ```python
 async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
     """MANDATORY: Validate in _do_embed, do NOT assume base validated."""
     
-    # ✅ CORRECT - Validate in _do_embed
+    # ✅ CORRECT: Validate in _do_embed
     if not isinstance(spec.text, str) or not spec.text.strip():
         raise BadRequest("text must be a non-empty string")
     
@@ -1321,7 +1321,7 @@ async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
 
 **RULE:** Every `_do_embed` MUST validate its own inputs. Do not assume base validation happened. Base validates wire format, NOT provider-specific constraints.
 
-### 8.3 Batch Failure Mode — CHOOSE ONE — MANDATORY
+### 8.3 Batch Failure Mode: CHOOSE ONE: MANDATORY
 
 **YOU MUST CHOOSE ONE of these two patterns. Document your choice. NEVER make it configurable.**
 
@@ -1368,13 +1368,13 @@ async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbed
         model=spec.model,
         total_texts=len(spec.texts),
         total_tokens=sum(e.get("tokens", 0) for e in embeddings),
-        failed_texts=failures  # REQUIRED - partial failure reporting
+        failed_texts=failures  # REQUIRED: partial failure reporting
     )
 ```
 
 ---
 
-**OPTION B: Fail-fast (All-or-nothing)**
+**OPTION B: Fail-fast (All or nothing)**
 
 ```python
 async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
@@ -1405,21 +1405,21 @@ async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbed
         model=spec.model,
         total_texts=len(spec.texts),
         total_tokens=sum(e.get("tokens", 0) for e in embeddings),
-        failed_texts=[]  # REQUIRED - empty array, not None
+        failed_texts=[]  # REQUIRED: empty array, not None
     )
 ```
 
-### 8.4 Batch Failure Mode — CONFIGURABILITY FORBIDDEN — MANDATORY
+### 8.4 Batch Failure Mode: CONFIGURABILITY FORBIDDEN: MANDATORY
 
 ```python
-# ❌ WRONG - NEVER make batch failure mode configurable
+# ❌ WRONG: NEVER make batch failure mode configurable
 class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     def __init__(self, collect_failures=True, **kwargs):  # ❌ NO
         super().__init__(**kwargs)
         self._collect_failures = collect_failures  # ❌ NO
         # Conformance tests expect deterministic behavior
 
-# ✅ CORRECT - Choose ONE, document it, remove config
+# ✅ CORRECT: Choose ONE, document it, remove config
 class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     """Production embedding adapter.
     
@@ -1434,7 +1434,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 
 **RULE:** Your adapter MUST have exactly ONE batch failure behavior. It MUST NOT be configurable at runtime. Document your choice in the class docstring.
 
-### 8.5 Truncation & Normalization — Base Owns, You Report
+### 8.5 Truncation & Normalization: Base Owns, You Report
 
 ```python
 async def _do_capabilities(self) -> EmbeddingCapabilities:
@@ -1446,25 +1446,25 @@ async def _do_capabilities(self) -> EmbeddingCapabilities:
         normalizes_at_source=False,  # Set to True ONLY if provider normalizes
     )
 
-# ✅ CORRECT - Let base handle truncation
+# ✅ CORRECT: Let base handle truncation
 # You do NOT truncate in _do_embed
 async def _do_embed(self, spec, *, ctx=None):
     # spec.text is ALREADY truncated by base if needed
     # You just generate embedding from whatever text arrives
     
-# ✅ CORRECT - Let base handle normalization
+# ✅ CORRECT: Let base handle normalization
 # Return raw vectors, base normalizes if spec.normalize=True and normalizes_at_source=False
 ```
 
 **RULE:** Do not implement truncation or normalization in `_do_embed`. Base handles both. You only report whether provider normalizes at source.
 
-### 8.6 Cache Stats Ownership — CRITICAL BOUNDARY — MANDATORY
+### 8.6 Cache Stats Ownership: CRITICAL BOUNDARY: MANDATORY
 
 ```python
 async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
     """MANDATORY: Adapter-owned stats ONLY. NO cache metrics."""
     
-    # ✅ CORRECT - Only adapter-owned metrics
+    # ✅ CORRECT: Only adapter-owned metrics
     total_ops = (
         self._stats["embed_calls"] +
         self._stats["embed_batch_calls"] +
@@ -1479,13 +1479,13 @@ async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
         total_tokens=self._stats["total_tokens_processed"],
         avg_processing_time_ms=avg_ms,
         error_count=self._stats["error_count"]
-        # ❌ NEVER include these - base owns them
+        # ❌ NEVER include these: base owns them
         # cache_hits=...  WRONG
         # cache_misses=... WRONG
-        # stream_stats=... WRONG - base owns
+        # stream_stats=... WRONG: base owns
     )
 
-# ❌ WRONG - DO NOT aggregate cache metrics
+# ❌ WRONG: DO NOT aggregate cache metrics
 def get_detailed_stats(self):
     return {
         "operations": self._stats,
@@ -1496,7 +1496,7 @@ def get_detailed_stats(self):
 
 **RULE:** `_do_get_stats()` MUST NOT include `cache_hits`, `cache_misses`, or any stream stats aggregated by base. Base owns these counters. Duplicating them causes double-counting in metrics.
 
-### 8.7 Streaming Pattern — CHOOSE ONE — MANDATORY
+### 8.7 Streaming Pattern: CHOOSE ONE: MANDATORY
 
 **YOU MUST CHOOSE ONE of these three streaming patterns. Document your choice. NEVER make it configurable.**
 
@@ -1533,7 +1533,7 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
 
 ```python
 async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
-    """STREAMING PATTERN: Progressive - partial vectors growing to full dimension."""
+    """STREAMING PATTERN: Progressive: partial vectors growing to full dimension."""
     
     dim = self._get_dimension(spec.model)
     chunk_size = max(1, dim // 3)  # Example: 3 chunks
@@ -1574,7 +1574,7 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
 
 ```python
 async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
-    """STREAMING PATTERN: Multi-vector - multiple complete vectors per chunk."""
+    """STREAMING PATTERN: Multi-vector: multiple complete vectors per chunk."""
     
     num_vectors = 3  # Example: generate 3 variations
     
@@ -1602,10 +1602,10 @@ async def _do_stream_embed(self, spec: EmbedSpec, *, ctx=None):
 
 **RULE:** Your adapter MUST implement EXACTLY ONE streaming pattern. Document which pattern in your class docstring. Do NOT make it configurable at runtime.
 
-### 8.8 Capabilities — NO RUNTIME CONFIGURATION — MANDATORY
+### 8.8 Capabilities: NO RUNTIME CONFIGURATION: MANDATORY
 
 ```python
-# ❌ WRONG - NEVER make core capabilities configurable
+# ❌ WRONG: NEVER make core capabilities configurable
 class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     def __init__(
         self,
@@ -1617,27 +1617,27 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
         self.supports_batch = supports_batch  # ❌ NO
         self.supports_streaming = supports_streaming  # ❌ NO
 
-# ✅ CORRECT - Capabilities are HARDCODED based on provider
+# ✅ CORRECT: Capabilities are HARDCODED based on provider
 class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     async def _do_capabilities(self) -> EmbeddingCapabilities:
         return EmbeddingCapabilities(
             # ... other fields ...
-            supports_batch=True,      # HARDCODED - provider supports batch
-            supports_streaming=True,  # HARDCODED - provider supports streaming
+            supports_batch=True,      # HARDCODED: provider supports batch
+            supports_streaming=True,  # HARDCODED: provider supports streaming
         )
 ```
 
 **RULE:** Core capabilities (`supports_batch`, `supports_streaming`, etc.) MUST be hardcoded based on your provider's actual capabilities. Do NOT make them configurable constructor parameters.
 
-### 8.9 Token Counting — NO APPROXIMATIONS — MANDATORY
+### 8.9 Token Counting: NO APPROXIMATIONS: MANDATORY
 
 ```python
-# ❌ WRONG - NEVER use approximations
+# ❌ WRONG: NEVER use approximations
 def _approx_tokens(self, text: str) -> int:
     words = len(text.split())  # ❌ NOT ACCURATE
     return words + 2  # ❌ CONFORMANCE FAILURE
 
-# ✅ CORRECT - Use real tokenizer or provider API
+# ✅ CORRECT: Use real tokenizer or provider API
 async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
     """MANDATORY: Accurate token counting."""
     
@@ -1661,7 +1661,7 @@ def _count_tokens_sync(self, text: str, model: str) -> int:
 
 **RULE:** Token counting MUST be accurate. Word-count approximations are FOR TESTING ONLY and MUST NOT appear in production adapters.
 
-### 8.10 Complete Embedding Example — Production Ready
+### 8.10 Complete Embedding Example: Production Ready
 
 ```python
 from typing import AsyncIterator, Dict, Any, List, Optional
@@ -1692,7 +1692,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
         self._max_batch_size = 256
         self._max_text_length = 8192
         
-        # Stats - NO CACHE METRICS (base owns those)
+        # Stats: NO CACHE METRICS (base owns those)
         self._stats = {
             "embed_calls": 0,
             "embed_batch_calls": 0,
@@ -1707,7 +1707,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
     # ---------- CAPABILITIES (Hardcoded, NOT configurable) ----------
     
     async def _do_capabilities(self) -> EmbeddingCapabilities:
-        """Advertise true provider capabilities - NEVER configurable."""
+        """Advertise true provider capabilities: NEVER configurable."""
         return EmbeddingCapabilities(
             server="my-embed-provider",
             version="1.0.0",
@@ -1782,7 +1782,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
             truncated=False  # Base sets this if truncation occurred
         )
     
-    # ---------- BATCH EMBED (Collection pattern - chosen, not configurable) ----------
+    # ---------- BATCH EMBED (Collection pattern: chosen, not configurable) ----------
     
     async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
         """BATCH FAILURE MODE: Collect per-item failures, continue processing."""
@@ -1853,10 +1853,10 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
             model=spec.model,
             total_texts=len(spec.texts),
             total_tokens=total_tokens,
-            failed_texts=failures  # REQUIRED - partial failure reporting
+            failed_texts=failures  # REQUIRED: partial failure reporting
         )
     
-    # ---------- STREAM EMBED (Single-chunk pattern - chosen, not configurable) ----------
+    # ---------- STREAM EMBED (Single-chunk pattern: chosen, not configurable) ----------
     
     async def _do_stream_embed(
         self, spec: EmbedSpec, *, ctx=None
@@ -1942,7 +1942,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
             encoding = tiktoken.get_encoding("cl100k_base")
         return len(encoding.encode(text))
     
-    # ---------- STATS (NO CACHE METRICS - CRITICAL) ----------
+    # ---------- STATS (NO CACHE METRICS: CRITICAL) ----------
     
     async def _do_get_stats(self, *, ctx=None) -> EmbeddingStats:
         """MANDATORY: Adapter-owned stats ONLY. NO cache metrics."""
@@ -1955,7 +1955,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
         
         avg_ms = (self._stats["total_processing_time_ms"] / total_ops) if total_ops else 0
         
-        # ✅ CORRECT - NO cache_hits, NO cache_misses
+        # ✅ CORRECT: NO cache_hits, NO cache_misses
         return EmbeddingStats(
             total_requests=total_ops,
             total_texts=self._stats["total_texts_embedded"],
@@ -1967,7 +1967,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
     # ---------- HEALTH ----------
     
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        """Health check - NO ctx.attrs-driven forcing."""
+        """Health check: NO ctx.attrs-driven forcing."""
         try:
             healthy = await self._client.health_check()
             return {
@@ -2011,7 +2011,7 @@ class ProductionEmbeddingAdapter(BaseEmbeddingAdapter):
 
 ---
 
-## 9. VECTOR ADAPTER — IMPLEMENTATION REQUIREMENTS
+## 9. VECTOR ADAPTER: IMPLEMENTATION REQUIREMENTS
 
 ### 9.1 Required Methods
 
@@ -2026,31 +2026,31 @@ from corpus_sdk.vector.types import (
 
 class MyVectorAdapter(BaseVectorAdapter):
     async def _do_capabilities(self) -> VectorCapabilities:
-        """REQUIRED - Describe dimensions, metrics, limits."""
+        """REQUIRED: Describe dimensions, metrics, limits."""
         
     async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
-        """REQUIRED - Single vector similarity search."""
+        """REQUIRED: Single vector similarity search."""
         
     async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[QueryResult]:
-        """REQUIRED - Batch queries - ALL-OR-NOTHING atomic."""
+        """REQUIRED: Batch queries: ALL OR NOTHING atomic."""
         
     async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
-        """REQUIRED - Insert/update vectors with namespace authority enforcement."""
+        """REQUIRED: Insert/update vectors with namespace authority enforcement."""
         
     async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
-        """REQUIRED - Delete vectors - IDEMPOTENT, no error on missing."""
+        """REQUIRED: Delete vectors: IDEMPOTENT, no error on missing."""
         
     async def _do_create_namespace(self, spec: NamespaceSpec, *, ctx=None) -> NamespaceResult:
-        """REQUIRED - Create namespace with dimensions and metric."""
+        """REQUIRED: Create namespace with dimensions and metric."""
         
     async def _do_delete_namespace(self, namespace: str, *, ctx=None) -> NamespaceResult:
-        """REQUIRED - Delete namespace and all its vectors."""
+        """REQUIRED: Delete namespace and all its vectors."""
         
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        """REQUIRED - Health with per-namespace status."""
+        """REQUIRED: Health with per-namespace status."""
 ```
 
-### 9.2 Namespace Authority — Spec.namespace is Authoritative — MANDATORY
+### 9.2 Namespace Authority: Spec.namespace is Authoritative: MANDATORY
 
 ```python
 async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
@@ -2073,10 +2073,10 @@ async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
             )
     
     # ❌ NEVER silently correct mismatches
-    # v.namespace = ns  # WRONG - do not modify
+    # v.namespace = ns  # WRONG: do not modify
     
     # ❌ NEVER allow per-item namespace override
-    # Process each vector in its own namespace  # WRONG - violates spec
+    # Process each vector in its own namespace  # WRONG: violates spec
     
     # Proceed with upsert...
 ```
@@ -2100,7 +2100,7 @@ async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[Query
             )
 ```
 
-### 9.3 Include Vectors Contract — [] NOT null — MANDATORY
+### 9.3 Include Vectors Contract: [] NOT null: MANDATORY
 
 ```python
 def _render_matches(self, matches, include_vectors: bool, include_metadata: bool):
@@ -2108,7 +2108,7 @@ def _render_matches(self, matches, include_vectors: bool, include_metadata: bool
     
     rendered = []
     for match in matches:
-        # ✅ CORRECT - include_vectors=False → [] (empty list)
+        # ✅ CORRECT: include_vectors=False → [] (empty list)
         vector = match.vector
         out_vec = list(vector.vector) if include_vectors else []  # NOT None, NOT omitted
         
@@ -2130,7 +2130,7 @@ def _render_matches(self, matches, include_vectors: bool, include_metadata: bool
 
 **RULE:** When `include_vectors=False`, `Vector.vector` MUST be `[]` (empty list). Not `None`. Not omitted. Not zero-filled. Empty list is the canonical "not included" representation.
 
-### 9.4 Filter Dialect Validation — Strict, No Silent Ignore — MANDATORY
+### 9.4 Filter Dialect Validation: Strict, No Silent Ignore: MANDATORY
 
 ```python
 def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
@@ -2159,7 +2159,7 @@ def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
                         "namespace": namespace,
                         "field": field,
                         "operator": unknown_ops[0],
-                        "supported": ["$in"]  # REQUIRED - list of supported operators
+                        "supported": ["$in"]  # REQUIRED: list of supported operators
                     }
                 )
             
@@ -2168,7 +2168,7 @@ def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
                 allowed = condition["$in"]
                 if not isinstance(allowed, list):
                     raise BadRequest(
-                        "invalid '$in' operand - must be list",
+                        "invalid '$in' operand: must be list",
                         details={
                             "namespace": namespace,
                             "field": field,
@@ -2179,11 +2179,11 @@ def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
 
 **RULE:** Unknown filter operators MUST raise `BadRequest` with `supported` list in details. Do NOT silently ignore unsupported operators. Do NOT treat them as "no match".
 
-### 9.5 Batch Query Atomicity — All-or-Nothing — MANDATORY
+### 9.5 Batch Query Atomicity: All or Nothing: MANDATORY
 
 ```python
 async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[QueryResult]:
-    """MANDATORY: Batch query is ATOMIC - all or nothing."""
+    """MANDATORY: Batch query is ATOMIC: all or nothing."""
     
     # ✅ VALIDATE ALL queries FIRST
     ns_info = self._get_namespace_info(spec.namespace)
@@ -2208,26 +2208,26 @@ async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[Query
     
     return results
 
-# ❌ WRONG - Partial execution on validation failure
+# ❌ WRONG: Partial execution on validation failure
 async def _do_batch_query(self, spec, *, ctx=None):
     results = []
     for i, q in enumerate(spec.queries):
         try:
             # Validate and execute one by one
-            result = await self._do_query(q, ctx=ctx)  # WRONG - not atomic
+            result = await self._do_query(q, ctx=ctx)  # WRONG: not atomic
             results.append(result)
         except Exception:
             # Continue with remaining queries? WRONG
             continue
 ```
 
-**RULE:** Batch query is ALL-OR-NOTHING. If any query is invalid, raise error for the ENTIRE batch. Do not return partial results. Do not fall back to per-query execution.
+**RULE:** Batch query is ALL OR NOTHING. If any query is invalid, raise error for the ENTIRE batch. Do not return partial results. Do not fall back to per-query execution.
 
-### 9.6 Delete Idempotency — No Error on Missing — MANDATORY
+### 9.6 Delete Idempotency: No Error on Missing: MANDATORY
 
 ```python
 async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
-    """MANDATORY: Delete is IDEMPOTENT - no error on missing IDs."""
+    """MANDATORY: Delete is IDEMPOTENT: no error on missing IDs."""
     
     deleted = 0
     
@@ -2237,7 +2237,7 @@ async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
             if key in self._store[spec.namespace]:
                 del self._store[spec.namespace][key]
                 deleted += 1
-            # ✅ CORRECT - ID not found: continue silently, no error
+            # ✅ CORRECT: ID not found: continue silently, no error
     
     # ✅ Return deleted_count, NOT attempted_count
     return DeleteResult(
@@ -2249,7 +2249,7 @@ async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
 
 **RULE:** Delete operations MUST NOT error when IDs do not exist. Return count of ACTUAL deletions, not attempted deletions.
 
-### 9.7 Delete Parameter Rule — IDs XOR Filter — MANDATORY
+### 9.7 Delete Parameter Rule: IDs XOR Filter: MANDATORY
 
 ```python
 async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
@@ -2275,10 +2275,10 @@ async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
 
 **RULE:** Delete operations MUST accept EITHER `ids` OR `filter`, not both, not neither. This is required by conformance tests.
 
-### 9.8 Distance Metric Strings — EXACT VALUES — MANDATORY
+### 9.8 Distance Metric Strings: EXACT VALUES: MANDATORY
 
 ```python
-# ✅ CORRECT - Use exact strings from specification
+# ✅ CORRECT: Use exact strings from specification
 SUPPORTED_METRICS = ("cosine", "euclidean", "dotproduct")
 
 async def _do_capabilities(self) -> VectorCapabilities:
@@ -2287,14 +2287,14 @@ async def _do_capabilities(self) -> VectorCapabilities:
         supported_metrics=SUPPORTED_METRICS,  # EXACT strings
     )
 
-# ❌ WRONG - Non-conformant variations
-supported_metrics = ("cosine_sim", "l2", "dot")  # WRONG - will fail conformance
-supported_metrics = ("COSINE", "EUCLIDEAN", "DOT")  # WRONG - case sensitive
+# ❌ WRONG: Non-conformant variations
+supported_metrics = ("cosine_sim", "l2", "dot")  # WRONG: will fail conformance
+supported_metrics = ("COSINE", "EUCLIDEAN", "DOT")  # WRONG: case sensitive
 ```
 
 **RULE:** Distance metric strings MUST be exactly `"cosine"`, `"euclidean"`, `"dotproduct"`. No variations. Case-sensitive.
 
-### 9.9 Suggested Batch Reduction — Percentage Semantics — MANDATORY
+### 9.9 Suggested Batch Reduction: Percentage Semantics: MANDATORY
 
 ```python
 def _suggested_batch_reduction_percent(self, requested: int, maximum: int) -> Optional[int]:
@@ -2324,7 +2324,7 @@ async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
 
 **RULE:** `suggested_batch_reduction` MUST be a PERCENTAGE (0-100). Base uses this to automatically split batches. Do not return absolute numbers.
 
-### 9.10 IndexNotReady — Retry Semantics — MANDATORY
+### 9.10 IndexNotReady: Retry Semantics: MANDATORY
 
 ```python
 async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
@@ -2334,7 +2334,7 @@ async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
     if spec.namespace in self._namespaces and not self._store.get(spec.namespace):
         raise IndexNotReady(
             "index not ready (no data in namespace)",
-            retry_after_ms=500,  # REQUIRED - always provide retry hint
+            retry_after_ms=500,  # REQUIRED: always provide retry hint
             details={
                 "namespace": spec.namespace  # REQUIRED
             }
@@ -2343,7 +2343,7 @@ async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
 
 **RULE:** `IndexNotReady` MUST include `retry_after_ms`. Default 500ms if provider doesn't specify. Always include `namespace` in details.
 
-### 9.11 Namespace Mismatch Error Details — CANONICAL SHAPE — MANDATORY
+### 9.11 Namespace Mismatch Error Details: CANONICAL SHAPE: MANDATORY
 
 ```python
 raise BadRequest(
@@ -2357,7 +2357,7 @@ raise BadRequest(
 )
 ```
 
-### 9.12 Dimension Mismatch Error Details — CANONICAL SHAPE — MANDATORY
+### 9.12 Dimension Mismatch Error Details: CANONICAL SHAPE: MANDATORY
 
 ```python
 raise DimensionMismatch(
@@ -2372,7 +2372,7 @@ raise DimensionMismatch(
 )
 ```
 
-### 9.13 Health Response — Namespace Status — MANDATORY
+### 9.13 Health Response: Namespace Status: MANDATORY
 
 ```python
 async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
@@ -2396,7 +2396,7 @@ async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
 
 **RULE:** Vector health response MUST include per-namespace status with dimensions, metric, count, and status. This is required by conformance tests.
 
-### 9.14 Complete Vector Example — Production Ready
+### 9.14 Complete Vector Example: Production Ready
 
 ```python
 from typing import Dict, Any, List, Optional, Tuple
@@ -2414,7 +2414,7 @@ from corpus_sdk.exceptions import (
     NotSupported, ResourceExhausted
 )
 
-# EXACT metric strings - DO NOT CHANGE
+# EXACT metric strings: DO NOT CHANGE
 METRIC_COSINE = "cosine"
 METRIC_EUCLIDEAN = "euclidean"
 METRIC_DOTPRODUCT = "dotproduct"
@@ -2424,10 +2424,10 @@ SUPPORTED_METRICS = (METRIC_COSINE, METRIC_EUCLIDEAN, METRIC_DOTPRODUCT)
 class ProductionVectorAdapter(BaseVectorAdapter):
     """Production-ready vector adapter with 100% conformance.
     
-    BATCH QUERY: Atomic (all-or-nothing) - any invalid query fails entire batch.
-    DELETE: Idempotent - no error on missing IDs.
+    BATCH QUERY: Atomic (all or nothing): any invalid query fails entire batch.
+    DELETE: Idempotent: no error on missing IDs.
     NAMESPACE: Spec.namespace is authoritative; mismatches raise BadRequest.
-    FILTERS: Strict validation - unknown operators raise BadRequest.
+    FILTERS: Strict validation: unknown operators raise BadRequest.
     """
     
     def __init__(self, client, **kwargs):
@@ -2472,14 +2472,14 @@ class ProductionVectorAdapter(BaseVectorAdapter):
     async def _do_create_namespace(
         self, spec: NamespaceSpec, *, ctx=None
     ) -> NamespaceResult:
-        """Create namespace - idempotent."""
+        """Create namespace: idempotent."""
         
         if spec.distance_metric not in SUPPORTED_METRICS:
             raise NotSupported(
                 f"distance_metric must be one of: {', '.join(SUPPORTED_METRICS)}"
             )
         
-        # Idempotent - if exists, succeed
+        # Idempotent: if exists, succeed
         if spec.namespace not in self._namespaces:
             self._namespaces[spec.namespace] = _NamespaceInfo(
                 dimensions=spec.dimensions,
@@ -2494,7 +2494,7 @@ class ProductionVectorAdapter(BaseVectorAdapter):
         )
     
     async def _do_delete_namespace(self, namespace: str, *, ctx=None) -> NamespaceResult:
-        """Delete namespace - idempotent."""
+        """Delete namespace: idempotent."""
         existed = namespace in self._namespaces
         self._namespaces.pop(namespace, None)
         self._store.pop(namespace, None)
@@ -2565,12 +2565,12 @@ class ProductionVectorAdapter(BaseVectorAdapter):
             total_matches=response.total_matches
         )
     
-    # ---------- BATCH QUERY (ATOMIC - All-or-Nothing) ----------
+    # ---------- BATCH QUERY (ATOMIC: All or Nothing) ----------
     
     async def _do_batch_query(
         self, spec: BatchQuerySpec, *, ctx=None
     ) -> List[QueryResult]:
-        """MANDATORY: Batch query is ATOMIC - all or nothing."""
+        """MANDATORY: Batch query is ATOMIC: all or nothing."""
         
         # Validate namespace exists
         if spec.namespace not in self._namespaces:
@@ -2725,10 +2725,10 @@ class ProductionVectorAdapter(BaseVectorAdapter):
             failures=[]
         )
     
-    # ---------- DELETE (Idempotent - No Error on Missing) ----------
+    # ---------- DELETE (Idempotent: No Error on Missing) ----------
     
     async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
-        """MANDATORY: Delete is IDEMPOTENT - no error on missing IDs."""
+        """MANDATORY: Delete is IDEMPOTENT: no error on missing IDs."""
         
         ns = spec.namespace
         
@@ -2783,7 +2783,7 @@ class ProductionVectorAdapter(BaseVectorAdapter):
             failures=[]
         )
     
-    # ---------- FILTER VALIDATION (Strict - No Silent Ignore) ----------
+    # ---------- FILTER VALIDATION (Strict: No Silent Ignore) ----------
     
     def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
         """MANDATORY: Validate filter operators before execution."""
@@ -2820,7 +2820,7 @@ class ProductionVectorAdapter(BaseVectorAdapter):
                     allowed = condition["$in"]
                     if not isinstance(allowed, list):
                         raise BadRequest(
-                            "invalid '$in' operand - must be list",
+                            "invalid '$in' operand: must be list",
                             details={
                                 "namespace": namespace,
                                 "field": field,
@@ -2860,10 +2860,6 @@ class ProductionVectorAdapter(BaseVectorAdapter):
         }
     
     # ---------- UTILITIES ----------
-    
-    def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
-        """Implemented above."""
-        pass
     
     def _suggested_batch_reduction_percent(self, requested: int, maximum: int) -> Optional[int]:
         """PERCENTAGE reduction hint, not absolute."""
@@ -2928,7 +2924,7 @@ class _NamespaceInfo:
 
 ---
 
-## 10. GRAPH ADAPTER — IMPLEMENTATION REQUIREMENTS
+## 10. GRAPH ADAPTER: IMPLEMENTATION REQUIREMENTS
 
 ### 10.1 Required Methods
 
@@ -2947,46 +2943,46 @@ from corpus_sdk.graph.types import (
 
 class MyGraphAdapter(BaseGraphAdapter):
     async def _do_capabilities(self) -> GraphCapabilities:
-        """REQUIRED - Describe dialects, features, limits."""
+        """REQUIRED: Describe dialects, features, limits."""
     
     async def _do_query(self, spec: GraphQuerySpec, *, ctx=None) -> QueryResult:
-        """REQUIRED - Unary graph query."""
+        """REQUIRED: Unary graph query."""
     
     async def _do_stream_query(self, spec: GraphQuerySpec, *, ctx=None) -> AsyncIterator[QueryChunk]:
-        """REQUIRED - Streaming graph query."""
+        """REQUIRED: Streaming graph query."""
     
     async def _do_bulk_vertices(self, spec: BulkVerticesSpec, *, ctx=None) -> BulkVerticesResult:
-        """REQUIRED - Bulk vertex scan with pagination."""
+        """REQUIRED: Bulk vertex scan with pagination."""
     
     async def _do_batch(self, ops: List[BatchOperation], *, ctx=None) -> BatchResult:
-        """REQUIRED - Batch operations with per-op result envelopes."""
+        """REQUIRED: Batch operations with per-op result envelopes."""
     
     async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -> BatchResult:
-        """REQUIRED if supports_transaction=True - Atomic transaction."""
+        """REQUIRED if supports_transaction=True: Atomic transaction."""
     
     async def _do_traversal(self, spec: GraphTraversalSpec, *, ctx=None) -> TraversalResult:
-        """REQUIRED if supports_traversal=True - Graph traversal."""
+        """REQUIRED if supports_traversal=True: Graph traversal."""
     
     async def _do_get_schema(self, *, ctx=None) -> GraphSchema:
-        """REQUIRED if supports_schema_ops=True - Schema retrieval."""
+        """REQUIRED if supports_schema_ops=True: Schema retrieval."""
     
     async def _do_upsert_nodes(self, spec: UpsertNodesSpec, *, ctx=None) -> UpsertResult:
-        """REQUIRED - Node upsert."""
+        """REQUIRED: Node upsert."""
     
     async def _do_upsert_edges(self, spec: UpsertEdgesSpec, *, ctx=None) -> UpsertResult:
-        """REQUIRED - Edge upsert."""
+        """REQUIRED: Edge upsert."""
     
     async def _do_delete_nodes(self, spec: DeleteNodesSpec, *, ctx=None) -> DeleteResult:
-        """REQUIRED - Node delete (idempotent)."""
+        """REQUIRED: Node delete (idempotent)."""
     
     async def _do_delete_edges(self, spec: DeleteEdgesSpec, *, ctx=None) -> DeleteResult:
-        """REQUIRED - Edge delete (idempotent)."""
+        """REQUIRED: Edge delete (idempotent)."""
     
     async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        """REQUIRED - Health check."""
+        """REQUIRED: Health check."""
 ```
 
-### 10.2 Batch/Transaction Result Envelope — {ok, result} — MANDATORY
+### 10.2 Batch/Transaction Result Envelope: {ok, result}: MANDATORY
 
 ```python
 async def _do_batch(self, ops: List[BatchOperation], *, ctx=None) -> BatchResult:
@@ -2999,7 +2995,7 @@ async def _do_batch(self, ops: List[BatchOperation], *, ctx=None) -> BatchResult
             if op.op == "graph.upsert_nodes":
                 spec = UpsertNodesSpec(**op.args)
                 res = await self._do_upsert_nodes(spec, ctx=ctx)
-                # ✅ CORRECT - {ok: true, result: {...}} envelope
+                # ✅ CORRECT: {ok: true, result: {...}} envelope
                 results.append({
                     "ok": True,
                     "result": asdict(res)
@@ -3055,7 +3051,7 @@ async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -
 
 **RULE:** Batch and transaction results MUST use the `{"ok": True/False, "result": {...}, "error": ...}` envelope format. Base expects this for cache invalidation.
 
-### 10.3 Shared Op Executor — Single Kernel for Batch + Transaction — MANDATORY
+### 10.3 Shared Op Executor: Single Kernel for Batch + Transaction: MANDATORY
 
 ```python
 class MyGraphAdapter(BaseGraphAdapter):
@@ -3066,7 +3062,7 @@ class MyGraphAdapter(BaseGraphAdapter):
         ctx: Optional[OperationContext]
     ) -> List[Dict[str, Any]]:
         """
-        SHARED OP EXECUTOR - Used by BOTH batch() and transaction().
+        SHARED OP EXECUTOR: Used by BOTH batch() and transaction().
         Single source of truth for operation execution.
         """
         results = []
@@ -3136,12 +3132,12 @@ class MyGraphAdapter(BaseGraphAdapter):
         return results
     
     async def _do_batch(self, ops: List[BatchOperation], *, ctx=None) -> BatchResult:
-        """Batch - uses shared executor."""
+        """Batch: uses shared executor."""
         results = await self._execute_ops_as_envelopes(ops, ctx)
         return BatchResult(results=results)
     
     async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -> BatchResult:
-        """Transaction - uses SAME shared executor."""
+        """Transaction: uses SAME shared executor."""
         results = await self._execute_ops_as_envelopes(operations, ctx)
         
         all_ok = all(r.get("ok") for r in results)
@@ -3157,7 +3153,7 @@ class MyGraphAdapter(BaseGraphAdapter):
 
 **RULE:** You MUST use a single operation execution kernel shared between `_do_batch()` and `_do_transaction()`. Do not duplicate operation logic.
 
-### 10.4 Dialect Validation — TWO Layers — MANDATORY
+### 10.4 Dialect Validation: TWO Layers: MANDATORY
 
 ```python
 async def _do_query(self, spec: GraphQuerySpec, *, ctx=None) -> QueryResult:
@@ -3186,7 +3182,7 @@ async def _execute_ops_as_envelopes(self, ops, ctx):
             args = op.args or {}
             dialect = args.get("dialect")
             
-            # ✅ RE-VALIDATE - batch bypasses base validation
+            # ✅ RE-VALIDATE: batch bypasses base validation
             if dialect and caps.supported_query_dialects:
                 if dialect not in caps.supported_query_dialects:
                     raise NotSupported(
@@ -3201,11 +3197,11 @@ async def _execute_ops_as_envelopes(self, ops, ctx):
 
 Do not assume base validation occurred for batch operations.
 
-### 10.5 Delete Idempotency — No Error on Missing — MANDATORY
+### 10.5 Delete Idempotency: No Error on Missing: MANDATORY
 
 ```python
 async def _do_delete_nodes(self, spec: DeleteNodesSpec, *, ctx=None) -> DeleteResult:
-    """MANDATORY: Delete is IDEMPOTENT - no error on missing IDs."""
+    """MANDATORY: Delete is IDEMPOTENT: no error on missing IDs."""
     
     deleted = 0
     
@@ -3236,17 +3232,17 @@ async def _do_delete_nodes(self, spec: DeleteNodesSpec, *, ctx=None) -> DeleteRe
 
 **RULE:** Delete operations MUST NOT error when IDs do not exist. Return count of ACTUAL deletions, not attempted deletions.
 
-### 10.6 Bulk Vertices Pagination — Cursor Contract — MANDATORY
+### 10.6 Bulk Vertices Pagination: Cursor Contract: MANDATORY
 
 ```python
 async def _do_bulk_vertices(
     self, spec: BulkVerticesSpec, *, ctx=None
 ) -> BulkVerticesResult:
-    """MANDATORY: Pagination contract - cursor, has_more."""
+    """MANDATORY: Pagination contract: cursor, has_more."""
     
     total = await self._get_vertex_count(spec.namespace)
     
-    # Cursor is opaque to base - can be string offset
+    # Cursor is opaque to base: can be string offset
     start = int(spec.cursor or 0)
     end = min(start + spec.limit, total)
     
@@ -3270,9 +3266,9 @@ async def _do_bulk_vertices(
 - `next_cursor`: string when more results exist, `None` when no more
 - `has_more`: boolean indicating if more results exist
 
-Cursor format is opaque to base - can be string offset, token, etc.
+Cursor format is opaque to base: can be string offset, token, etc.
 
-### 10.7 Traversal Result Shape — Nodes, Edges, Paths — MANDATORY
+### 10.7 Traversal Result Shape: Nodes, Edges, Paths: MANDATORY
 
 ```python
 async def _do_traversal(
@@ -3327,7 +3323,7 @@ async def _do_traversal(
 
 **RULE:** Traversal result MUST include `nodes`, `relationships`, and `paths` arrays. This is required by conformance tests.
 
-### 10.8 Capabilities Enforcement — Operation Coupling — MANDATORY
+### 10.8 Capabilities Enforcement: Operation Coupling: MANDATORY
 
 ```python
 async def _do_transaction(self, operations: List[BatchOperation], *, ctx=None) -> BatchResult:
@@ -3359,10 +3355,10 @@ async def _do_traversal(self, spec: GraphTraversalSpec, *, ctx=None) -> Traversa
 
 **RULE:** If `caps.supports_X = False`, `_do_X` MUST raise `NotSupported`. Do not silently no-op.
 
-### 10.9 Capabilities — NO RUNTIME CONFIGURATION — MANDATORY
+### 10.9 Capabilities: NO RUNTIME CONFIGURATION: MANDATORY
 
 ```python
-# ❌ WRONG - NEVER make core capabilities configurable
+# ❌ WRONG: NEVER make core capabilities configurable
 class MyGraphAdapter(BaseGraphAdapter):
     def __init__(
         self,
@@ -3374,19 +3370,19 @@ class MyGraphAdapter(BaseGraphAdapter):
         self._supports_transaction = supports_transaction_ops  # ❌ NO
         self._supports_traversal = supports_traversal_ops      # ❌ NO
 
-# ✅ CORRECT - Capabilities are HARDCODED
+# ✅ CORRECT: Capabilities are HARDCODED
 class MyGraphAdapter(BaseGraphAdapter):
     async def _do_capabilities(self) -> GraphCapabilities:
         return GraphCapabilities(
             # ... other fields ...
-            supports_transaction=True,   # HARDCODED - provider supports transactions
-            supports_traversal=True,     # HARDCODED - provider supports traversal
+            supports_transaction=True,   # HARDCODED: provider supports transactions
+            supports_traversal=True,     # HARDCODED: provider supports traversal
         )
 ```
 
 **RULE:** Core capabilities MUST be hardcoded based on your provider's actual capabilities. Do NOT make them configurable constructor parameters.
 
-### 10.10 Complete Graph Example — Production Ready
+### 10.10 Complete Graph Example: Production Ready
 
 ```python
 from typing import AsyncIterator, Dict, Any, List, Optional
@@ -3413,7 +3409,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
     """Production-ready graph adapter with 100% conformance.
     
     DIALECTS: Supported dialects hardcoded in capabilities.
-    DELETE: Idempotent - no error on missing IDs.
+    DELETE: Idempotent: no error on missing IDs.
     BATCH/TRANSACTION: Shared op executor with {ok, result} envelopes.
     CAPABILITIES: Hardcoded, NOT configurable at runtime.
     """
@@ -3422,7 +3418,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
         super().__init__(**kwargs)
         self._client = client
         
-        # HARDCODED capabilities - NOT configurable
+        # HARDCODED capabilities: NOT configurable
         self._supported_dialects = ("cypher", "opencypher")
         self._supports_stream = True
         self._supports_bulk = True
@@ -3440,7 +3436,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
     # ---------- CAPABILITIES (Hardcoded) ----------
     
     async def _do_capabilities(self) -> GraphCapabilities:
-        """Advertise true capabilities - NOT configurable."""
+        """Advertise true capabilities: NOT configurable."""
         return GraphCapabilities(
             server="my-graph-provider",
             version="1.0.0",
@@ -3661,7 +3657,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
     async def _do_batch(
         self, ops: List[BatchOperation], *, ctx=None
     ) -> BatchResult:
-        """Batch operations - uses shared executor."""
+        """Batch operations: uses shared executor."""
         
         caps = await self._do_capabilities()
         if not caps.supports_batch:
@@ -3675,7 +3671,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
     async def _do_transaction(
         self, operations: List[BatchOperation], *, ctx=None
     ) -> BatchResult:
-        """Transaction - uses SAME shared executor."""
+        """Transaction: uses SAME shared executor."""
         
         caps = await self._do_capabilities()
         if not caps.supports_transaction:
@@ -3698,7 +3694,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
     async def _do_traversal(
         self, spec: GraphTraversalSpec, *, ctx=None
     ) -> TraversalResult:
-        """Graph traversal - returns nodes, edges, paths."""
+        """Graph traversal: returns nodes, edges, paths."""
         
         caps = await self._do_capabilities()
         if not caps.supports_traversal:
@@ -3831,7 +3827,7 @@ class ProductionGraphAdapter(BaseGraphAdapter):
         )
     
     async def _do_delete_nodes(self, spec: DeleteNodesSpec, *, ctx=None) -> DeleteResult:
-        """MANDATORY: Delete is IDEMPOTENT - no error on missing."""
+        """MANDATORY: Delete is IDEMPOTENT: no error on missing."""
         
         deleted = 0
         
@@ -3901,12 +3897,12 @@ class ProductionGraphAdapter(BaseGraphAdapter):
 
 ---
 
-## 11. CACHE OWNERSHIP BOUNDARY — CRITICAL
+## 11. CACHE OWNERSHIP BOUNDARY: CRITICAL
 
-### 11.1 Embedding Stats — NO Cache Metrics — MANDATORY
+### 11.1 Embedding Stats: NO Cache Metrics: MANDATORY
 
 ```python
-# ❌ WRONG - DO NOT include cache metrics in adapter stats
+# ❌ WRONG: DO NOT include cache metrics in adapter stats
 async def _do_get_stats(self, *, ctx=None):
     return {
         "total_requests": ...,
@@ -3914,7 +3910,7 @@ async def _do_get_stats(self, *, ctx=None):
         "cache_misses": self._cache_misses,  # ❌ Base owns this
     }
 
-# ✅ CORRECT - Adapter stats = provider metrics ONLY
+# ✅ CORRECT: Adapter stats = provider metrics ONLY
 async def _do_get_stats(self, *, ctx=None):
     return EmbeddingStats(
         total_requests=self._stats["total_ops"],
@@ -3928,7 +3924,7 @@ async def _do_get_stats(self, *, ctx=None):
 
 **RULE:** `_do_get_stats()` MUST NOT include `cache_hits`, `cache_misses`, or any stream stats aggregated by base. Base owns these counters. Duplicating them causes double-counting in metrics and conformance failures.
 
-### 11.2 Capabilities Caching — Allowed, With Rules — MANDATORY
+### 11.2 Capabilities Caching: Allowed, With Rules: MANDATORY
 
 ```python
 class MyLLMAdapter(BaseLLMAdapter):
@@ -3958,7 +3954,7 @@ class MyLLMAdapter(BaseLLMAdapter):
     
     async def _do_complete(self, request, *, ctx=None):
         # Use CACHED capabilities for enforcement
-        caps = await self._do_capabilities()  # Fast - uses cache
+        caps = await self._do_capabilities()  # Fast: uses cache
         
         # Enforce max_tool_calls_per_turn
         if request.tool_choice and caps.max_tool_calls_per_turn:
@@ -3973,7 +3969,7 @@ class MyLLMAdapter(BaseLLMAdapter):
 
 ---
 
-## 12. BATCH FAILURE MODE — DECISION MATRIX
+## 12. BATCH FAILURE MODE: DECISION MATRIX
 
 **YOU MUST CHOOSE ONE. DOCUMENT YOUR CHOICE. NEVER MAKE CONFIGURABLE.**
 
@@ -4003,7 +3999,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 
 ---
 
-## 13. STREAMING PATTERN — DECISION MATRIX
+## 13. STREAMING PATTERN: DECISION MATRIX
 
 **YOU MUST CHOOSE ONE. DOCUMENT YOUR CHOICE. NEVER MAKE CONFIGURABLE.**
 
@@ -4029,12 +4025,12 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 
 ---
 
-## 14. PRODUCTION HARDENING — REMOVE ALL MOCK-ONLY CODE
+## 14. PRODUCTION HARDENING: REMOVE ALL MOCK ONLY CODE
 
 ### 14.1 Patterns to DELETE Entirely
 
 ```python
-# ❌ DELETE ALL OF THESE - MOCK-ONLY, NOT FOR PRODUCTION
+# ❌ DELETE ALL OF THESE: MOCK-ONLY, NOT FOR PRODUCTION
 
 # 1. Context attribute error injection
 ctx.attrs.get("simulate_error")
@@ -4058,9 +4054,9 @@ simulate_latency = True
 await asyncio.sleep(dur_ms / 1000.0)  # Except for rate limiting
 
 # 5. Configurable capabilities
-supports_batch=True  # Constructor param - NO
-supports_streaming=True  # Constructor param - NO
-collect_failures_in_native_batch=True  # Constructor param - NO
+supports_batch=True  # Constructor param: NO
+supports_streaming=True  # Constructor param: NO
+collect_failures_in_native_batch=True  # Constructor param: NO
 
 # 6. Test/demo code
 __main__ block
@@ -4109,7 +4105,7 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 
 ---
 
-## 15. PER-DOMAIN IMPLEMENTATION CHECKLISTS
+## 15. PER DOMAIN IMPLEMENTATION CHECKLISTS
 
 ### 15.1 LLM Adapter Checklist
 
@@ -4142,7 +4138,7 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 - [ ] **Namespace authority**: `UpsertSpec.namespace` is authoritative; mismatches → BadRequest with complete details
 - [ ] **Include vectors contract**: `include_vectors=False` → `Vector.vector = []` (empty list), NOT null, NOT omitted
 - [ ] **Filter dialect validation**: Unknown operators → BadRequest with `supported` list in details; no silent ignore
-- [ ] **Batch query atomicity**: All-or-nothing; any invalid query → entire batch fails; no partial results
+- [ ] **Batch query atomicity**: All or nothing; any invalid query → entire batch fails; no partial results
 - [ ] **Delete idempotency**: No error on missing IDs; `deleted_count` = actual deletions, NOT attempts
 - [ ] **Delete parameter rule**: Must provide either `ids` OR `filter`; not both, not neither
 - [ ] **Distance metrics**: EXACT strings `"cosine"`, `"euclidean"`, `"dotproduct"`; no variations
@@ -4166,73 +4162,71 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 
 ---
 
-## 16. COMMON PITFALLS — 55+ CONFORMANCE FAILURES
+## 16. COMMON PITFALLS: 55+ CONFORMANCE FAILURES
 
 ### LLM PITFALLS (12)
 
-1. **Mismatched complete/stream output** — `_do_complete()` and `_do_stream()` return different text ❌
-2. **No tool choice validation** — Accepts `tool_choice` with unknown tool name ❌
-3. **Zero completion tokens for tool calls** — Reports 0 tokens for tool-calling turns ❌
-4. **Stop sequence at LAST occurrence** — Cuts at last occurrence instead of first ❌
-5. **Tool calls in non-final chunks** — Emits tool calls before final chunk ❌
-6. **Missing final tool call chunk** — Stream ends without tool_calls in final chunk ❌
-7. **Operation without capability** — Implements `_do_stream()` when `supports_streaming=False` ❌
-8. **Overly restrictive roles** — Rejects `tool`, `function`, `developer` roles ❌
-9. **Word-count token approximation** — Uses `len(text.split())` for token counting ❌
-10. **Configurable capabilities** — `supports_streaming` as constructor param ❌
-11. **Context attribute error injection** — Reads `ctx.attrs["simulate_error"]` ❌
-12. **Temperature simulation** — Manually duplicates/drops tokens ❌
+1. **Mismatched complete/stream output**: `_do_complete()` and `_do_stream()` return different text ❌
+2. **No tool choice validation**: Accepts `tool_choice` with unknown tool name ❌
+3. **Zero completion tokens for tool calls**: Reports 0 tokens for tool-calling turns ❌
+4. **Stop sequence at LAST occurrence**: Cuts at last occurrence instead of first ❌
+5. **Tool calls in non-final chunks**: Emits tool calls before final chunk ❌
+6. **Missing final tool call chunk**: Stream ends without tool_calls in final chunk ❌
+7. **Operation without capability**: Implements `_do_stream()` when `supports_streaming=False` ❌
+8. **Overly restrictive roles**: Rejects `tool`, `function`, `developer` roles ❌
+9. **Word-count token approximation**: Uses `len(text.split())` for token counting ❌
+10. **Configurable capabilities**: `supports_streaming` as constructor param ❌
+11. **Context attribute error injection**: Reads `ctx.attrs["simulate_error"]` ❌
+12. **Temperature simulation**: Manually duplicates/drops tokens ❌
 
 ### EMBEDDING PITFALLS (14)
 
-13. **No validation in _do_embed** — Assumes base validated non-empty string ❌
-14. **Configurable batch failure mode** — `collect_failures_in_native_batch` flag ❌
-15. **Cache stats in _do_get_stats** — Includes `cache_hits`, `cache_misses` ❌
-16. **Configurable streaming pattern** — `stream_chunk_pattern` parameter ❌
-17. **Configurable capabilities** — `supports_batch`, `supports_streaming` as constructor params ❌
-18. **Token approximation** — `_approx_tokens()` word-count hack ❌
-19. **Artificial latency** — `_sleep_random()`, `simulate_latency` flag ❌
-20. **RNG for vectors** — Seeded random for deterministic vectors ❌
-21. **Probabilistic failures** — `failure_rate`, `_random_failure()` ❌
-22. **Dummy cache** — In-memory dict cache instead of TTL cache ❌
-23. **Missing batch failure details** — Failure objects missing `index`, `code`, `message` ❌
-24. **Null failed_texts** — Returns `None` instead of empty array ❌
-25. **No model validation** — Accepts unsupported models ❌
-26. **Normalizes_at_source misreporting** — Returns normalized vectors but sets `normalizes_at_source=False` ❌
+13. **No validation in _do_embed**: Assumes base validated non-empty string ❌
+14. **Configurable batch failure mode**: `collect_failures_in_native_batch` flag ❌
+15. **Cache stats in _do_get_stats**: Includes `cache_hits`, `cache_misses` ❌
+16. **Configurable streaming pattern**: `stream_chunk_pattern` parameter ❌
+17. **Configurable capabilities**: `supports_batch`, `supports_streaming` as constructor params ❌
+18. **Token approximation**: `_approx_tokens()` word-count hack ❌
+19. **Artificial latency**: `_sleep_random()`, `simulate_latency` flag ❌
+20. **RNG for vectors**: Seeded random for deterministic vectors ❌
+21. **Probabilistic failures**: `failure_rate`, `_random_failure()` ❌
+22. **Dummy cache**: In-memory dict cache instead of TTL cache ❌
+23. **Missing batch failure details**: Failure objects missing `index`, `code`, `message` ❌
+24. **Null failed_texts**: Returns `None` instead of empty array ❌
+25. **No model validation**: Accepts unsupported models ❌
+26. **Normalizes_at_source misreporting**: Returns normalized vectors but sets `normalizes_at_source=False` ❌
 
 ### VECTOR PITFALLS (18)
 
-27. **No namespace authority** — Allows vector.namespace != spec.namespace ❌
-28. **Silent namespace correction** — Overwrites vector.namespace to match spec ❌
-29. **include_vectors=False returns null** — Returns `null` or omits field instead of `[]` ❌
-30. **Silent filter operator ignore** — Ignores unknown operators instead of raising BadRequest ❌
-31. **Missing filter error details** — No `supported` list in error details ❌
-32. **Batch query partial execution** — Continues after query failure ❌
-33. **Delete errors on missing** — Raises error when ID not found ❌
-34. **Delete count = attempted** — Reports `len(ids)` instead of actual deletions ❌
-35. **Delete accepts both ids AND filter** — No validation for mutual exclusivity ❌
-36. **Wrong metric strings** — Uses `"cosine_sim"`, `"l2"`, `"dot"` instead of canonical strings ❌
-37. **Absolute batch reduction** — Returns absolute number instead of percentage ❌
-38. **IndexNotReady missing retry_after_ms** — No retry hint provided ❌
-39. **Missing namespace in IndexNotReady details** — Omitted ❌
-40. **DimensionMismatch missing fields** — Missing `expected`, `actual`, `namespace`, `vector_id`, `index` ❌
-41. **NamespaceMismatch missing fields** — Missing `spec_namespace`, `vector_namespace`, `vector_id`, `index` ❌
-42. **Health missing namespace status** — No per-namespace metrics ❌
-43. **Context attribute failure injection** — Reads `ctx.attrs["fail"]` ❌
-44. **Environment test seeding** — `VECTOR_SEED_DEFAULT` env var ❌
+27. **No namespace authority**: Allows vector.namespace != spec.namespace ❌
+28. **Silent namespace correction**: Overwrites vector.namespace to match spec ❌
+29. **include_vectors=False returns null**: Returns `null` or omits field instead of `[]` ❌
+30. **Silent filter operator ignore**: Ignores unknown operators instead of raising BadRequest ❌
+31. **Missing filter error details**: No `supported` list in error details ❌
+32. **Batch query partial execution**: Continues after query failure ❌
+33. **Delete errors on missing**: Raises error when ID not found ❌
+34. **Delete count = attempted**: Reports `len(ids)` instead of actual deletions ❌
+35. **Delete accepts both ids AND filter**: No validation for mutual exclusivity ❌
+36. **Wrong metric strings**: Uses `"cosine_sim"`, `"l2"`, `"dot"` instead of canonical strings ❌
+37. **Absolute batch reduction**: Returns absolute number instead of percentage ❌
+38. **IndexNotReady missing retry_after_ms**: No retry hint provided ❌
+39. **Missing namespace in IndexNotReady details**: Omitted ❌
+40. **DimensionMismatch missing fields**: Missing `expected`, `actual`, `namespace`, `vector_id`, `index` ❌
+41. **NamespaceMismatch missing fields**: Missing `spec_namespace`, `vector_namespace`, `vector_id`, `index` ❌
+42. **Health missing namespace status**: No per-namespace metrics ❌
+43. **Context attribute failure injection**: Reads `ctx.attrs["fail"]` ❌
+44. **Environment test seeding**: `VECTOR_SEED_DEFAULT` env var ❌
 
 ### GRAPH PITFALLS (13)
 
-45. **Wrong batch result format** — Returns raw provider response, not `{"ok": True, "result": ...}` ❌
-46. **Duplicated batch/transaction logic** — Separate implementations for batch and transaction ❌
-47. **No dialect re-validation in batch** — Assumes base validated, skips check ❌
-48. **Delete errors on missing** — Raises error when node/edge not found ❌
-49. **Bulk vertices missing pagination fields** — No `next_cursor` or `has_more` ❌
-50. **Traversal missing paths** — Returns nodes/edges but no `paths` array ❌
-51. **Operation without capability** — Implements `_do_transaction` when `supports_transaction=False` ❌
-52. **Configurable capabilities** — `supports_transaction_ops`, `supports_traversal_ops` as constructor params ❌
-53. **Deterministic hash IDs** — Uses `_stable_int()` for ID generation ❌
-54. **Context attribute error injection** — Reads `ctx.attrs["simulate_error"]` ❌
-55. **Artificial latency** — `_sleep()` with fixed delay ❌
-
----
+45. **Wrong batch result format**: Returns raw provider response, not `{"ok": True, "result": ...}` ❌
+46. **Duplicated batch/transaction logic**: Separate implementations for batch and transaction ❌
+47. **No dialect re-validation in batch**: Assumes base validated, skips check ❌
+48. **Delete errors on missing**: Raises error when node/edge not found ❌
+49. **Bulk vertices missing pagination fields**: No `next_cursor` or `has_more` ❌
+50. **Traversal missing paths**: Returns nodes/edges but no `paths` array ❌
+51. **Operation without capability**: Implements `_do_transaction` when `supports_transaction=False` ❌
+52. **Configurable capabilities**: `supports_transaction_ops`, `supports_traversal_ops` as constructor params ❌
+53. **Deterministic hash IDs**: Uses `_stable_int()` for ID generation ❌
+54. **Context attribute error injection**: Reads `ctx.attrs["simulate_error"]` ❌
+55. **Artificial latency**: `_sleep()` with fixed delay ❌
