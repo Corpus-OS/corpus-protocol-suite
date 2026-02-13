@@ -1915,15 +1915,6 @@ Now run the official certification suite against your adapter. **Choose the sect
 ---
 
 ### 4.1 Embedding Certification
-
-**Test fixture** (`tests/conftest.py`):
-```python
-import pytest
-from adapters.hello_embedding import HelloEmbeddingAdapter
-
-@pytest.fixture
-def adapter():
-    return HelloEmbeddingAdapter(mode="thin")
 ```
 
 **Run tests:**
