@@ -1944,18 +1944,9 @@ pytest tests/embedding/test_errors.py -v
 ---
 
 ### 4.2 LLM Certification
-
-**Test fixture** (`tests/conftest.py`):
-```python
-import pytest
-from adapters.hello_llm import HelloLLMAdapter
-
-@pytest.fixture
-def adapter():
-    return HelloLLMAdapter(mode="thin")
 ```
-
 **Run tests:**
+
 ```bash
 # Test LLM protocol
 pytest tests/llm/ -v
@@ -1973,17 +1964,9 @@ pytest tests/llm/test_errors.py -v
 
 ### 4.3 Vector Certification
 
-**Test fixture** (`tests/conftest.py`):
-```python
-import pytest
-from adapters.hello_vector import HelloVectorAdapter
-
-@pytest.fixture
-def adapter():
-    return HelloVectorAdapter(mode="thin")
 ```
-
 **Run tests:**
+
 ```bash
 # Test vector protocol
 pytest tests/vector/ -v
@@ -2002,17 +1985,10 @@ pytest tests/vector/test_deadlines.py -v
 
 ### 4.4 Graph Certification
 
-**Test fixture** (`tests/conftest.py`):
-```python
-import pytest
-from adapters.hello_graph import HelloGraphAdapter
-
-@pytest.fixture
-def adapter():
-    return HelloGraphAdapter(mode="thin")
 ```
 
 **Run tests:**
+
 ```bash
 # Test graph protocol
 pytest tests/graph/ -v
