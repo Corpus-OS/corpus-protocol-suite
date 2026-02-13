@@ -1944,7 +1944,7 @@ pytest tests/embedding/test_errors.py -v
 ---
 
 ### 4.2 LLM Certification
-```
+
 **Run tests:**
 
 ```bash
@@ -1964,7 +1964,6 @@ pytest tests/llm/test_errors.py -v
 
 ### 4.3 Vector Certification
 
-```
 **Run tests:**
 
 ```bash
@@ -1984,8 +1983,6 @@ pytest tests/vector/test_deadlines.py -v
 ---
 
 ### 4.4 Graph Certification
-
-```
 
 **Run tests:**
 
