@@ -120,7 +120,7 @@ pip install redis msgpack          # Optional: for RedisDocStore
 
 ## 2. Testing Your Adapter (Certification Suite)
 
-The CORPUS certification suite ships with the SDK. You do not need to create test files or conftest.py—they are already installed with `corpus-sdk`.
+The Corpus OS certification suite ships with the SDK. You do not need to create test files or conftest.py—they are already installed with `corpus-sdk`.
 
 ### Step 1: Set Your Adapter
 
