@@ -159,7 +159,7 @@ CORPUS PROTOCOL SUITE - GOLD CERTIFIED
 
 **That's Gold certification.** Your adapter is now CORPUS-compatible.
 ---
-
+```
 ## 3. Hello World: Complete Reference Adapters
 
 This section provides **four complete, specification-compliant reference implementations**—one for each protocol. **Choose the one that matches your provider type.**
