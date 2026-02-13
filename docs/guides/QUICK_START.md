@@ -1915,9 +1915,9 @@ Now run the official certification suite against your adapter. **Choose the sect
 ---
 
 ### 4.1 Embedding Certification
-```
 
 **Run tests:**
+
 ```bash
 # Test embedding protocol only
 pytest tests/embedding/ -v
