@@ -47,7 +47,7 @@
 - [Appendix C: Debugging Production Issues](#appendix-c-debugging-production-issues)
 
 ---
-> **Prerequisite:** You have a **Gold-certified adapter** from the [Quickstart](../guides/QUICKSTART.md).  
+> **Prerequisite:** You have a **Gold-certified adapter** from the [Quickstart](../guides/QUICK_START.md).  
 > **Goal:** Expose your adapter as a production-ready HTTP service.  
 > **Time:** 20-30 minutes (depending on deployment target)
 ---
