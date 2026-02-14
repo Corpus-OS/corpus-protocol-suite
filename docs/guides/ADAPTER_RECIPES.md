@@ -1,6 +1,6 @@
 # Corpus OS Adapters Guide
 
-## From Implementation to Production: Adapter Patterns & Decisions
+### From Implementation to Production: Adapter Patterns & Decisions
 
 ---
 
