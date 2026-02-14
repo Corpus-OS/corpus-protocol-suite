@@ -154,6 +154,24 @@
 
 &nbsp;&nbsp;&nbsp;&nbsp;[9.15 Complete Vector Example (Production Ready)](#915-complete-vector-example-production-ready)
 
+&nbsp;&nbsp;&nbsp;&nbsp;[9.16 Technical Reference: Similarity & Normalization (MANDATORY)](#916-technical-reference-similarity--normalization-mandatory)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.1 Cosine Similarity Canonical Form](#9161-cosine-similarity-canonical-form)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.2 L2 Normalization Contract](#9162-l2-normalization-contract)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.3 Euclidean Distance Canonical Form](#9163-euclidean-distance-canonical-form)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.4 Dot Product Canonical Form](#9164-dot-product-canonical-form)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.5 Precision Requirements](#9165-precision-requirements)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.6 Conformance Test Vectors](#9166-conformance-test-vectors)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.7 Common Failure Patterns](#9167-common-failure-patterns)
+
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[9.16.8 Zero Vector Edge Cases (Production Safety)](#9168-zero-vector-edge-cases-production-safety)
+
 [10. GRAPH ADAPTER IMPLEMENTATION REQUIREMENTS](#10-graph-adapter-implementation-requirements)
 
 &nbsp;&nbsp;&nbsp;&nbsp;[10.1 Required Methods](#101-required-methods)
@@ -262,6 +280,7 @@ from corpus_sdk.graph.graph_base import BaseGraphAdapter
 - Handle tool call token accounting
 - Define error detail schemas per error type
 - Define response shape contracts per operation
+- Enforce mathematical precision for similarity metrics
 
 **YOU implement these. This document tells you how.**
 
@@ -2724,7 +2743,21 @@ def _validate_filter_dialect(self, filter: Optional[Dict], namespace: str):
 
 **RULE:** Unknown filter operators MUST raise `BadRequest` with `supported` list in details. Do NOT silently ignore unsupported operators. Do NOT treat them as "no match".
 
-### 9.5 Batch Query Atomicity: All or Nothing: MANDATORY
+### 9.5 Filter Operator Error Details: CANONICAL SHAPE: MANDATORY
+
+```python
+raise BadRequest(
+    "unsupported filter operator",
+    details={
+        "operator": "$regex",        # REQUIRED
+        "field": "title",           # REQUIRED
+        "supported": ["$in"],       # REQUIRED: array of supported operators
+        "namespace": "docs"         # REQUIRED
+    }
+)
+```
+
+### 9.6 Batch Query Atomicity: All or Nothing: MANDATORY
 
 ```python
 async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[QueryResult]:
@@ -2771,7 +2804,7 @@ async def _do_batch_query(self, spec: BatchQuerySpec, *, ctx=None) -> List[Query
 
 **RULE:** Batch query is ALL OR NOTHING. If any query is invalid, raise error for the ENTIRE batch. Do not return partial results. Do not fall back to per-query execution.
 
-### 9.6 Delete Idempotency: No Error on Missing: MANDATORY
+### 9.7 Delete Idempotency: No Error on Missing: MANDATORY
 
 ```python
 async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
@@ -2797,7 +2830,7 @@ async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
 
 **RULE:** Delete operations MUST NOT error when IDs do not exist. Return count of ACTUAL deletions, not attempted deletions.
 
-### 9.7 Delete Parameter Rule: IDs XOR Filter: MANDATORY
+### 9.8 Delete Parameter Rule: IDs XOR Filter: MANDATORY
 
 ```python
 async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
@@ -2823,7 +2856,7 @@ async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
 
 **RULE:** Delete operations MUST accept EITHER `ids` OR `filter`, not both, not neither. This is required by conformance tests.
 
-### 9.8 Distance Metric Strings: EXACT VALUES: MANDATORY
+### 9.9 Distance Metric Strings: EXACT VALUES: MANDATORY
 
 ```python
 # ✅ CORRECT: Use exact strings from specification
@@ -2838,7 +2871,7 @@ async def _do_capabilities(self) -> VectorCapabilities:
 
 **RULE:** Distance metric strings MUST be exactly `"cosine"`, `"euclidean"`, `"dotproduct"`. No variations. Case-sensitive.
 
-### 9.9 Suggested Batch Reduction: Percentage Semantics: MANDATORY
+### 9.10 Suggested Batch Reduction: Percentage Semantics: MANDATORY
 
 ```python
 def _suggested_batch_reduction_percent(self, requested: int, maximum: int) -> Optional[int]:
@@ -2871,7 +2904,7 @@ async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
 
 **RULE:** `suggested_batch_reduction` MUST be a PERCENTAGE (0-100). Base uses this to automatically split batches. Do not return absolute numbers.
 
-### 9.10 IndexNotReady: Retry Semantics: MANDATORY
+### 9.11 IndexNotReady: Retry Semantics: MANDATORY
 
 ```python
 async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
@@ -2891,7 +2924,7 @@ async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
 
 **RULE:** `IndexNotReady` MUST include `retry_after_ms`. Default 500ms if provider doesn't specify. Always include `namespace` in details.
 
-### 9.11 Namespace Mismatch Error Details: CANONICAL SHAPE: MANDATORY
+### 9.12 Namespace Mismatch Error Details: CANONICAL SHAPE: MANDATORY
 
 ```python
 from corpus_sdk.vector.vector_base import BadRequest
@@ -2907,7 +2940,7 @@ raise BadRequest(
 )
 ```
 
-### 9.12 Dimension Mismatch Error Details: CANONICAL SHAPE: MANDATORY
+### 9.13 Dimension Mismatch Error Details: CANONICAL SHAPE: MANDATORY
 
 ```python
 from corpus_sdk.vector.vector_base import DimensionMismatch
@@ -2924,7 +2957,7 @@ raise DimensionMismatch(
 )
 ```
 
-### 9.13 Health Response: Namespace Status: MANDATORY
+### 9.14 Health Response: Namespace Status: MANDATORY
 
 ```python
 async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
@@ -2959,7 +2992,7 @@ async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
 
 **RULE:** Vector health response MUST include per-namespace status with dimensions, metric, count, and status. This is required by conformance tests.
 
-### 9.14 Complete Vector Example (Production Ready)
+### 9.15 Complete Vector Example (Production Ready)
 
 ```python
 from typing import Dict, Any, List, Optional, Tuple
@@ -3585,6 +3618,176 @@ class _NamespaceInfo:
     dimensions: int
     distance_metric: str
 ```
+
+---
+
+### 9.16 Technical Reference: Similarity & Normalization (MANDATORY)
+
+**Why this matters:** Corpus Protocol conformance tests are mathematically sensitive. If your underlying engine uses a non-standard approximation for similarity, your adapter will fail Behavioral Conformance due to floating-point drift. This section defines the exact mathematical formulas your implementation must satisfy.
+
+---
+
+#### 9.16.1 Cosine Similarity Canonical Form
+
+When `distance_metric` is set to `"cosine"`, the similarity score `S_c` between query vector `A` and document vector `B` **must** resolve to:
+
+```
+S_c(A, B) = (A · B) / (||A||₂ × ||B||₂)
+```
+
+Where:
+- `A · B` = Σᵢ (Aᵢ × Bᵢ)  (dot product)
+- `||A||₂` = √(Σᵢ Aᵢ²)      (L2 norm)
+
+**Critical implementation rules:**
+- If your provider returns **distance** (e.g., `1 - cosine_similarity`), you **must** convert to similarity before returning: `similarity = 1 - distance`
+- If your provider returns **angular distance** (`cosine_distance = 1 - cosine_similarity`), apply same conversion
+- If your provider returns **cosine similarity** directly, pass through unchanged
+- Never return raw dot product unless vectors are pre-normalized (see §9.16.2)
+- If `||A||₂ = 0` or `||B||₂ = 0`, return `0.0` (prevents division by zero)
+
+**Verification test case:**
+```python
+A = [1.0, 0.0, 0.0]
+B = [0.0, 1.0, 0.0]
+# Expected cosine similarity: 0.0 (orthogonal vectors)
+```
+
+---
+
+#### 9.16.2 L2 Normalization Contract
+
+If your adapter reports `normalizes_at_source = True` in capabilities, the resulting vector `v̂` **must** be the unit vector of `v`, calculated as:
+
+```
+v̂ = v / ||v||₂
+```
+
+Where:
+- `||v||₂` = √(Σᵢ vᵢ²)
+- If `||v||₂ = 0`, return zero vector (all components 0.0)
+
+**Critical implementation rules:**
+- Normalization **must** happen at the provider level before Corpus receives the vector
+- If your provider does **not** normalize at source, set `normalizes_at_source = False` and let the base class handle normalization
+- **Never** apply normalization twice (provider + base) as this distorts results and moves vectors off the unit sphere
+- Never use L1 normalization (Σ|vᵢ|) as a substitute
+
+**Verification test case:**
+```python
+v = [3.0, 4.0]           # L2 norm = 5.0
+v_hat = [0.6, 0.8]       # Expected normalized vector
+```
+
+---
+
+#### 9.16.3 Euclidean Distance Canonical Form
+
+When `distance_metric` is set to `"euclidean"`, the distance `D_e` between vectors **must** be:
+
+```
+D_e(A, B) = √(Σᵢ (Aᵢ - Bᵢ)²)
+```
+
+This is the **magnitude of the difference vector**: `||A - B||₂`.
+
+**Critical implementation rules:**
+- Return **distance**, not squared distance
+- Never return negative distances (results are always ≥ 0)
+- For zero vectors, distance = norm of the other vector: `D_e(0, B) = ||B||₂`
+
+**Verification test case:**
+```python
+A = [1.0, 0.0, 0.0]
+B = [0.0, 1.0, 0.0]
+# Difference vector = [1, -1, 0]
+# Sum of squares = 1² + (-1)² + 0² = 2
+# Expected Euclidean distance = √2 ≈ 1.4142135623730951
+```
+
+---
+
+#### 9.16.4 Dot Product Canonical Form
+
+When `distance_metric` is set to `"dotproduct"`, the score `S_d` **must** be:
+
+```
+S_d(A, B) = Σᵢ (Aᵢ × Bᵢ)
+```
+
+**Critical implementation rules:**
+- Dot product assumes vectors are already appropriately scaled
+- If your provider returns cosine similarity when dot product is requested, this **will** fail conformance
+- Dot product can be negative; this is expected behavior
+- No clamping required (range is (-∞, +∞))
+
+---
+
+#### 9.16.5 Precision Requirements
+
+| Requirement | Value | Consequence if violated |
+|-------------|-------|------------------------|
+| **Floating Point Precision** | FP32 (single precision) minimum during calculation | Score drift > 0.0001 causes conformance failure |
+| **Score Range - Cosine** | Clamp to `[-1.0, 1.0]` | Overflow errors in wire handler |
+| **Score Range - Euclidean** | Clamp to `[0.0, +∞)` | Negative distances break downstream systems |
+| **Score Range - Dot Product** | No clamping (can be any float) | N/A |
+| **Zero Vector Handling - Cosine** | Return `0.0` | Division by zero errors |
+| **Zero Vector Handling - Normalization** | Return zero vector (all zeros) | Division by zero errors |
+| **Zero Vector Handling - Euclidean** | Return `||other||₂` | Incorrect distance calculations |
+
+---
+
+#### 9.16.6 Conformance Test Vectors
+
+Use these known inputs/outputs to validate your implementation **before** running the full conformance suite:
+
+| Test Case | Input A | Input B | Expected Cosine | Expected Euclidean | Expected Dot |
+|-----------|---------|---------|-----------------|-------------------|--------------|
+| Orthogonal | `[1,0,0]` | `[0,1,0]` | `0.0` | `√2 ≈ 1.41421356` | `0.0` |
+| Identical | `[1,2,3]` | `[1,2,3]` | `1.0` | `0.0` | `14.0` |
+| Opposite | `[1,0,0]` | `[-1,0,0]` | `-1.0` | `2.0` | `-1.0` |
+| Zero A | `[0,0,0]` | `[1,0,0]` | `0.0` | `1.0` | `0.0` |
+| Zero B | `[1,0,0]` | `[0,0,0]` | `0.0` | `1.0` | `0.0` |
+| Zero Both | `[0,0,0]` | `[0,0,0]` | `0.0` | `0.0` | `0.0` |
+| Scaled | `[2,0,0]` | `[1,0,0]` | `1.0` | `1.0` | `2.0` |
+
+**Implementation verification:** If your adapter passes these seven test cases with precision < 0.0001 drift, you have satisfied the mathematical requirements of the protocol.
+
+---
+
+#### 9.16.7 Common Failure Patterns
+
+| Pattern | Symptom | Root Cause |
+|---------|---------|------------|
+| **Distance instead of similarity** | Cosine scores always ≤ 0 or inverted | Returning `1 - cosine_similarity` or `cosine_distance` without conversion to similarity |
+| **Squared distance** | Euclidean scores too large | Returning Σ(Aᵢ - Bᵢ)² without square root |
+| **L1 normalization** | Vectors not unit length | Using Σ\|vᵢ\| instead of √(Σvᵢ²) |
+| **Unclamped cosine** | Scores > 1.0 or < -1.0 | Floating-point accumulation drift beyond [-1.0, 1.0] |
+| **Provider-side double normalization** | Scores slightly off (0.0001 drift) | Provider normalizes AND base normalizes (moves vectors off unit sphere) |
+| **Zero vector division** | Runtime crashes or NaN | Not handling `||v||₂ = 0` case before division |
+| **Dot product as cosine** | Scores always between -1 and 1 | Returning `dot(A,B)` when vectors aren't normalized, or returning cosine when dot requested |
+| **Incorrect difference vector** | Euclidean distances wrong | Using `A + B` instead of `A - B`, or missing square root |
+
+**If your conformance tests fail by < 0.001:** Check floating-point precision and clamping first. These tiny drifts are almost always precision issues, not logic errors. The most common culprit is **double normalization**—verify your provider isn't normalizing when `normalizes_at_source = True`.
+
+---
+
+#### 9.16.8 Zero Vector Edge Cases (Production Safety)
+
+Zero vectors occur in production (empty documents, failed embeddings, corrupted data). Your adapter **must** handle them gracefully:
+
+| Scenario | Required Behavior |
+|----------|-------------------|
+| **Query vector is zero, document non-zero** (cosine) | Return 0.0 (cannot determine angle) |
+| **Document vector is zero, query non-zero** (cosine) | Return 0.0 |
+| **Both vectors zero** (cosine) | Return 0.0 |
+| **Normalizing zero vector** | Return zero vector `[0.0, ..., 0.0]` |
+| **Query zero, document non-zero** (euclidean) | Return `||document||₂` |
+| **Document zero, query non-zero** (euclidean) | Return `||query||₂` |
+| **Both zero** (euclidean) | Return 0.0 |
+| **Dot product with zero vector** | Return 0.0 |
+
+**Production rule:** Never throw an exception, crash, or return NaN for zero vectors. The system must remain operational even with garbage inputs.
 
 ---
 
@@ -5139,6 +5342,8 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 - [ ] **Error detail schemas**: DimensionMismatch, NamespaceMismatch include ALL required fields (expected, actual, namespace, vector_id, index)
 - [ ] **NO mock patterns**: No `ctx.attrs`, no RNG, no `failure_rate`, no `_sleep()`, no `VECTOR_SEED_*`
 - [ ] **Error imports**: Import error classes from `corpus_sdk.vector.vector_base`
+- [ ] **Mathematical precision**: Passes all 7 test vectors with < 0.0001 drift; handles zero vectors without errors
+- [ ] **Normalization flag**: `normalizes_at_source` correctly reflects provider behavior; no double normalization
 
 ### 15.4 Graph Adapter Checklist
 
@@ -5212,21 +5417,26 @@ hashlib.sha256(repr(obj).encode()).hexdigest()
 45. **Context attribute failure injection**: Reads `ctx.attrs["fail"]` ❌
 46. **Environment test seeding**: `VECTOR_SEED_DEFAULT` env var ❌
 47. **Wrong error imports**: Imports from non-existent `corpus_sdk.vector.exceptions` ❌
+48. **Cosine similarity math**: Returns `1 - cosine_distance` incorrectly ❌
+49. **Euclidean squared distance**: Returns Σ(Aᵢ - Bᵢ)² without square root ❌
+50. **Double normalization**: `normalizes_at_source=True` but base normalizes again ❌
+51. **Zero vector division**: Crashes on zero vector input ❌
+52. **Unclamped cosine scores**: Returns values outside [-1.0, 1.0] ❌
 
 ### GRAPH PITFALLS
 
-48. **Wrong batch result format**: Returns raw provider response, not `{"ok": True, "result": ...}` ❌
-49. **Duplicated batch/transaction logic**: Separate implementations for batch and transaction ❌
-50. **No dialect re-validation in batch**: Assumes base validated, skips check ❌
-51. **Delete errors on missing**: Raises error when node/edge not found ❌
-52. **Bulk vertices missing pagination fields**: No `next_cursor` or `has_more` ❌
-53. **Traversal missing paths**: Returns nodes/edges but no `paths` array ❌
-54. **Operation without capability**: Implements `_do_transaction` when `supports_transaction=False` ❌
-55. **Configurable capabilities**: `supports_transaction_ops`, `supports_traversal_ops` as constructor params ❌
-56. **Deterministic hash IDs**: Uses `_stable_int()` for ID generation ❌
-57. **Context attribute error injection**: Reads `ctx.attrs["simulate_error"]` ❌
-58. **Artificial latency**: `_sleep()` with fixed delay ❌
-59. **Wrong error imports**: Imports from non-existent `corpus_sdk.graph.exceptions` ❌
+53. **Wrong batch result format**: Returns raw provider response, not `{"ok": True, "result": ...}` ❌
+54. **Duplicated batch/transaction logic**: Separate implementations for batch and transaction ❌
+55. **No dialect re-validation in batch**: Assumes base validated, skips check ❌
+56. **Delete errors on missing**: Raises error when node/edge not found ❌
+57. **Bulk vertices missing pagination fields**: No `next_cursor` or `has_more` ❌
+58. **Traversal missing paths**: Returns nodes/edges but no `paths` array ❌
+59. **Operation without capability**: Implements `_do_transaction` when `supports_transaction=False` ❌
+60. **Configurable capabilities**: `supports_transaction_ops`, `supports_traversal_ops` as constructor params ❌
+61. **Deterministic hash IDs**: Uses `_stable_int()` for ID generation ❌
+62. **Context attribute error injection**: Reads `ctx.attrs["simulate_error"]` ❌
+63. **Artificial latency**: `_sleep()` with fixed delay ❌
+64. **Wrong error imports**: Imports from non-existent `corpus_sdk.graph.exceptions` ❌
 
 ---
 
