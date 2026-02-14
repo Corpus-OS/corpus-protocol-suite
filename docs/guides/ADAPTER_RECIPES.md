@@ -68,9 +68,9 @@ Copy this table and fill it out for your provider:
 | **Timeouts** | Does the SDK/client support timeouts? | Deadline propagation |
 | **Tenancy** | Multi-tenant? How is tenant identified? | Tenant hashing requirements |
 
-# Complete Error Taxonomy Reference
+## Complete Error Taxonomy Reference
 
-## 1.2 Error Taxonomy Mapping Worksheet
+### 1.2 Error Taxonomy Mapping Worksheet
 
 Before implementing error mapping, map your provider's errors using this complete reference:
 
