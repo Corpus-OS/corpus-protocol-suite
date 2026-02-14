@@ -41,6 +41,150 @@
 ### Consistency rule
 - Do not duplicate or reinterpret protocol rules here; when unsure, defer to the canonical docs
 
+# Rule Cross-Reference Index
+
+| Rule | Applies To | Key Sections |
+|------|------------|--------------|
+| **Tenant Hashing** | All domains | 3.3, 7.9, 8.10, 9.15, 10.10 |
+| **Deadline Propagation** | All domains | 3.2, 6.2, 7.9, 8.10, 9.15, 10.10 |
+| **Error Mapping** | All domains | 4.2, 7.9, 8.10, 9.15, 10.10 |
+| **Error Detail Schemas** | All domains | 4.3, 9.5, 9.12, 9.13 |
+| **Retry Semantics** | All domains | 4.4, 9.11 |
+| **Modes (thin vs standalone)** | All domains | 5.0 |
+| **Preflight Deadline Check** | All domains | 6.1 |
+| **Capabilities Caching** | All domains | 11.2 |
+| **Batch Failure Mode** | Embedding, Vector, Graph | 8.3, 8.4, 12.0 |
+| **Streaming Pattern** | LLM, Embedding, Graph | 7.6, 8.7, 10.3, 13.0 |
+| **NO Mock Patterns** | All domains | 3.4, 14.1 |
+| **NO Configurable Capabilities** | All domains | 8.8, 9.9, 10.9 |
+| **Shared Planning Path** | LLM | 7.2, 7.9 |
+| **Tool Call Validation** | LLM | 7.3, 7.9 |
+| **Tool Call Usage Accounting** | LLM | 7.4, 7.9 |
+| **Stop Sequences (FIRST occurrence)** | LLM | 7.5, 7.9 |
+| **Tool Call Streaming Rules** | LLM | 7.6, 7.9 |
+| **Capabilities Enforcement** | LLM, Graph | 7.7, 10.8 |
+| **Role Validation (Permissive)** | LLM | 7.8, 7.9 |
+| **Token Counting (No Approximations)** | LLM, Embedding | 7.4, 7.9, 8.9, 8.10 |
+| **Validation Placement (in _do_*)** | Embedding | 8.2, 8.10 |
+| **Cache Stats Ownership** | Embedding | 8.6, 8.10, 11.1 |
+| **Truncation & Normalization** | Embedding | 8.5, 8.10 |
+| **Namespace Authority** | Vector | 9.2, 9.15 |
+| **Include Vectors Contract ([] not null)** | Vector | 9.3, 9.15 |
+| **Filter Dialect Validation** | Vector | 9.4, 9.5, 9.15 |
+| **Batch Query Atomicity** | Vector | 9.6, 9.15 |
+| **Delete Idempotency** | Vector, Graph | 9.7, 9.15, 10.5, 10.10 |
+| **Delete Parameter Rule (IDs XOR Filter)** | Vector | 9.8, 9.15 |
+| **Distance Metric Strings (EXACT)** | Vector | 9.9, 9.15 |
+| **Suggested Batch Reduction (Percentage)** | Vector | 9.10, 9.15 |
+| **IndexNotReady (retry_after_ms)** | Vector | 9.11, 9.15 |
+| **Namespace Mismatch Error Details** | Vector | 9.12, 9.15 |
+| **Dimension Mismatch Error Details** | Vector | 9.13, 9.15 |
+| **Health Response (Namespace Status)** | Vector | 9.14, 9.15 |
+| **Similarity & Normalization Math** | Vector | 9.16, 9.16.1-9.16.8 |
+| **Cosine Similarity Canonical Form** | Vector | 9.16.1 |
+| **L2 Normalization Contract** | Vector | 9.16.2 |
+| **Euclidean Distance Canonical Form** | Vector | 9.16.3 |
+| **Dot Product Canonical Form** | Vector | 9.16.4 |
+| **Precision Requirements** | Vector | 9.16.5 |
+| **Conformance Test Vectors** | Vector | 9.16.6 |
+| **Zero Vector Edge Cases** | Vector | 9.16.8 |
+| **Batch/Transaction Result Envelope** | Graph | 10.2, 10.10 |
+| **Shared Op Executor** | Graph | 10.3, 10.10 |
+| **Dialect Validation (Two Layers)** | Graph | 10.4, 10.10 |
+| **Bulk Vertices Pagination** | Graph | 10.6, 10.10 |
+| **Traversal Result Shape** | Graph | 10.7, 10.10 |
+
+---
+
+## Quick Reference by Domain
+
+### LLM Adapter (Section 7)
+| Rule | Key Sections |
+|------|--------------|
+| Shared Planning Path | 7.2, 7.9 |
+| Tool Call Validation | 7.3, 7.9 |
+| Tool Call Usage Accounting | 7.4, 7.9 |
+| Stop Sequences (FIRST occurrence) | 7.5, 7.9 |
+| Tool Call Streaming Rules | 7.6, 7.9 |
+| Capabilities Enforcement | 7.7 |
+| Role Validation (Permissive) | 7.8, 7.9 |
+| Token Counting | 7.4, 7.9 |
+| Required Methods | 7.1 |
+| Complete Example | 7.9 |
+
+### Embedding Adapter (Section 8)
+| Rule | Key Sections |
+|------|--------------|
+| Required Methods | 8.1 |
+| Validation Placement | 8.2, 8.10 |
+| Batch Failure Mode | 8.3, 8.4, 12.0 |
+| Cache Stats Ownership | 8.6, 8.10, 11.1 |
+| Streaming Pattern | 8.7, 13.0 |
+| NO Configurable Capabilities | 8.8 |
+| Token Counting (No Approximations) | 8.9, 8.10 |
+| Truncation & Normalization | 8.5, 8.10 |
+| Complete Example | 8.10 |
+
+### Vector Adapter (Section 9)
+| Rule | Key Sections |
+|------|--------------|
+| Required Methods | 9.1 |
+| Namespace Authority | 9.2, 9.15 |
+| Include Vectors Contract | 9.3, 9.15 |
+| Filter Dialect Validation | 9.4, 9.5, 9.15 |
+| Batch Query Atomicity | 9.6, 9.15 |
+| Delete Idempotency | 9.7, 9.15 |
+| Delete Parameter Rule | 9.8, 9.15 |
+| Distance Metric Strings | 9.9, 9.15 |
+| Suggested Batch Reduction | 9.10, 9.15 |
+| IndexNotReady | 9.11, 9.15 |
+| Namespace Mismatch Error Details | 9.12, 9.15 |
+| Dimension Mismatch Error Details | 9.13, 9.15 |
+| Health Response | 9.14, 9.15 |
+| Complete Example | 9.15 |
+| Similarity & Normalization | 9.16 |
+| Cosine Similarity | 9.16.1 |
+| L2 Normalization | 9.16.2 |
+| Euclidean Distance | 9.16.3 |
+| Dot Product | 9.16.4 |
+| Precision Requirements | 9.16.5 |
+| Conformance Test Vectors | 9.16.6 |
+| Zero Vector Edge Cases | 9.16.8 |
+
+### Graph Adapter (Section 10)
+| Rule | Key Sections |
+|------|--------------|
+| Required Methods | 10.1 |
+| Batch/Transaction Result Envelope | 10.2, 10.10 |
+| Shared Op Executor | 10.3, 10.10 |
+| Dialect Validation (Two Layers) | 10.4, 10.10 |
+| Delete Idempotency | 10.5, 10.10 |
+| Bulk Vertices Pagination | 10.6, 10.10 |
+| Traversal Result Shape | 10.7, 10.10 |
+| Capabilities Enforcement | 10.8 |
+| NO Configurable Capabilities | 10.9 |
+| Complete Example | 10.10 |
+
+---
+
+## Anti-Pattern Quick Reference
+
+| Anti-Pattern | Forbidden In | Key Warning Sections |
+|--------------|--------------|----------------------|
+| `ctx.attrs` for operational logic | All domains | 3.4, 14.1 |
+| RNG / probabilistic failures | All domains | 3.4, 14.1 |
+| Configurable capabilities | All domains | 8.8, 9.9, 10.9 |
+| Cache stats in `_do_get_stats` | Embedding | 8.6, 11.1 |
+| Token counting approximations | LLM, Embedding | 7.4, 8.9 |
+| Silent filter operator ignore | Vector | 9.4 |
+| Delete errors on missing | Vector, Graph | 9.7, 10.5 |
+| Null instead of `[]` for vectors | Vector | 9.3 |
+| Mismatched complete/stream output | LLM | 7.2 |
+| Tool calls in non-final chunks | LLM | 7.6 |
+| Zero completion tokens for tool calls | LLM | 7.4 |
+| Double normalization | Vector | 9.16.2 |
+| Zero vector division | Vector | 9.16.8 |
+
 ---
 **TABLE OF CONTENTS**
 
