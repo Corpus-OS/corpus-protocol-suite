@@ -1,4 +1,4 @@
-# corpus_sdk/examples/vector/mock_vector_adapter.py
+# tests/vector/mock_vector_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Mock Vector adapter used in Corpus SDK example scripts.
