@@ -1,1402 +1,1366 @@
-# Adapter Recipes
+# Corpus OS Adapters Guide
+
+## From Implementation to Production: Adapter Patterns & Decisions
+
+---
 
 **Table of Contents**
-- [0. How to Use This File](#0-how-to-use-this-file)
-- [1. LLM Adapter Recipes](#1-llm-adapter-recipes)
-- [2. Embedding Adapter Recipes](#2-embedding-adapter-recipes)
-- [3. Vector Adapter Recipes](#3-vector-adapter-recipes)
-- [4. Graph Adapter Recipes](#4-graph-adapter-recipes)
-- [5. Cross-Cutting Recipes](#5-cross-cutting-recipes)
-- [6. "Real-ish" Provider: Multiple Adapters, Shared Pieces](#6-real-ish-provider-multiple-adapters-shared-pieces)
-- [7. Choosing the Right Recipe](#7-choosing-the-right-recipe)
-- [8. Next Steps](#8-next-steps)
+- [0. How to Use This Guide](#0-how-to-use-this-guide)
+- [1. Before You Write Code: Provider Assessment](#1-before-you-write-code-provider-assessment)
+- [2. Batch Failure Mode: The First Critical Choice](#2-batch-failure-mode-the-first-critical-choice)
+- [3. Streaming Pattern: Matching Provider Reality](#3-streaming-pattern-matching-provider-reality)
+- [4. Error Mapping Strategies by Provider Type](#4-error-mapping-strategies-by-provider-type)
+- [5. Provider-Specific Migration Paths](#5-provider-specific-migration-paths)
+- [6. Multi-Tenancy Deep Dive](#6-multi-tenancy-deep-dive)
+- [7. Deadline Propagation Patterns](#7-deadline-propagation-patterns)
+- [8. Cache Ownership Explained](#8-cache-ownership-explained)
+- [9. Idempotency Implementation Patterns](#9-idempotency-implementation-patterns)
+- [10. Provider SDK Integration Patterns](#10-provider-sdk-integration-patterns)
+- [11. Rate Limit Handling Deep Dive](#11-rate-limit-handling-deep-dive)
+- [12. Operational Patterns](#12-operational-patterns)
+- [13. Troubleshooting by Symptom](#13-troubleshooting-by-symptom)
+- [14. Decision Matrix Quick Reference](#14-decision-matrix-quick-reference)
+- [Appendix A: Provider Assessment Worksheet](#appendix-a-provider-assessment-worksheet)
 
 ---
 
-> **Goal:** Give adapter authors copy-pasteable patterns for real-world adapters.  
-> **Audience:** People who finished `Quickstart` and now want "how do I do X with my provider?".
+> **Goal:** Help you make the right implementation choices for YOUR specific provider.  
+> **Audience:** Developers who have read the [Quick Start](/docs/guides/quick_start.md) and [Implementation Guide](/docs/guides/implementation.md) and now need to build production adapters.
 
-**Read these *also*:**
-
-- `QUICK_START.md` — hello world Embedding adapter
-- `IMPLEMENTATION.md` — full runtime semantics & base class behavior
-- `BEHAVIORAL_CONFORMANCE.md` — normative behavioral rules
-- `SCHEMA_CONFORMANCE.md` — JSON schemas & wire shapes
+**This is a decision guide, not a reference.** For exhaustive rules and requirements, see:
+- [Quick Start](/docs/guides/quick_start.md) — Hello world, certification process, reference implementations
+- [Implementation Guide](/docs/guides/implementation.md) — All rules, all requirements, all edge cases
 
 ---
 
-## 0. How to Use This File
+## 0. How to Use This Guide
 
-Each section is a **recipe**:
+Each section helps you **choose** between valid patterns based on your provider's actual behavior. You'll leave with:
 
-- **Pick** the component you care about (LLM / Embedding / Vector / Graph)
-- **Copy** the closest recipe into your repo
-- **Replace** the fake provider client / error types with your real ones
-- **Run** the conformance tests and fix anything they complain about
+- A clear set of decisions about your adapter's architecture
+- Provider-specific migration guidance
+- Operational patterns for running in production
+- A troubleshooting reference for common issues
 
-Conventions:
-
-- All adapters subclass:
-  - `BaseLLMAdapter`
-  - `BaseEmbeddingAdapter`
-  - `BaseVectorAdapter`
-  - `BaseGraphAdapter`
-- We always use **canonical error types** (e.g. `BadRequest`, `AuthError`, `ResourceExhausted`, …)
-- Example provider types are placeholders (`MyProvider*`, `AcmeClient`, etc.)
+**What this guide is NOT:**
+- ❌ Another code reference (see Quick Start for that)
+- ❌ An exhaustive rulebook (see Implementation Guide for that)
 
 ---
 
-## 1. LLM Adapter Recipes
+## 1. Before You Write Code: Provider Assessment
 
-### 1.1 Minimal Non-Toy LLM Adapter
+**Stop.** Before writing a single line of code, answer these questions about your provider. Your answers will determine every subsequent choice.
 
-**Scenario:** Wrap a single upstream LLM with basic completion + streaming.  
-**Good for:** "I just want this thing to talk Corpus ASAP."
+> 💡 **Pro Tip:** Use the [Provider Assessment Worksheet](#appendix-a-provider-assessment-worksheet) in Appendix A to document your answers. This becomes your adapter's architecture decision record.
 
-```python
-# adapters/my_llm_adapter.py
-from typing import AsyncIterator, Dict, Any
+### 1.1 Capabilities Inventory Checklist
 
-from corpus_sdk.llm.llm_base import (
-    BaseLLMAdapter,
-    LLMCapabilities,
-    LLMCompletion,
-    LLMChunk,
-    BadRequest,
-)
+Copy this table and fill it out for your provider:
 
-# Fake provider client + errors; replace with your SDK.
-class MyProviderClient:
-    async def complete(self, *, model: str, messages, **kwargs) -> Dict[str, Any]:
-        # Pretend this hits a real upstream.
-        joined = "\n".join(m["content"] for m in messages)
-        return {"text": f"[reply to]: {joined[:80]}..."}
+| Capability | Your Provider's Behavior | Corpus Impact |
+|------------|-------------------------|----------------|
+| **Batch operations** | Does the API accept multiple items? | Determines batch failure mode (§2) |
+| **Per-item status** | On batch, does it return success/failure per item? | Collection vs fail-fast choice |
+| **Streaming** | Does it support streaming responses? How? (SSE, chunks, etc.) | Streaming pattern choice (§3) |
+| **Token counting** | Does it provide token counts? API or local tokenizer? | `supports_token_counting` flag |
+| **Normalization** | Are returned vectors already normalized? | `normalizes_at_source` flag |
+| **Idempotency** | Does it support idempotency keys? | `idempotent_writes` flag must reflect reality |
+| **Error details** | What fields appear in error responses? | Error detail mapping (§4) |
+| **Rate limits** | How are they communicated? Headers? Response body? | ResourceExhausted mapping |
+| **Authentication** | API key? OAuth? mTLS? | AuthError mapping |
+| **Timeouts** | Does the SDK/client support timeouts? | Deadline propagation |
+| **Tenancy** | Multi-tenant? How is tenant identified? | Tenant hashing requirements |
 
+### 1.2 Error Taxonomy Mapping Worksheet
 
-class MyLLMAdapter(BaseLLMAdapter):
-    def __init__(self, client: MyProviderClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
+Before implementing error mapping, map your provider's errors:
 
-    async def _do_capabilities(self) -> LLMCapabilities:
-        return LLMCapabilities(
-            server="my-llm",
-            version="1.0.0",
-            supported_models=("my-llm-1",),
-            max_context_length=8192,
-            supports_streaming=True,
-            supports_count_tokens=False,
-        )
+| Provider Error | HTTP Status | Corpus Error | Required Details |
+|----------------|-------------|--------------|------------------|
+| rate_limit_exceeded | 429 | ResourceExhausted | `retry_after_ms`, `resource_scope` |
+| invalid_api_key | 401 | AuthError | none |
+| model_not_found | 404 | ModelNotAvailable | `requested_model`, `supported_models` |
+| ... | ... | ... | ... |
 
-    async def _do_complete(self, request, *, ctx=None) -> LLMCompletion:
-        caps = await self._do_capabilities()
-        if request.model not in caps.supported_models:
-            raise BadRequest(f"unknown model '{request.model}'")
+### 1.3 Batch Operation Semantics
 
-        resp = await self._client.complete(
-            model=request.model,
-            messages=request.messages,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-        )
-
-        return LLMCompletion(
-            text=resp["text"],
-            model=request.model,
-            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        )
-
-    async def _do_stream(
-        self,
-        request,
-        *,
-        ctx=None,
-    ) -> AsyncIterator[LLMChunk]:
-        # Easiest legal streaming: one final chunk.
-        completion = await self._do_complete(request, ctx=ctx)
-        yield LLMChunk(
-            text=completion.text,
-            is_final=True,
-            model=request.model,
-        )
-
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
-        # Not used because supports_count_tokens=False
-        raise NotImplementedError
-
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        return {"ok": True, "server": "my-llm", "version": "1.0.0"}
-````
-
-Wire it with `WireLLMHandler` exactly like in the quickstart.
+| Question | If Yes → | If No → |
+|----------|----------|---------|
+| Does the API return per-item status? | Collection pattern possible | Fail-fast only |
+| Can you submit 100 items and get 98 successes? | Use collection pattern | Use fail-fast |
+| What happens on validation error? | Batch rejected entirely → fail-fast | Per-item errors → collection |
 
 ---
 
-### 1.2 LLM with Provider Token Counting & Context Limits
+## 2. Batch Failure Mode: The First Critical Choice
 
-**Scenario:** Your provider exposes `count_tokens` and has a hard context window.
-**Goal:** Reject over-long prompts *before* hitting the model.
+**This is the most important decision you'll make.** Your choice determines how your adapter behaves when some items in a batch succeed and others fail.
 
-```python
-# adapters/my_llm_with_tokens.py
-from corpus_sdk.llm.llm_base import (
-    BaseLLMAdapter,
-    LLMCapabilities,
-    LLMCompletion,
-    LLMChunk,
-    BadRequest,
-)
+### 2.1 Decision Tree
 
-class ProviderClient:
-    async def complete(self, *, model, messages, timeout=None, **kwargs):
-        ...
-    async def count_tokens(self, *, model, text, timeout=None):
-        ...
-
-class MyLLMWithTokens(BaseLLMAdapter):
-    def __init__(self, client: ProviderClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
-
-    async def _do_capabilities(self) -> LLMCapabilities:
-        return LLMCapabilities(
-            server="my-llm-with-tokens",
-            version="1.0.0",
-            supported_models=("my-llm-ctx8k",),
-            max_context_length=8192,
-            supports_streaming=True,
-            supports_count_tokens=True,  # important
-        )
-
-    async def _do_count_tokens(
-        self,
-        text: str,
-        model: str,
-        *,
-        ctx=None,
-    ) -> int:
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        resp = await self._client.count_tokens(
-            model=model,
-            text=text,
-            timeout=timeout_s,
-        )
-        return int(resp["tokens"])
-
-    async def _do_complete(self, request, *, ctx=None) -> LLMCompletion:
-        # Base class will call _do_count_tokens and enforce max_context_length.
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        resp = await self._client.complete(
-            model=request.model,
-            messages=request.messages,
-            max_tokens=request.max_tokens,
-            temperature=request.temperature,
-            timeout=timeout_s,
-        )
-
-        return LLMCompletion(
-            text=resp["text"],
-            model=request.model,
-            usage=resp.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}),
-        )
-
-    async def _do_stream(self, request, *, ctx=None):
-        # Could stream here; see 1.3 for a full example.
-        raise BadRequest("streaming not implemented yet")
-
-    async def _do_health(self, *, ctx=None):
-        return {"ok": True, "server": "my-llm-with-tokens", "version": "1.0.0"}
+```
+Start: Does your provider have a batch API?
+├─ NO → Use single-item operations (base handles batching via loop)
+│
+└─ YES → Does the provider return per-item status?
+    ├─ NO → You MUST use FAIL-FAST mode
+    │   (any error fails the entire batch)
+    │
+    └─ YES → Can you submit 100 items and get 98 successes + 2 errors?
+        ├─ NO (provider fails whole batch on any error) → FAIL-FAST
+        │
+        └─ YES → You can choose, but COLLECTION is recommended
+            (better user experience, partial success reporting)
 ```
 
----
+### 2.2 Provider Patterns by Category
 
-### 1.3 LLM Streaming Adapter (Chunked Provider Response)
+| Provider Type | Typical Behavior | Recommended Mode | Rationale |
+|--------------|------------------|------------------|-----------|
+| **Embedding APIs** (OpenAI, Cohere) | Per-item status with partial success | **Collection** | Users expect partial results when some texts fail |
+| **Vector DBs** (Pinecone, Qdrant) | Batch rejected on dimension mismatch | **Fail-fast** | Schema violations are request-level, not per-item |
+| **Graph DBs with transactions** | Atomic batches | **Fail-fast** | Transaction semantics require all-or-nothing |
+| **Graph DBs without transactions** | Per-op status | **Collection** | No atomicity guarantee, report per-op failures |
 
-**Scenario:** Provider streams tokens/chunks; you want full Corpus streaming semantics.
+### 2.3 🔴 CRITICAL: The One Rule - NEVER Make It Configurable
 
 ```python
-# adapters/my_llm_streaming.py
-from typing import AsyncIterator, Dict, Any
+# ❌ WRONG
+class MyAdapter(BaseAdapter):
+    def __init__(self, collect_failures=True):  # NO
+        self.collect_failures = collect_failures
 
-from corpus_sdk.llm.llm_base import (
-    BaseLLMAdapter,
-    LLMCapabilities,
-    LLMCompletion,
-    LLMChunk,
-    Unavailable,
-)
-
-class ProviderStreamError(Exception):
-    ...
-
-class StreamingProviderClient:
-    async def stream_complete(self, *, model, messages, timeout=None, **kwargs):
-        """
-        Yields dicts like:
-        {"text": "...", "is_final": False}
-        and one final: {"text": "...", "is_final": True}
-        """
-        ...
-
-class MyStreamingLLMAdapter(BaseLLMAdapter):
-    def __init__(self, client: StreamingProviderClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
-
-    async def _do_capabilities(self) -> LLMCapabilities:
-        return LLMCapabilities(
-            server="my-llm-streaming",
-            version="1.0.0",
-            supported_models=("my-llm-stream-1",),
-            max_context_length=8192,
-            supports_streaming=True,
-            supports_count_tokens=False,
-        )
-
-    async def _do_complete(self, request, *, ctx=None) -> LLMCompletion:
-        # Simple "gather from streaming" implementation.
-        text_parts = []
-        async for chunk in self._do_stream(request, ctx=ctx):
-            text_parts.append(chunk.text)
-        full_text = "".join(text_parts)
-        return LLMCompletion(
-            text=full_text,
-            model=request.model,
-            usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        )
-
-    async def _do_stream(
-        self,
-        request,
-        *,
-        ctx=None,
-    ) -> AsyncIterator[LLMChunk]:
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        try:
-            async for prov_chunk in self._client.stream_complete(
-                model=request.model,
-                messages=request.messages,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-                timeout=timeout_s,
-            ):
-                yield LLMChunk(
-                    text=prov_chunk.get("text", ""),
-                    is_final=bool(prov_chunk.get("is_final", False)),
-                    model=request.model,
-                )
-        except ProviderStreamError as e:
-            # Base will convert this to a canonical error envelope.
-            raise Unavailable(str(e))
-
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
-        raise NotImplementedError
-
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        return {"ok": True, "server": "my-llm-streaming", "version": "1.0.0"}
+# ✅ CORRECT
+class MyAdapter(BaseAdapter):
+    """BATCH FAILURE MODE: Collection pattern (provider returns per-item status)"""
+    # Hardcoded, documented, not configurable
 ```
 
----
+**Why:** Conformance tests expect deterministic behavior. If your adapter behaves differently based on a flag, it will fail certification in non-deterministic ways. This single rule prevents 80% of certification-related support tickets.
 
-### 1.4 LLM Error Mapping Table
-
-**Scenario:** Provider has many HTTP codes / error types; you want one *central* mapping.
+### 2.4 Documenting Your Choice
 
 ```python
-# adapters/provider_errors_llm.py
-from corpus_sdk.llm.llm_base import (
-    LLMAdapterError,
-    BadRequest,
-    AuthError,
-    ResourceExhausted,
-    Unavailable,
-    DeadlineExceeded,
-)
-
-class ProviderRateLimitError(Exception): ...
-class ProviderAuthError(Exception): ...
-class ProviderBadRequest(Exception): ...
-class ProviderTimeout(Exception): ...
-class ProviderServerError(Exception): ...
-
-def map_provider_error_llm(e: Exception) -> LLMAdapterError:
-    if isinstance(e, ProviderRateLimitError):
-        return ResourceExhausted("rate limit exceeded", retry_after_ms=5000)
-    if isinstance(e, ProviderAuthError):
-        return AuthError("invalid credentials")
-    if isinstance(e, ProviderBadRequest):
-        return BadRequest("invalid request")
-    if isinstance(e, ProviderTimeout):
-        return DeadlineExceeded("upstream timeout")
-    if isinstance(e, ProviderServerError):
-        return Unavailable("upstream server error")
-    # Fallback
-    return Unavailable("unknown provider error")
-```
-
-Usage inside your adapter:
-
-```python
-from .provider_errors_llm import map_provider_error_llm
-
-async def _do_complete(self, request, *, ctx=None):
-    try:
-        resp = await self._client.complete(...)
-    except Exception as e:
-        raise map_provider_error_llm(e)
-    ...
-```
-
----
-
-## 2. Embedding Adapter Recipes
-
-### 2.1 Single-Model Embedding with Truncation
-
-**Scenario:** Provider has a strict `max_text_length`; you want the base to handle it.
-
-```python
-# adapters/my_embedding_single.py
-from typing import Dict, Any
-
-from corpus_sdk.embedding.embedding_base import (
-    BaseEmbeddingAdapter,
-    EmbeddingCapabilities,
-    EmbedSpec,
-    BatchEmbedSpec,
-    EmbedResult,
-    BatchEmbedResult,
-    EmbeddingVector,
-    ModelNotAvailable,
-)
-
-class ProviderEmbeddingClient:
-    async def embed(self, *, model, text, timeout=None) -> Dict[str, Any]:
-        ...
-
-class MySingleModelEmbeddingAdapter(BaseEmbeddingAdapter):
-    def __init__(self, client: ProviderEmbeddingClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
-
-    async def _do_capabilities(self) -> EmbeddingCapabilities:
-        return EmbeddingCapabilities(
-            server="my-embed-single",
-            version="1.0.0",
-            supported_models=("embed-1",),
-            max_batch_size=64,
-            max_text_length=2048,  # base enforces + truncates
-            max_dimensions=768,
-            supports_normalization=True,
-            supports_truncation=True,
-            supports_token_counting=False,
-            normalizes_at_source=False,
-        )
-
-    async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
-        caps = await self._do_capabilities()
-        if spec.model not in caps.supported_models:
-            raise ModelNotAvailable(f"model '{spec.model}' is not supported")
-
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        resp = await self._client.embed(
-            model=spec.model,
-            text=spec.text,  # already truncated by base if needed
-            timeout=timeout_s,
-        )
-
-        vec = resp["vector"]
-        ev = EmbeddingVector(
-            vector=vec,
-            text=spec.text,
-            model=spec.model,
-            dimensions=len(vec),
-        )
-
-        return EmbedResult(
-            embedding=ev,
-            model=spec.model,
-            text=spec.text,
-            tokens_used=resp.get("tokens"),
-            truncated=False,  # base flips this if truncation happened
-        )
-
-    async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
-        # For simplicity, build on single-embed path.
-        embeddings = []
-        for t in spec.texts:
-            single = await self._do_embed(
-                EmbedSpec(
-                    text=t,
-                    model=spec.model,
-                    truncate=spec.truncate,
-                    normalize=False,
-                ),
-                ctx=ctx,
-            )
-            embeddings.append(single.embedding)
-
-        return BatchEmbedResult(
-            embeddings=embeddings,
-            model=spec.model,
-            total_texts=len(spec.texts),
-            total_tokens=None,
-            failed_texts=[],
-        )
-
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
-        raise NotImplementedError
-
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        return {"ok": True, "server": "my-embed-single", "version": "1.0.0"}
-```
-
----
-
-### 2.2 Multi-Model Embedding (Small + Large)
-
-**Scenario:** Two models with different limits; you want one adapter.
-
-```python
-# adapters/my_embedding_multi.py
-from dataclasses import dataclass
-
-from corpus_sdk.embedding.embedding_base import (
-    BaseEmbeddingAdapter,
-    EmbeddingCapabilities,
-    EmbedSpec,
-    EmbedResult,
-    BatchEmbedSpec,
-    BatchEmbedResult,
-    EmbeddingVector,
-    ModelNotAvailable,
-)
-
-@dataclass(frozen=True)
-class EmbeddingModelConfig:
-    name: str
-    max_text_length: int
-    dimensions: int
-
-class ProviderClient:
-    async def embed(self, *, model, text, timeout=None):
-        ...
-
-class MultiModelEmbeddingAdapter(BaseEmbeddingAdapter):
-    def __init__(self, client: ProviderClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
-        self._models = {
-            "embed-small": EmbeddingModelConfig("embed-small", max_text_length=1024, dimensions=384),
-            "embed-large": EmbeddingModelConfig("embed-large", max_text_length=4096, dimensions=1536),
-        }
-
-    async def _do_capabilities(self) -> EmbeddingCapabilities:
-        # Take the strictest (smallest) max_text_length across models, or document per-model behavior.
-        max_len = min(cfg.max_text_length for cfg in self._models.values())
-        max_dims = max(cfg.dimensions for cfg in self._models.values())
-        return EmbeddingCapabilities(
-            server="my-embed-multi",
-            version="1.0.0",
-            supported_models=tuple(self._models.keys()),
-            max_batch_size=128,
-            max_text_length=max_len,
-            max_dimensions=max_dims,
-            supports_normalization=True,
-            supports_truncation=True,
-            supports_token_counting=False,
-            normalizes_at_source=False,
-        )
-
-    def _get_model_config(self, model_name: str) -> EmbeddingModelConfig:
-        try:
-            return self._models[model_name]
-        except KeyError:
-            raise ModelNotAvailable(f"model '{model_name}' is not supported")
-
-    async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
-        cfg = self._get_model_config(spec.model)
-
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        resp = await self._client.embed(
-            model=cfg.name,
-            text=spec.text,
-            timeout=timeout_s,
-        )
-        vec = resp["vector"]
-
-        ev = EmbeddingVector(
-            vector=vec,
-            text=spec.text,
-            model=spec.model,
-            dimensions=len(vec),
-        )
-        return EmbedResult(
-            embedding=ev,
-            model=spec.model,
-            text=spec.text,
-            tokens_used=resp.get("tokens"),
-            truncated=False,
-        )
-
-    async def _do_embed_batch(self, spec: BatchEmbedSpec, *, ctx=None) -> BatchEmbedResult:
-        cfg = self._get_model_config(spec.model)
-        embeddings = []
-        for t in spec.texts:
-            single = await self._do_embed(
-                EmbedSpec(
-                    text=t,
-                    model=cfg.name,
-                    truncate=spec.truncate,
-                    normalize=False,
-                ),
-                ctx=ctx,
-            )
-            embeddings.append(single.embedding)
-
-        return BatchEmbedResult(
-            embeddings=embeddings,
-            model=cfg.name,
-            total_texts=len(spec.texts),
-            total_tokens=None,
-            failed_texts=[],
-        )
-
-    async def _do_count_tokens(self, text: str, model: str, *, ctx=None) -> int:
-        raise NotImplementedError
-
-    async def _do_health(self, *, ctx=None):
-        return {"ok": True, "server": "my-embed-multi", "version": "1.0.0"}
-```
-
----
-
-### 2.3 Batch Embedding with Native Batch API + Partial Failure
-
-```python
-# adapters/my_embedding_batch.py
-from typing import Dict, Any, List
-
-from corpus_sdk.embedding.embedding_base import (
-    BaseEmbeddingAdapter,
-    EmbeddingCapabilities,
-    BatchEmbedSpec,
-    BatchEmbedResult,
-    EmbedSpec,
-    EmbedResult,
-    EmbeddingVector,
-    EmbeddingAdapterError,
-)
-
-class ProviderBatchError(Exception):
-    """Wraps partial failures:
-    .failures: List[{"index": int, "error": Exception}]
+class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     """
-    def __init__(self, failures: List[Dict[str, Any]]):
-        self.failures = failures
+    BATCH FAILURE MODE: Collect per-item failures.
+    
+    This adapter processes all items in the batch and collects individual failures.
+    The batch operation always succeeds (HTTP 200) with partial results.
+    Failures are reported in the `failed_texts` array with:
+    - index: position in original batch
+    - text: truncated preview (first 100 chars)
+    - error: exception class name
+    - code: uppercase error code
+    - message: truncated error message
+    - metadata: original metadata if provided
+    
+    Rationale: Provider's batch API returns per-item status and supports
+    partial success. This provides the best user experience.
+    """
+```
 
-class ProviderClient:
-    async def embed_batch(self, *, model, texts, timeout=None):
-        ...
+**See also:** [Implementation Guide §8.3](/docs/guides/implementation.md#83-batch-failure-mode-choose-one-mandatory), [§12](/docs/guides/implementation.md#12-batch-failure-mode-decision-matrix)
 
-class BatchEmbeddingAdapter(BaseEmbeddingAdapter):
-    def __init__(self, client: ProviderClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
+---
 
-    async def _do_capabilities(self) -> EmbeddingCapabilities:
-        return EmbeddingCapabilities(
-            server="my-embed-batch",
-            version="1.0.0",
-            supported_models=("embed-batch-1",),
-            max_batch_size=256,
-            max_text_length=8192,
-            max_dimensions=1536,
-            supports_normalization=True,
-            supports_truncation=True,
-            supports_token_counting=False,
-            normalizes_at_source=False,
-        )
+## 3. Streaming Pattern: Matching Provider Reality
 
-    async def _do_embed(self, spec: EmbedSpec, *, ctx=None) -> EmbedResult:
-        # Used if you want fallback behavior; can be trivial.
-        batch = await self._do_embed_batch(
-            BatchEmbedSpec(
-                texts=[spec.text],
-                model=spec.model,
-                truncate=spec.truncate,
-                normalize=spec.normalize,
-            ),
-            ctx=ctx,
-        )
-        return EmbedResult(
-            embedding=batch.embeddings[0],
-            model=batch.model,
-            text=spec.text,
-            tokens_used=None,
-            truncated=False,
-        )
+**Streaming means different things for different components.** Choose the pattern that matches your provider's actual behavior.
 
-    async def _do_embed_batch(
-        self,
-        spec: BatchEmbedSpec,
-        *,
-        ctx=None,
-    ) -> BatchEmbedResult:
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
+### 3.1 Streaming by Component
 
-        try:
-            resp = await self._client.embed_batch(
-                model=spec.model,
-                texts=spec.texts,
-                timeout=timeout_s,
-            )
-        except ProviderBatchError as e:
-            # Map per-item failures; succeed others.
-            embeddings: List[EmbeddingVector] = []
-            failed = []
-            for idx, text in enumerate(spec.texts):
-                failure = next((f for f in e.failures if f["index"] == idx), None)
-                if failure:
-                    err: EmbeddingAdapterError = failure["error"]
-                    failed.append(
-                        {
-                            "index": idx,
-                            "text": text,
-                            "code": err.code,
-                            "error": err.__class__.__name__,
-                            "message": str(err),
-                        }
-                    )
-                else:
-                    # In a real integration you'd pull the vector from resp.
-                    # Here we just fake one.
-                    embeddings.append(
-                        EmbeddingVector(
-                            vector=[1.0],
-                            text=text,
-                            model=spec.model,
-                            dimensions=1,
-                        )
-                    )
+| Component | What Streaming Typically Means | Common Patterns |
+|-----------|-------------------------------|-----------------|
+| **LLM** | Token-by-token generation | Progressive (token stream) |
+| **Embedding** | Rare - most return complete vectors | Single-chunk (emulated) or Multi-vector (batch streaming) |
+| **Vector** | Not applicable | N/A (no streaming in protocol) |
+| **Graph** | Row-by-row query results | Multi-vector (row stream) |
 
-            return BatchEmbedResult(
-                embeddings=embeddings,
-                model=spec.model,
-                total_texts=len(spec.texts),
-                total_tokens=None,
-                failed_texts=failed,
-            )
+### 3.2 The Three Patterns
 
-        # Happy path: all good.
-        vectors = resp["vectors"]
-        embeddings = [
-            EmbeddingVector(
-                vector=v,
-                text=t,
-                model=spec.model,
-                dimensions=len(v),
-            )
-            for t, v in zip(spec.texts, vectors)
-        ]
-        return BatchEmbedResult(
-            embeddings=embeddings,
-            model=spec.model,
-            total_texts=len(spec.texts),
-            total_tokens=resp.get("total_tokens"),
-            failed_texts=[],
-        )
+| Pattern | Description | When To Use |
+|---------|-------------|-------------|
+| **Single-chunk** | One final chunk with complete result | Provider returns entire response at once; used to emulate streaming when provider doesn't support it |
+| **Progressive** | Partial results that build to completion | LLM token streaming, progressive inference |
+| **Multi-vector** | Multiple complete results per stream | Batch results returning one by one, graph query row streaming |
+
+### 3.3 Decision Tree: Which Pattern Fits Your Provider?
+
+```
+Start: Does your provider have a streaming API?
+├─ NO → You MUST use SINGLE-CHUNK (emulate streaming with one chunk)
+│
+└─ YES → What component are you implementing?
+    ├─ LLM → PROGRESSIVE (token stream)
+    │   Example: "Hello", " world", "!" 
+    │
+    ├─ Graph Query → MULTI-VECTOR (row stream)
+    │   Example: row 1, row 2, row 3, end
+    │
+    └─ Embedding → (Rare) What does the stream contain?
+        ├─ Complete vectors, one at a time? → MULTI-VECTOR
+        │   Example: "embedding-1", then "embedding-2"
+        │
+        └─ Partial vectors building to completion? → PROGRESSIVE
+            (Very rare - confirm your provider actually does this)
+```
+
+### 3.4 Pattern Examples by Component
+
+| Component | Pattern | Example Providers |
+|-----------|---------|-------------------|
+| **LLM** | Progressive | OpenAI stream=True, Anthropic streaming |
+| **Graph** | Multi-vector | Neo4j streaming results, SQL row streaming |
+| **Embedding** | Single-chunk (emulated) | OpenAI embeddings (non-streaming) |
+| **Embedding** | Multi-vector (rare) | Batch embedding APIs that return as ready |
+
+### 3.5 Special Case: LLM Tool Call Streaming
+
+For LLM adapters, tool calls have specific rules regardless of pattern:
+
+```python
+# Rule 1: Tool calls appear ONLY in final chunk
+if tool_calls:
+    # Non-final chunks are empty
+    yield LLMChunk(text="", is_final=False)
+    
+    # Final chunk has tool_calls
+    yield LLMChunk(
+        text="",
+        is_final=True,
+        tool_calls=tool_calls,
+        usage_so_far=final_usage
+    )
+```
+
+**See also:** [Implementation Guide §7.6](/docs/guides/implementation.md#76-streaming-rules-tool-calls-mandatory)
+
+### 3.6 Documenting Your Choice
+
+```python
+class MyLLMAdapter(BaseLLMAdapter):
+    """
+    STREAMING PATTERN: Progressive (token stream).
+    
+    This adapter emits chunks as tokens are generated by the provider.
+    Tool calls appear only in the final chunk with empty text.
+    
+    Rationale: Provider streams tokens via server-sent events.
+    """
+
+class MyEmbeddingAdapter(BaseEmbeddingAdapter):
+    """
+    STREAMING PATTERN: Single-chunk (emulated).
+    
+    This adapter emits exactly one chunk with is_final=True.
+    Provider does not support true streaming; this is for protocol compliance.
+    """
 ```
 
 ---
 
-### 2.4 Embedding + Normalization + Cache
+## 4. Error Mapping Strategies by Provider Type
 
-**Scenario:** You want normalized vectors and a small in-process cache.
+**Different provider types need different error mapping strategies.** This section helps you choose the right approach.
 
-```python
-# wiring in your service, not in the adapter itself
-from corpus_sdk.embedding.embedding_base import (
-    InMemoryTTLCache,
-)
-from adapters.my_embedding_single import MySingleModelEmbeddingAdapter
+### 4.1 REST API Providers (OpenAI, Cohere, Pinecone)
 
-cache = InMemoryTTLCache(max_items=10_000)
+**Strategy:** Map HTTP status codes first, then response body fields.
 
-adapter = MySingleModelEmbeddingAdapter(
-    client=ProviderEmbeddingClient(),
-    mode="standalone",
-    cache=cache,
-    cache_embed_ttl_s=60,
-)
+| Status Code | Typical Meaning | Corpus Error | Details to Extract |
+|-------------|-----------------|--------------|-------------------|
+| 429 | Rate limited | ResourceExhausted | Retry-After header, rate limit scope |
+| 401 | Unauthorized | AuthError | Error message |
+| 403 | Forbidden | AuthError | Error message |
+| 400 | Bad request | BadRequest | Validation details from body |
+| 404 | Not found | BadRequest | What wasn't found |
+| 500+ | Server error | Unavailable | None |
 
-# Base will:
-# - Cache embed() calls (tenant-aware, content-addressed)
-# - Normalize vectors when spec.normalize=True and caps.supports_normalization=True
-```
+### 4.2 SDK-Based Providers (Neo4j Driver, pgvector)
 
-(See `IMPLEMENTATION.md` for cache key details.)
+**Strategy:** Map exception types directly.
 
----
+| SDK Exception | Corpus Error | Notes |
+|--------------|--------------|-------|
+| `TransientError` | TransientNetwork | Connection issues, timeouts |
+| `ClientError` | BadRequest | Invalid queries, syntax errors |
+| `AuthError` | AuthError | Authentication failures |
+| `DatabaseError` | Unavailable | Server-side issues |
 
-## 3. Vector Adapter Recipes
+### 4.3 gRPC Providers
 
-### 3.1 In-Memory Vector Store (Great for Tests)
+**Strategy:** Map gRPC status codes, check trailing metadata.
 
-```python
-# adapters/in_memory_vector_adapter.py
-from typing import Dict, Any, List
-from math import sqrt
+| gRPC Status Code | Corpus Error | Notes |
+|------------------|--------------|-------|
+| `RESOURCE_EXHAUSTED` | ResourceExhausted | Check trailing metadata for retry info |
+| `UNAUTHENTICATED` | AuthError | - |
+| `INVALID_ARGUMENT` | BadRequest | - |
+| `UNAVAILABLE` | TransientNetwork | - |
+| `DEADLINE_EXCEEDED` | DeadlineExceeded | - |
 
-from corpus_sdk.vector.vector_base import (
-    BaseVectorAdapter,
-    VectorCapabilities,
-    QuerySpec,
-    UpsertSpec,
-    DeleteSpec,
-    NamespaceSpec,
-    QueryResult,
-    UpsertResult,
-    DeleteResult,
-    NamespaceResult,
-    Vector,
-    VectorMatch,
-)
+### 4.4 The Detail Schema Requirements (By Error Type)
 
-def _l2(a: List[float], b: List[float]) -> float:
-    return sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+**Every error MUST include specific fields.** Here's the complete reference:
 
-class InMemoryVectorAdapter(BaseVectorAdapter):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        # namespace -> id -> Vector
-        self._store: Dict[str, Dict[str, Vector]] = {}
+| Error Type | Required Fields | Example |
+|------------|-----------------|---------|
+| **DimensionMismatch** | `expected`, `actual`, `namespace`, `vector_id`, `index` | `{"expected": 384, "actual": 512, "namespace": "docs", "vector_id": "vec_123", "index": 3}` |
+| **NamespaceMismatch** | `spec_namespace`, `vector_namespace`, `vector_id`, `index` | `{"spec_namespace": "default", "vector_namespace": "other", "vector_id": "vec_123", "index": 2}` |
+| **FilterValidation** | `operator`, `field`, `supported`, `namespace` | `{"operator": "$regex", "field": "title", "supported": ["$in"], "namespace": "docs"}` |
+| **ModelNotAvailable** | `requested_model`, `supported_models` | `{"requested_model": "gpt-5", "supported_models": ["gpt-4", "gpt-3.5"]}` |
+| **IndexNotReady** | `namespace` | `{"namespace": "docs"}` |
+| **TextTooLong** | `max_length`, `actual_length` | `{"max_length": 8192, "actual_length": 15000}` |
+| **ResourceExhausted** | `resource_scope` | `{"resource_scope": "rate_limit"}` or `"quota"` or `"concurrency"` |
 
-    async def _do_capabilities(self) -> VectorCapabilities:
-        return VectorCapabilities(
-            server="vector-in-memory",
-            version="1.0.0",
-            max_dimensions=2048,
-            max_top_k=100,
-            max_batch_size=1024,
-            supports_metadata_filtering=False,
-            supports_index_management=True,
-        )
-
-    async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
-        ns = self._store.get(spec.namespace, {})
-        matches: List[VectorMatch] = []
-        for v in ns.values():
-            # Super naive: L2 distance + convert to [0,1] score.
-            d = _l2(spec.vector, v.vector)
-            score = 1.0 / (1.0 + d)
-            matches.append(
-                VectorMatch(
-                    vector=v,
-                    score=score,
-                    distance=d,
-                )
-            )
-        matches.sort(key=lambda m: m.score, reverse=True)
-        top = matches[: spec.top_k]
-        return QueryResult(
-            matches=top,
-            query_vector=spec.vector,
-            namespace=spec.namespace,
-            total_matches=len(matches),
-        )
-
-    async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
-        ns = self._store.setdefault(spec.namespace, {})
-        for v in spec.vectors:
-            ns[str(v.id)] = v
-        return UpsertResult(
-            upserted_count=len(spec.vectors),
-            failed_count=0,
-            failures=[],
-        )
-
-    async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
-        ns = self._store.setdefault(spec.namespace, {})
-        deleted = 0
-        for vid in spec.ids:
-            if str(vid) in ns:
-                del ns[str(vid)]
-                deleted += 1
-        return DeleteResult(
-            deleted_count=deleted,
-            failed_count=0,
-            failures=[],
-        )
-
-    async def _do_create_namespace(self, spec: NamespaceSpec, *, ctx=None) -> NamespaceResult:
-        self._store.setdefault(spec.namespace, {})
-        return NamespaceResult(success=True, namespace=spec.namespace, details={})
-
-    async def _do_delete_namespace(self, namespace: str, *, ctx=None) -> NamespaceResult:
-        self._store.pop(namespace, None)
-        return NamespaceResult(success=True, namespace=namespace, details={})
-
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        return {"ok": True, "server": "vector-in-memory", "version": "1.0.0"}
-```
-
-Great for unit tests and CI; don't use for serious workloads.
+**See also:** [Implementation Guide §4.3](/docs/guides/implementation.md#43-error-detail-schemas-per-error-type-mandatory)
 
 ---
 
-### 3.2 Hosted Vector DB Wrapper (Shape)
+## 5. Provider-Specific Migration Paths
 
-**Scenario:** You're wrapping a real vector DB (Pinecone/Weaviate/pgvector-like).
-**Pattern:** Namespace + capabilities enforcement.
+### 5.1 Coming from OpenAI
+
+**What changes when you move from OpenAI SDK to Corpus adapter?**
+
+| OpenAI Concept | Corpus Concept | What You Must Change |
+|----------------|----------------|---------------------|
+| **Idempotency optional** | `idempotent_writes` must reflect reality | Set flag based on whether you implement it |
+| **Raw tenant IDs** | Tenant hashing | Hash all tenant IDs before logging/storing |
+| **Batch errors** | `failed_texts` array | Map per-item errors with `index` field |
+| **No deadline propagation** | `ctx.remaining_ms()` | Add timeout to all HTTP calls |
+| **Streaming chunks** | Tool call rules | Tool calls only in final chunk |
+
+**Error Mapping: OpenAI → Corpus**
+
+| OpenAI Error | Corpus Error | Required Details |
+|--------------|--------------|------------------|
+| `rate_limit_error` | `ResourceExhausted` | `retry_after_ms` from headers, `resource_scope="rate_limit"` |
+| `invalid_api_key` | `AuthError` | None |
+| `model_not_found` | `ModelNotAvailable` | `requested_model`, `supported_models` |
+| `context_length_exceeded` | `BadRequest` | None |
+| `server_error` (500) | `Unavailable` | None |
+
+### 5.2 Coming from Pinecone
+
+**What changes when you move from Pinecone SDK to Corpus adapter?**
+
+| Pinecone Concept | Corpus Concept | Why Your Code Probably Breaks |
+|------------------|----------------|------------------------------|
+| **Per-vector namespace** | **Single namespace per call** | Pinecone allows per-vector namespaces; Corpus requires ALL vectors in a batch to have the same namespace |
+| **$eq is default** | **Only $in is supported** | Your filters using `{"genre": "doc"}` (implicit $eq) must become `{"genre": {"$in": ["doc"]}}` |
+| **No delete validation** | **IDs XOR Filter required** | Your delete calls must provide EITHER ids OR filter, never both, never neither |
+| **Delete counts attempts** | **Delete counts actual deletions** | Your code probably returns `len(ids)`; must return actual count of deleted vectors |
+| **Index status** | **IndexNotReady with retry_after** | Must add retry hints and namespace details |
+
+**Filter Translation Guide:**
 
 ```python
-# adapters/hosted_vector_adapter.py
-from typing import Dict, Any, List
+# Pinecone filter -> Corpus filter
+pinecone_filter = {"genre": "doc"}
+# becomes
+corpus_filter = {"genre": {"$in": ["doc"]}}
 
-from corpus_sdk.vector.vector_base import (
-    BaseVectorAdapter,
-    VectorCapabilities,
-    QuerySpec,
-    UpsertSpec,
-    DeleteSpec,
-    NamespaceSpec,
-    QueryResult,
-    UpsertResult,
-    DeleteResult,
-    NamespaceResult,
-    Vector,
-    VectorMatch,
-    BadRequest,
-)
+pinecone_filter = {"genre": {"$in": ["doc", "article"]}}
+# becomes (same, $in is supported)
+corpus_filter = {"genre": {"$in": ["doc", "article"]}}
 
-class HostedVectorClient:
-    async def query(self, *, index_name, vector, top_k, filter=None, **kwargs):
-        ...
-    async def upsert(self, *, index_name, vectors: List[Dict[str, Any]], **kwargs):
-        ...
-    async def delete(self, *, index_name, ids: List[str], **kwargs):
-        ...
-    async def create_index(self, *, name: str, dimension: int, **kwargs):
-        ...
-    async def delete_index(self, *, name: str, **kwargs):
-        ...
+# UNSUPPORTED: $ne, $gt, $lt, $exists, etc.
+# Must raise BadRequest with supported list
+```
 
-class HostedVectorAdapter(BaseVectorAdapter):
-    def __init__(self, client: HostedVectorClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
+### 5.3 Coming from Neo4j
 
-    async def _do_capabilities(self) -> VectorCapabilities:
-        return VectorCapabilities(
-            server="hosted-vector",
-            version="1.0.0",
-            max_dimensions=1536,
-            max_top_k=100,
-            max_batch_size=500,
-            supports_metadata_filtering=True,
-            supports_index_management=True,
-        )
+**What changes when you move from Neo4j driver to Corpus adapter?**
 
-    def _index_name(self, namespace: str) -> str:
-        return f"corpus-{namespace or 'default'}"
+| Neo4j Concept | Corpus Concept | What You Must Change |
+|----------------|----------------|---------------------|
+| **Raw session results** | **QueryResult wrapper** | Wrap records in QueryResult object |
+| **No dialect validation** | **Must validate dialects** | Check `spec.dialect` against `supported_query_dialects` |
+| **Batch operations** | **{ok, result} envelope** | Wrap each batch result in `{"ok": True/False, "result": ...}` |
+| **Transactions** | **Atomic transactions** | ALL operations must succeed or none |
+| **Delete on missing** | **Idempotent delete** | No error when node/edge doesn't exist |
 
-    async def _do_query(self, spec: QuerySpec, *, ctx=None) -> QueryResult:
-        caps = await self._do_capabilities()
-        if len(spec.vector) > caps.max_dimensions:
-            raise BadRequest("vector dimensions exceed max_dimensions")
+**Batch Operation Envelope Pattern:**
 
-        resp = await self._client.query(
-            index_name=self._index_name(spec.namespace),
-            vector=spec.vector,
-            top_k=spec.top_k,
-            filter=spec.filter if caps.supports_metadata_filtering else None,
-        )
+```python
+# In your shared op executor
+results.append({
+    "ok": True,
+    "result": {
+        "nodes_created": 1,
+        "properties_set": 3
+    }
+})
 
-        matches = [
-            VectorMatch(
-                vector=Vector(
-                    id=str(item["id"]),
-                    vector=item["vector"] if spec.include_vectors else [],
-                    metadata=item.get("metadata") if spec.include_metadata else None,
-                ),
-                score=item["score"],
-                distance=item.get("distance"),
-            )
-            for item in resp["matches"]
-        ]
-        return QueryResult(
-            matches=matches,
-            query_vector=spec.vector,
-            namespace=spec.namespace,
-            total_matches=resp.get("total_matches", len(matches)),
-        )
-
-    async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
-        caps = await self._do_capabilities()
-        if len(spec.vectors) > caps.max_batch_size:
-            raise BadRequest("too many vectors in one batch")
-
-        payload = [
-            {
-                "id": str(v.id),
-                "vector": v.vector,
-                "metadata": v.metadata or {},
-            }
-            for v in spec.vectors
-        ]
-
-        await self._client.upsert(
-            index_name=self._index_name(spec.namespace),
-            vectors=payload,
-        )
-        return UpsertResult(
-            upserted_count=len(spec.vectors),
-            failed_count=0,
-            failures=[],
-        )
-
-    async def _do_delete(self, spec: DeleteSpec, *, ctx=None) -> DeleteResult:
-        await self._client.delete(
-            index_name=self._index_name(spec.namespace),
-            ids=[str(i) for i in spec.ids],
-        )
-        return DeleteResult(
-            deleted_count=len(spec.ids),
-            failed_count=0,
-            failures=[],
-        )
-
-    async def _do_create_namespace(self, spec: NamespaceSpec, *, ctx=None) -> NamespaceResult:
-        caps = await self._do_capabilities()
-        await self._client.create_index(
-            name=self._index_name(spec.namespace),
-            dimension=caps.max_dimensions,
-        )
-        return NamespaceResult(success=True, namespace=spec.namespace, details={})
-
-    async def _do_delete_namespace(self, namespace: str, *, ctx=None) -> NamespaceResult:
-        await self._client.delete_index(name=self._index_name(namespace))
-        return NamespaceResult(success=True, namespace=namespace, details={})
-
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        return {"ok": True, "server": "hosted-vector", "version": "1.0.0"}
+# Not
+results.append({
+    "nodes_created": 1,
+    "properties_set": 3
+})
 ```
 
 ---
 
-### 3.3 Multi-Tenant Vector Patterns
+## 6. Multi-Tenancy Deep Dive
 
-Two common patterns:
+**Getting tenant isolation right is critical. Most production incidents stem from getting this wrong.**
 
-1. **Namespace per tenant**
-
-   * `namespace = f"{ctx.tenant}--{logical_namespace}"`
-   * Good isolation; more indexes.
-
-2. **Single index, tenant in metadata**
-
-   * Shared index; filter on `tenant_id`
-   * Fewer indexes; more complex filters.
-
-Both are valid; pick based on your provider and scale.
-
----
-
-### 3.4 Partial Failure Reporting (Upsert/Delete)
-
-When provider returns per-item status, map failures into `failures` list:
+### 6.1 The Three Rules of Tenant Handling
 
 ```python
-# inside _do_upsert
-failures = []
-success_count = 0
-for idx, item in enumerate(provider_result["items"]):
-    if item["status"] == "ok":
-        success_count += 1
-    else:
-        failures.append(
-            {
-                "index": idx,
-                "id": spec.vectors[idx].id,
-                "code": "UNAVAILABLE",
-                "message": item.get("error", "unknown"),
+# Rule 1: NEVER log or emit raw tenant IDs
+tenant_id = ctx.tenant if ctx else None
+if tenant_id:
+    logger.info(f"Request for tenant {tenant_id}")  # ❌ PII LEAK
+    metrics.increment("requests", tags={"tenant": tenant_id})  # ❌ PII LEAK
+
+# ✅ CORRECT: Always hash
+tenant_hash = self._tenant_hash(tenant_id)
+logger.info(f"Request for tenant {tenant_hash}")
+metrics.increment("requests", tags={"tenant": tenant_hash})
+
+# Rule 2: Use hashed tenant in cache keys
+cache_key = f"embed:{tenant_hash}:{model}:{text_hash}"  # ✅
+
+# Rule 3: Use raw tenant ONLY for provider calls that need it
+if tenant_id:
+    provider_request["tenant"] = tenant_id  # ✅ Provider needs raw ID
+```
+
+### 6.2 The Tenant Hashing Function
+
+```python
+def _tenant_hash(self, tenant: Optional[str]) -> Optional[str]:
+    """Create privacy-preserving hash of tenant identifier."""
+    if not tenant:
+        return None
+    # Use SHA256, truncate to reasonable length
+    return hashlib.sha256(tenant.encode()).hexdigest()[:16]
+```
+
+### 6.3 When to Use Raw vs Hashed Tenant
+
+| Use Case | Use Raw Tenant | Use Hashed Tenant |
+|----------|---------------|-------------------|
+| Provider API calls | ✅ Provider needs it | ❌ |
+| Logging | ❌ Never | ✅ Always |
+| Metrics tags | ❌ Never | ✅ Always |
+| Cache keys | ❌ PII exposure | ✅ Safe |
+| Error details | ❌ Never | ✅ Safe |
+| Namespace names | ✅ Often needed | ❌ |
+
+### 6.4 Common Multi-Tenancy Mistakes
+
+```python
+# Mistake 1: Raw tenant in logs
+logger.info(f"Processing request for {ctx.tenant}")
+
+# Mistake 2: Raw tenant in cache keys
+cache_key = f"embedding:{ctx.tenant}:{model}"
+
+# Mistake 3: Assuming tenant is always present
+if ctx.tenant:  # May be None for global/anon requests
+    # Handle tenant-specific logic
+else:
+    # Must handle global case
+
+# Mistake 4: Forgetting tenant in cache isolation
+# Different tenants should NOT share cache keys
+# Base handles this automatically when you use tenant_hash
+```
+
+### 6.5 Tenant-Aware Rate Limiting
+
+```python
+# The base class handles tenant-aware rate limiting automatically
+# You don't need to implement this - just ensure ctx.tenant is passed
+
+# BUT: If your provider has per-tenant rate limits, you need to track them
+def _map_provider_error(self, e):
+    if "rate limit" in str(e).lower():
+        # Extract tenant from context for error details
+        tenant_hash = self._tenant_hash(ctx.tenant) if ctx else None
+        return ResourceExhausted(
+            "Rate limit exceeded",
+            retry_after_ms=5000,
+            resource_scope="rate_limit",
+            details={
+                "tenant_hash": tenant_hash,  # ✅ Safe to include
+                "provider_error": str(e)
             }
         )
-
-return UpsertResult(
-    upserted_count=success_count,
-    failed_count=len(failures),
-    failures=failures,
-)
 ```
 
-Same pattern applies to `DeleteResult`.
+**See also:** [Implementation Guide §3.3](/docs/guides/implementation.md#33-tenant-hashing-mandatory)
 
 ---
 
-## 4. Graph Adapter Recipes
+## 7. Deadline Propagation Patterns
 
-### 4.1 Unary Graph Query (Cypher / SQL-ish)
+**Different provider SDKs handle timeouts differently. Here's how to map `ctx.remaining_ms()` to each.**
+
+### 7.1 HTTPX / Requests (Most REST APIs)
 
 ```python
-# adapters/my_graph_adapter.py
-from typing import Dict, Any, List
+def _timeout_from_ctx(self, ctx):
+    if ctx is None:
+        return None
+    rem = ctx.remaining_ms()
+    if rem is None or rem <= 0:
+        return None
+    return rem / 1000.0  # Convert to seconds
 
-from corpus_sdk.graph.graph_base import (
-    BaseGraphAdapter,
-    GraphCapabilities,
-    GraphRow,
-    GraphStreamEvent,
-)
-
-class GraphDBClient:
-    async def query(self, *, dialect: str, text: str, params: Dict[str, Any], timeout=None):
-        ...
-
-class MyGraphAdapter(BaseGraphAdapter):
-    def __init__(self, client: GraphDBClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
-
-    async def _do_capabilities(self) -> GraphCapabilities:
-        return GraphCapabilities(
-            server="my-graph",
-            version="1.0.0",
-            dialect="cypher",
-            supports_streaming=True,
-        )
-
-    async def _do_query(self, spec, *, ctx=None):
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        rows = await self._client.query(
-            dialect="cypher",
-            text=spec.query,
-            params=spec.params,
-            timeout=timeout_s,
-        )
-
-        # rows is e.g. List[Dict[str, Any]]
-        graph_rows = [GraphRow(data=row) for row in rows]
-        return {"rows": graph_rows}
-
-    async def _do_stream_query(self, spec, *, ctx=None):
-        # See 4.2 for a full streaming example
-        rows = (await self._do_query(spec, ctx=ctx))["rows"]
-        for row in rows:
-            yield GraphStreamEvent(data=row, kind="row")
-        yield GraphStreamEvent(data=None, kind="end")
-
-    async def _do_batch(self, spec, *, ctx=None):
-        # Implement according to BEHAVIORAL_CONFORMANCE.md
-        raise NotImplementedError
-
-    async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
-        return {"ok": True, "server": "my-graph", "version": "1.0.0"}
+async def _do_embed(self, spec, *, ctx=None):
+    timeout = self._timeout_from_ctx(ctx)
+    
+    response = await self._client.post(
+        url,
+        json=payload,
+        timeout=timeout  # ✅ Pass seconds
+    )
 ```
 
----
-
-### 4.2 Streaming Graph Query
+### 7.2 gRPC (Deadline Pattern)
 
 ```python
-# adapters/my_graph_streaming.py
-from typing import AsyncIterator
+import datetime
 
-from corpus_sdk.graph.graph_base import (
-    BaseGraphAdapter,
-    GraphCapabilities,
-    GraphStreamEvent,
-    GraphRow,
-)
+def _deadline_from_ctx(self, ctx):
+    if ctx is None or ctx.deadline_ms is None:
+        return None
+    # gRPC expects absolute datetime
+    return datetime.datetime.fromtimestamp(ctx.deadline_ms / 1000)
 
-class StreamingGraphClient:
-    async def stream(self, *, query: str, params: dict, timeout=None):
-        """
-        async generator yielding rows (dicts).
-        """
-        ...
-
-class StreamingGraphAdapter(BaseGraphAdapter):
-    def __init__(self, client: StreamingGraphClient, **kwargs):
-        super().__init__(**kwargs)
-        self._client = client
-
-    async def _do_capabilities(self) -> GraphCapabilities:
-        return GraphCapabilities(
-            server="my-graph-streaming",
-            version="1.0.0",
-            dialect="cypher",
-            supports_streaming=True,
-        )
-
-    async def _do_stream_query(
-        self,
-        spec,
-        *,
-        ctx=None,
-    ) -> AsyncIterator[GraphStreamEvent]:
-        timeout_s = None
-        if ctx is not None:
-            rem = ctx.remaining_ms()
-            if rem and rem > 0:
-                timeout_s = rem / 1000.0
-
-        async for row in self._client.stream(
-            query=spec.query,
-            params=spec.params,
-            timeout=timeout_s,
-        ):
-            yield GraphStreamEvent(
-                data=GraphRow(data=row),
-                kind="row",
-            )
-
-        # Exactly one terminal event.
-        yield GraphStreamEvent(data=None, kind="end")
+async def _do_query(self, spec, *, ctx=None):
+    deadline = self._deadline_from_ctx(ctx)
+    
+    response = await self._stub.Query(
+        request,
+        deadline=deadline  # ✅ gRPC deadline
+    )
 ```
 
-(Implement `_do_query`, `_do_batch`, `_do_health` as in 4.1.)
-
----
-
-## 5. Cross-Cutting Recipes
-
-### 5.1 Deadline Helper
-
-Use the same helper everywhere:
+### 7.3 AWS SDK (Boto3)
 
 ```python
-# adapters/utils_time.py
-from typing import Optional
-from corpus_sdk.common.context import OperationContext  # adjust import if needed
-
-def timeout_from_ctx(ctx: Optional[OperationContext]) -> Optional[float]:
+def _timeout_from_ctx(self, ctx):
     if ctx is None:
         return None
     rem = ctx.remaining_ms()
     if rem is None or rem <= 0:
         return None
     return rem / 1000.0
-```
-
-Usage:
-
-```python
-from .utils_time import timeout_from_ctx
 
 async def _do_embed(self, spec, *, ctx=None):
-    timeout_s = timeout_from_ctx(ctx)
-    resp = await self._client.embed(..., timeout=timeout_s)
-    ...
+    timeout = self._timeout_from_ctx(ctx)
+    
+    # Boto3 uses config objects
+    config = Config(
+        connect_timeout=timeout,
+        read_timeout=timeout
+    )
+    
+    response = await self._client.embed(
+        Text=spec.text,
+        Config=config
+    )
+```
+
+### 7.4 Custom SDK Without Timeout Support
+
+```python
+async def _do_embed(self, spec, *, ctx=None):
+    if ctx and ctx.deadline_ms:
+        remaining = ctx.remaining_ms()
+        if remaining <= 0:
+            raise DeadlineExceeded("deadline expired")
+        
+        # Use asyncio.timeout as a safety net
+        try:
+            async with asyncio.timeout(remaining / 1000):
+                response = await self._client.embed(spec.text)
+        except asyncio.TimeoutError:
+            raise DeadlineExceeded("provider timeout")
+    else:
+        response = await self._client.embed(spec.text)
+```
+
+### 7.5 🔴 CRITICAL: The Critical Rule - Always Propagate
+
+```python
+# ❌ WRONG: Ignoring deadline
+async def _do_embed(self, spec, *, ctx=None):
+    return await self._client.embed(spec.text)  # No timeout!
+
+# ✅ CORRECT: Always propagate
+async def _do_embed(self, spec, *, ctx=None):
+    timeout = self._timeout_from_ctx(ctx)
+    return await self._client.embed(spec.text, timeout=timeout)
+```
+
+**Why:** If you don't propagate deadlines, requests can hang forever, exhausting resources and violating SLOs.
+
+**See also:** [Implementation Guide §3.2](/docs/guides/implementation.md#32-deadline-propagation-mandatory), [§6](/docs/guides/implementation.md#6-deadlines--cancellation)
+
+---
+
+## 8. Cache Ownership Explained
+
+**This is the most misunderstood boundary in the entire system.**
+
+### 8.1 What the Base Class Owns
+
+```python
+# The base class automatically provides:
+# - In-memory TTL cache (in standalone mode)
+# - Cache key generation (includes tenant hash)
+# - Cache hit/miss counting
+# - Cache invalidation for vector/graph after writes
+# - TTL enforcement
+
+# You DO NOT:
+# - Implement your own cache
+# - Report cache metrics in _do_get_stats
+# - Invalidate cache manually (base handles it)
+```
+
+### 8.2 What You (The Adapter) Own
+
+```python
+# You own:
+# - Provider response generation
+# - Error mapping
+# - Provider-side metrics (latency, error rates)
+# - Everything NOT related to caching
+
+# In _do_get_stats, you report ONLY adapter metrics:
+async def _do_get_stats(self, *, ctx=None):
+    return EmbeddingStats(
+        total_requests=self._stats["total_ops"],
+        total_texts=self._stats["total_texts"],
+        total_tokens=self._stats["total_tokens"],
+        avg_processing_time_ms=self._stats["avg_ms"],
+        error_count=self._stats["errors"]
+        # ❌ NO cache_hits
+        # ❌ NO cache_misses
+        # ❌ NO stream_stats
+    )
+```
+
+### 8.3 The Cache Invalidation Contract (Vector/Graph)
+
+```python
+async def _do_upsert(self, spec: UpsertSpec, *, ctx=None) -> UpsertResult:
+    # 1. Perform the upsert
+    result = await self._client.upsert(vectors)
+    
+    # 2. ✅ AFTER successful write, base automatically invalidates
+    #    You do NOT call _invalidate_namespace_cache manually
+    #    Base detects writes via UpsertResult
+    
+    return UpsertResult(
+        upserted_count=result.count,
+        failed_count=0,
+        failures=[]
+    )
+
+# ❌ WRONG: Manual invalidation
+await self._invalidate_namespace_cache(spec.namespace)  # NO - base handles it
+```
+
+### 8.4 Cache Key Generation (For Reference)
+
+```python
+# You don't need to implement this, but understand how it works:
+# Base generates cache keys like:
+cache_key = f"{component}:{tenant_hash}:{operation}:{content_hash}"
+
+# Example:
+# "embedding:1a2b3c4d:embed:5e6f7g8h"
+```
+
+### 8.5 🔴 CRITICAL: Common Cache Ownership Mistakes
+
+```python
+# Mistake 1: Including cache stats in _do_get_stats
+async def _do_get_stats(self):
+    return {
+        "total_requests": 1000,
+        "cache_hits": 800,  # ❌ Base owns this
+        "cache_misses": 200,  # ❌ Base owns this
+    }
+
+# Mistake 2: Implementing your own cache
+self._my_cache = {}  # ❌ Use base cache or none
+
+# Mistake 3: Manual invalidation
+await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
+
+# Mistake 4: Assuming cache exists in 'thin' mode
+# In thin mode, cache is a no-op. Your adapter should work either way.
+```
+
+**See also:** [Implementation Guide §8.6](/docs/guides/implementation.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11](/docs/guides/implementation.md#11-cache-ownership-boundary-critical)
+
+---
+
+## 9. Idempotency Implementation Patterns
+
+**Required ONLY if your provider supports idempotency AND you set `idempotent_writes=True`.**
+
+### 9.1 What Idempotency Means in Corpus
+
+```python
+# If you set idempotent_writes=True, you MUST implement:
+# - Given the same idempotency key within 24 hours:
+#   - First call → process and store result
+#   - Subsequent calls → return stored result without processing
+# - Different keys → treated as different requests
+
+# If your provider DOES NOT support idempotency, set idempotent_writes=False
+```
+
+**Per the [Implementation Guide](/docs/guides/implementation.md):** The flag must honestly reflect your implementation. If you set it to True, you must implement 24-hour deduplication.
+
+### 9.2 Pattern A: In-Memory Cache (Development/Testing)
+
+```python
+class MyEmbeddingAdapter(BaseEmbeddingAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._idempotency_cache = {}  # {key: (timestamp, result)}
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        # Check idempotency
+        if ctx and ctx.idempotency_key and ctx.tenant:
+            key = f"idem:{ctx.tenant}:{ctx.idempotency_key}"
+            cached = self._idempotency_cache.get(key)
+            if cached:
+                timestamp, result = cached
+                if time.time() - timestamp < 86400:  # 24 hours per spec
+                    return result
+        
+        # Process normally
+        result = await self._process_embed(spec, ctx)
+        
+        # Store for idempotency
+        if ctx and ctx.idempotency_key and ctx.tenant:
+            self._idempotency_cache[key] = (time.time(), result)
+        
+        return result
+    
+    # Optional: Cleanup old entries periodically
+    def _cleanup_cache(self):
+        now = time.time()
+        self._idempotency_cache = {
+            k: v for k, v in self._idempotency_cache.items()
+            if now - v[0] < 86400
+        }
+```
+
+### 9.3 Pattern B: Redis (Production) - With Schema Versioning
+
+```python
+import redis.asyncio as redis
+import json
+
+class MyEmbeddingAdapter(BaseEmbeddingAdapter):
+    def __init__(self, redis_url=None, **kwargs):
+        super().__init__(**kwargs)
+        self._redis = redis.from_url(redis_url) if redis_url else None
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        # Check idempotency
+        if ctx and ctx.idempotency_key and ctx.tenant and self._redis:
+            key = f"idem:v1:{ctx.tenant}:{ctx.idempotency_key}"  # Include version
+            cached = await self._redis.get(key)
+            if cached:
+                # Store as JSON for version safety
+                data = json.loads(cached)
+                return self._deserialize_result(data)
+        
+        # Process normally
+        result = await self._process_embed(spec, ctx)
+        
+        # Store for idempotency with 24h TTL
+        if ctx and ctx.idempotency_key and ctx.tenant and self._redis:
+            # Store as JSON with schema version
+            data = self._serialize_result(result)
+            data["_schema_version"] = "1.0"
+            await self._redis.setex(
+                key,
+                86400,  # 24 hours per spec
+                json.dumps(data)
+            )
+        
+        return result
+    
+    def _serialize_result(self, result):
+        """Convert result to JSON-serializable dict."""
+        # Implement based on your result type
+        return {
+            "embedding": result.embedding.vector,
+            "model": result.model,
+            "text": result.text,
+            "tokens_used": result.tokens_used
+        }
+    
+    def _deserialize_result(self, data):
+        """Rebuild result from JSON."""
+        # Check version for backward compatibility
+        if data.get("_schema_version") != "1.0":
+            # Handle version migration or reject
+            pass
+        # Reconstruct result object
+        return EmbedResult(...)
+```
+
+> ⚠️ **Warning:** Avoid `pickle` for stored results - it's version-sensitive and a security risk. Use JSON with explicit schema versioning.
+
+### 9.4 Pattern C: No Storage (When Idempotency Not Required)
+
+```python
+class MyLLMAdapter(BaseLLMAdapter):
+    async def _do_capabilities(self) -> LLMCapabilities:
+        return LLMCapabilities(
+            # ... other fields
+            idempotent_writes=False,  # ✅ Honest - not implementing
+        )
+    
+    # No idempotency implementation needed
+```
+
+### 9.5 Key Requirements (If You Implement Idempotency)
+
+```python
+# 1. Key MUST include tenant
+key = f"idem:{ctx.tenant}:{ctx.idempotency_key}"  # ✅
+key = f"idem:{ctx.idempotency_key}"  # ❌ No tenant isolation
+
+# 2. TTL MUST be 24 hours minimum (per spec)
+await self._redis.setex(key, 86400, data)  # ✅ 24h
+await self._redis.setex(key, 3600, data)   # ❌ Too short - will fail conformance
+
+# 3. Storage SHOULD use versioned schema
+# 4. Cache MUST survive adapter restarts in production
+```
+
+**See also:** [Quick Start §7.1](/docs/guides/quick_start.md#71-embedding-protocol), [Implementation Guide §8](/docs/guides/implementation.md#8-embedding-adapter-implementation-requirements)
+
+---
+
+## 10. Provider SDK Integration Patterns
+
+**How to integrate with existing provider SDKs.**
+
+### 10.1 Pattern 1: Wrap Existing Client
+
+```python
+class MyAdapter(BaseAdapter):
+    def __init__(self, provider_client, **kwargs):
+        """
+        Args:
+            provider_client: Existing client from provider SDK
+                            (OpenAI client, Pinecone index, etc.)
+        """
+        super().__init__(**kwargs)
+        self._client = provider_client  # Use existing client
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        # Just adapt the interface
+        timeout = self._timeout_from_ctx(ctx)
+        
+        # Provider SDK may have different timeout mechanisms
+        response = await self._client.embeddings.create(
+            model=spec.model,
+            input=spec.text,
+            timeout=timeout
+        )
+        
+        # Map to Corpus format
+        return EmbedResult(...)
+```
+
+**Best for:** When you already have a configured client with connection pooling, retries, etc.
+
+### 10.2 Pattern 2: Build New Client
+
+```python
+import httpx
+
+class MyAdapter(BaseAdapter):
+    def __init__(self, api_key, base_url=None, **kwargs):
+        super().__init__(**kwargs)
+        self._api_key = api_key
+        self._base_url = base_url or "https://api.provider.com/v1"
+        self._client = httpx.AsyncClient(timeout=30.0)
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        timeout = self._timeout_from_ctx(ctx)
+        
+        response = await self._client.post(
+            f"{self._base_url}/embeddings",
+            json={
+                "model": spec.model,
+                "input": spec.text
+            },
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=timeout
+        )
+        response.raise_for_status()
+        data = response.json()
+        
+        return EmbedResult(...)
+    
+    async def close(self):
+        await self._client.aclose()
+```
+
+**Best for:** When you need full control over HTTP behavior.
+
+### 10.3 Pattern 3: Sync SDK + asyncio
+
+```python
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+class MyAdapter(BaseAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._client = ProviderSyncClient()  # Sync SDK
+        self._executor = ThreadPoolExecutor(max_workers=4)
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        # Run blocking call in thread pool
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            self._executor,
+            lambda: self._client.embed(
+                model=spec.model,
+                text=spec.text
+            )
+        )
+        return EmbedResult(...)
+```
+
+**Best for:** When provider only offers a synchronous SDK.
+
+### 10.4 Pattern 4: Multi-Protocol Provider
+
+```python
+# adapters/acme/__init__.py
+from .client import AcmeClient
+from .llm import AcmeLLMAdapter
+from .embedding import AcmeEmbeddingAdapter
+from .vector import AcmeVectorAdapter
+
+# All adapters share the same client
+client = AcmeClient(api_key="...")
+
+llm_adapter = AcmeLLMAdapter(client)
+embedding_adapter = AcmeEmbeddingAdapter(client)
+vector_adapter = AcmeVectorAdapter(client)
+```
+
+**Best for:** Providers offering multiple services (like OpenAI).
+
+### 10.5 Client Lifecycle Management
+
+```python
+class MyAdapter(BaseAdapter):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._client = None  # Lazy init
+    
+    async def _ensure_client(self):
+        if self._client is None:
+            self._client = await self._create_client()
+    
+    async def _do_embed(self, spec, *, ctx=None):
+        await self._ensure_client()
+        # Use client...
+    
+    async def close(self):
+        if self._client:
+            await self._client.aclose()
 ```
 
 ---
 
-### 5.2 Simple Retry + Backoff Wrapper
+## 11. Rate Limit Handling Deep Dive
 
-**Be careful:** only retry when safe (idempotent operations or when your provider guarantees idempotency).
+**Different providers surface rate limits differently. Here's how to handle each pattern.**
+
+### 11.1 Pattern A: Headers-Based (Most REST APIs)
 
 ```python
-# adapters/utils_retry.py
-import asyncio
-from typing import Awaitable, Callable, TypeVar, Iterable
+def _map_provider_error(self, e: httpx.HTTPStatusError):
+    if e.response.status_code == 429:
+        # Check multiple header formats
+        retry_after = None
+        
+        # Standard Retry-After (seconds)
+        if "Retry-After" in e.response.headers:
+            retry_after = int(e.response.headers["Retry-After"]) * 1000
+        
+        # X-RateLimit-* headers
+        elif "X-RateLimit-Reset" in e.response.headers:
+            # Unix timestamp
+            reset = int(e.response.headers["X-RateLimit-Reset"])
+            now = time.time()
+            retry_after = max(0, (reset - now)) * 1000
+        
+        # Determine scope
+        scope = "api"
+        if "X-RateLimit-Scope" in e.response.headers:
+            scope = e.response.headers["X-RateLimit-Scope"]
+        
+        return ResourceExhausted(
+            "Rate limit exceeded",
+            retry_after_ms=retry_after or 5000,
+            resource_scope=scope,
+            details={
+                "limit": e.response.headers.get("X-RateLimit-Limit"),
+                "remaining": e.response.headers.get("X-RateLimit-Remaining")
+            }
+        )
+```
 
-from corpus_sdk.embedding.embedding_base import (
-    TransientNetwork,
-    Unavailable,
-    ResourceExhausted,
-)
+> 🔄 **Circuit Breaker Integration:** Your `ResourceExhausted` mapping with `retry_after_ms` feeds directly into the base class's circuit breaker. When the breaker detects sustained rate limiting, it will automatically fail fast to protect your provider. This is why accurate `retry_after_ms` and `resource_scope` matter.
 
-T = TypeVar("T")
+### 11.2 Pattern B: Response Body
 
-def _is_retryable(e: Exception) -> bool:
-    if isinstance(e, (TransientNetwork, Unavailable)):
-        return True
-    if isinstance(e, ResourceExhausted) and getattr(e, "retry_after_ms", None):
-        return True
-    return False
+```python
+def _map_provider_error(self, e: Exception):
+    if isinstance(e, ProviderRateLimitError):
+        # Extract from error object
+        data = e.response.json()
+        
+        retry_after = None
+        if "retry_after" in data:
+            retry_after = data["retry_after"]  # May be seconds or ms
+            if retry_after < 100:  # Probably seconds
+                retry_after *= 1000
+        
+        scope = data.get("scope", "api")
+        
+        return ResourceExhausted(
+            data.get("message", "Rate limit exceeded"),
+            retry_after_ms=retry_after or 5000,
+            resource_scope=scope,
+            details={"provider_response": data}
+        )
+```
 
-async def retry_async(
-    fn: Callable[[], Awaitable[T]],
-    *,
-    attempts: int = 3,
-    base_delay_s: float = 0.1,
-) -> T:
-    last_exc: Exception | None = None
-    for i in range(attempts):
+### 11.3 Pattern C: No Retry Information
+
+```python
+def _map_provider_error(self, e: Exception):
+    if self._is_rate_limit(e):
+        # No retry info provided - use defaults with backoff
+        return ResourceExhausted(
+            "Rate limit exceeded",
+            retry_after_ms=5000,  # Default
+            resource_scope="unknown",
+            details={"provider_error": str(e)}
+        )
+```
+
+### 11.4 Pattern D: Multiple Scopes
+
+Some providers have different rate limits for different resources:
+
+```python
+def _map_provider_error(self, e: Exception):
+    if e.response.status_code == 429:
+        data = e.response.json()
+        
+        # Determine which scope was hit
+        if "model" in data.get("scope", ""):
+            scope = f"model:{data.get('model', 'unknown')}"
+        elif "namespace" in data.get("scope", ""):
+            scope = f"namespace:{data.get('namespace', 'unknown')}"
+        else:
+            scope = "api"
+        
+        return ResourceExhausted(
+            "Rate limit exceeded",
+            retry_after_ms=data.get("retry_after_ms", 5000),
+            resource_scope=scope,
+            details={
+                "limit_type": data.get("type"),
+                "limit": data.get("limit")
+            }
+        )
+```
+
+### 11.5 Rate Limit Scope Values
+
+| Scope | Meaning | When Used |
+|-------|---------|-----------|
+| `api` | Overall API rate limit | Default |
+| `model` | Per-model rate limit | LLM/Embedding providers |
+| `namespace` | Per-namespace rate limit | Vector/Graph databases |
+| `user` | Per-user rate limit | Multi-tenant services |
+| `concurrency` | Concurrent request limit | Streaming/async APIs |
+
+### 11.6 Implementing Retry with Rate Limits
+
+```python
+async def _call_with_retry(self, fn, ctx=None):
+    for attempt in range(3):
         try:
             return await fn()
-        except Exception as e:
-            if not _is_retryable(e) or i == attempts - 1:
+        except ResourceExhausted as e:
+            if attempt == 2:  # Last attempt
                 raise
-            last_exc = e
-            delay = base_delay_s * (2 ** i)
-            await asyncio.sleep(delay)
-    assert False, "unreachable"
+            
+            # Use retry_after from error
+            delay_ms = e.retry_after_ms or (5000 * (2 ** attempt))
+            
+            # Check if we have time to retry
+            if ctx:
+                remaining = ctx.remaining_ms()
+                if remaining and delay_ms > remaining:
+                    raise DeadlineExceeded("deadline too short for retry")
+            
+            await asyncio.sleep(delay_ms / 1000)
 ```
 
-Usage:
+**See also:** [Implementation Guide §4.4](/docs/guides/implementation.md#44-retry-semantics-mandatory)
+
+---
+
+## 12. Operational Patterns
+
+### 12.1 Monitoring: What Metrics Matter
+
+| Metric | Source | What to Watch For |
+|--------|--------|-------------------|
+| **Provider latency** | Your HTTP/SDK client | Spikes indicate provider issues |
+| **Error rate by type** | Your error mapping | Unexpected error types mean mapping gaps |
+| **Rate limit hits** | ResourceExhausted count | May need to adjust retry strategy |
+| **Deadline exceeded** | DeadlineExceeded count | Timeouts too aggressive? |
+| **Cache hit rate** | Base class metrics | Low hit rate? Adjust TTL |
+
+### 12.2 🔴 CRITICAL: Logging - What's Safe, What's Not
+
+**NEVER log:**
+- Raw tenant IDs (use tenant hash)
+- Full text payloads (PII risk)
+- Embedding vectors (can be reverse-engineered)
+- API keys or secrets
+
+**ALWAYS log:**
+- Tenant hash (for debugging multi-tenant issues)
+- Operation type (embed, complete, query)
+- Error type and code (not full stack traces in production)
+- Request IDs for correlation
+
+**Example safe log:**
+```json
+{
+  "tenant_hash": "a1b2c3d4e5f6",
+  "operation": "embed",
+  "model": "text-embedding-ada-002",
+  "duration_ms": 245,
+  "success": true,
+  "request_id": "req_123"
+}
+```
+
+### 12.3 Health Check Best Practices
 
 ```python
-from .utils_retry import retry_async
-
-async def _do_embed(self, spec, *, ctx=None):
-    async def call():
-        return await self._client.embed(...)
-
+async def _do_health(self, *, ctx=None) -> Dict[str, Any]:
+    """
+    Health check should:
+    - Be lightweight (don't call expensive operations)
+    - Return graded status (ok/degraded/down)
+    - Include version information
+    - Include component-specific status
+    """
     try:
-        resp = await retry_async(call)
-    except Exception as e:
-        raise map_provider_error_embedding(e)
+        # Simple ping to provider
+        await self._client.ping(timeout=2.0)
+        return {
+            "ok": True,
+            "status": "ok",
+            "server": "my-adapter",
+            "version": "1.0.0"
+        }
+    except Exception:
+        return {
+            "ok": False,
+            "status": "down",
+            "server": "my-adapter",
+            "version": "1.0.0"
+        }
 ```
 
----
-
-### 5.3 Tenant-Safe Logging & Metrics
-
-**Pattern:**
-
-* Use `tenant_hash` in metrics (base already does).
-* Do **not** log raw tenant IDs or full texts/embeddings.
-
-Example wrapper:
+### 12.4 Shutdown and Cleanup
 
 ```python
-# adapters/utils_logging.py
-import hashlib
-from typing import Optional
-
-def hash_tenant(tenant: Optional[str]) -> str:
-    if not tenant:
-        return "none"
-    return hashlib.sha256(tenant.encode("utf-8")).hexdigest()[:16]
-
-def log_request(component: str, op: str, tenant: Optional[str]):
-    th = hash_tenant(tenant)
-    # Replace with your logger
-    print(f"[{component}.{op}] tenant_hash={th}")
-```
-
-Usage inside `_do_*`:
-
-```python
-from .utils_logging import log_request
-
-async def _do_embed(self, spec, *, ctx=None):
-    log_request("embedding", "embed", getattr(ctx, "tenant", None))
-    ...
+class MyAdapter(BaseAdapter):
+    async def close(self):
+        """Clean up resources when adapter is shut down."""
+        if hasattr(self, "_client"):
+            await self._client.aclose()
+        
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=True)
 ```
 
 ---
 
-## 6. "Real-ish" Provider: Multiple Adapters, Shared Pieces
+## 13. Troubleshooting by Symptom
 
-**Suggested layout:**
+### 13.1 Conformance Failures During Certification
 
-```text
-adapters/
-  acme/
-    __init__.py
-    client.py               # AcmeClient (raw HTTP/gRPC)
-    errors.py               # provider → Corpus error mapping
-    utils_time.py           # timeout helper
-    utils_retry.py          # retry helper
+| Error Message | Likely Cause | Fix |
+|--------------|--------------|-----|
+| `capabilities missing required field: protocol` | Forgot protocol field | Add `protocol="llm/v1.0"` (or your domain) |
+| `capabilities missing required field: model_family` (LLM) | Missing model_family | Add model_family to LLM capabilities |
+| `capabilities missing required field: idempotent_writes` (Embedding) | Missing idempotency flag | Set based on your implementation (true/false) |
+| `Batch result missing field: failures` | Wrong field name | Use `failed_texts` for embedding, `failures` for others |
+| `Batch success missing index` | No index on embedding vectors | Add `index=idx` to EmbeddingVector |
+| `Namespace mismatch` | Vector.namespace != spec.namespace | Enforce namespace authority |
+| `Missing index in failure` | Failure object missing required field | Add `index` to all failure objects |
+| `Missing metadata in failure` | Failure object missing metadata | Add `metadata` field (may be null) |
+| `include_vectors=False returned vectors` | Returning full vectors | Return `[]` when `include_vectors=False` |
+| `Delete returned attempted count` | Counting attempts not actuals | Count actual deletions only |
+| `Batch query not atomic` | Continuing after query failure | Validate all first, then execute |
+| `Missing retry_after_ms` | IndexNotReady missing retry hint | Always add `retry_after_ms` |
+| `Missing namespace in error details` | Error missing required field | Add namespace to all namespace-related errors |
+| `Tool calls in non-final chunk` | Streaming pattern wrong | Tool calls only in final chunk |
+| `Stop sequence cut at last occurrence` | Wrong stop logic | Cut at FIRST occurrence |
+| `Zero completion tokens for tool calls` | Missing token synthesis | Synthesize from tool call payload |
 
-    llm_adapter.py          # AcmeLLMAdapter(BaseLLMAdapter)
-    embedding_adapter.py    # AcmeEmbeddingAdapter(BaseEmbeddingAdapter)
-    vector_adapter.py       # AcmeVectorAdapter(BaseVectorAdapter)
-    graph_adapter.py        # AcmeGraphAdapter(BaseGraphAdapter)
-```
+### 13.2 Production Errors
 
-Shared pieces:
-
-* `client.py` — base "AcmeClient" used by all adapters.
-* `errors.py` — `map_error_llm`, `map_error_embedding`, etc.
-* `utils_time.py` — `timeout_from_ctx`.
-* `utils_retry.py` — safe retry wrapper.
-
-Then each adapter file is ~50–100 lines of *just*:
-
-* Capabilities
-* `_do_*` implementations
-* `AcmeClient` calls
-* Error mapping
-
-Everything else (deadlines, metrics, circuit breaking, caching, envelopes) comes from the SDK.
-
----
-
-## 7. Choosing the Right Recipe
-
-Quick "what do I start from?" table:
-
-| Use case                            | Start with section             |
-| ----------------------------------- | ------------------------------ |
-| Simple LLM, no streaming, no tokens | **1.1 Minimal LLM**            |
-| LLM with strict context window      | **1.2 LLM + token counting**   |
-| Streaming LLM completions           | **1.3 Streaming LLM**          |
-| Simple Embedding backend            | **2.1 Single-model Embedding** |
-| Embedding small+large models        | **2.2 Multi-model Embedding**  |
-| Provider has batch Embedding API    | **2.3 Batch Embedding**        |
-| Test/CI-only vector backend         | **3.1 In-memory Vector**       |
-| Hosted vector DB integration        | **3.2 Hosted Vector**          |
-| Graph DB unary queries              | **4.1 Unary Graph**            |
-| Graph DB with streaming             | **4.2 Streaming Graph**        |
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
+| `ResourceExhausted` with no retry_after | Incomplete error mapping | Add retry_after_ms from provider headers |
+| `DeadlineExceeded` but provider fast | Not propagating deadlines | Add `ctx.remaining_ms()` to client timeouts |
+| Tenant IDs in logs/metrics | Missing tenant hashing | Add `_tenant_hash()` method |
+| Cache stats appearing twice | _do_get_stats() includes cache metrics | Remove cache_hits/cache_misses |
+| Batch operations failing randomly | Configurable batch mode | Hardcode one mode, remove flag |
+| Streaming behaves differently between calls | Configurable streaming pattern | Hardcode one pattern, remove flag |
 
 ---
 
-## 8. Next Steps
+## 14. Decision Matrix Quick Reference
 
-Once you've cloned a recipe:
-
-1. Swap out the **provider client** and **error types** for your real ones.
-2. Make sure `capabilities()` truly matches what the provider can do.
-3. Run the conformance tests:
-
-   * `make test-llm-conformance`
-   * `make test-embedding-conformance`
-   * `make test-vector-conformance`
-   * `make test-graph-conformance`
-4. Only after all suites pass **unmodified**, wire your adapter into a production routing stack.
+| Decision | Options | How to Choose | Must Not Do |
+|----------|---------|---------------|-------------|
+| **Batch failure mode** | Collect vs Fail-fast | Does provider return per-item status? | Make configurable |
+| **Streaming pattern** | Single/Progressive/Multi | Component + provider capabilities | Make configurable |
+| **Normalization** | `normalizes_at_source=True/False` | Does provider normalize vectors? | Normalize twice |
+| **Idempotency** | True/False | Set based on implementation, not wishful thinking | Claim True without implementing |
+| **Delete semantics** | Count actual deletions | Always | Count attempts |
+| **Namespace handling** | Enforce authority | Always | Silently correct |
+| **Filter validation** | Strict with `supported` list | Always | Silently ignore |
+| **Include vectors** | `[]` when False | Always | Return `null` or omit |
+| **Token counting** | Accurate (tiktoken/provider) | If `supports_token_counting=True` | Use approximations |
+| **Tenant IDs** | Hash before logging | Always | Log raw tenant IDs |
+| **Deadlines** | Propagate to provider | Always | Ignore `ctx.remaining_ms()` |
+| **Cache stats** | Adapter metrics only | Always | Include cache_hits/cache_misses |
 
 ---
 
-**Maintainers:** Corpus SDK Team
-**Scope:** Practical patterns for implementing adapters; see `IMPLEMENTATION.md`, `BEHAVIORAL_CONFORMANCE.md`, and `SCHEMA_CONFORMANCE.md` for normative details.
+## Appendix A: Provider Assessment Worksheet
 
-```
+Use this worksheet to document your provider's capabilities before writing your adapter. This becomes your adapter's architecture decision record.
+
+### Provider Information
+
+| Field | Your Answer |
+|-------|-------------|
+| Provider Name | |
+| API Version | |
+| Base URL | |
+| Authentication Method | |
+| SDK Available? (Language) | |
+
+### Capabilities Checklist
+
+| Capability | Provider Support | Notes |
+|------------|------------------|-------|
+| **Batch API?** | ☐ Yes ☐ No | Max batch size: _____ |
+| **Per-item status in batch?** | ☐ Yes ☐ No | |
+| **Streaming API?** | ☐ Yes ☐ No | Protocol: _____ |
+| **Token counting API?** | ☐ Yes ☐ No | |
+| **Tokenizer available locally?** | ☐ Yes ☐ No | |
+| **Returns normalized vectors?** | ☐ Yes ☐ No | |
+| **Supports idempotency keys?** | ☐ Yes ☐ No | |
+| **Timeout support in SDK?** | ☐ Yes ☐ No | |
+| **Multi-tenant?** | ☐ Yes ☐ No | Tenant identifier: _____ |
+
+### Error Mapping Worksheet
+
+| Provider Error | HTTP Status | Corpus Error | Required Details | Source (Header/Body) |
+|----------------|-------------|--------------|------------------|---------------------|
+| | | | | |
+| | | | | |
+| | | | | |
+| | | | | |
+
+### Rate Limit Pattern
+
+| Question | Answer |
+|----------|--------|
+| How are rate limits communicated? | ☐ Headers ☐ Response body ☐ Both |
+| Header names (if applicable) | |
+| Retry-After format | ☐ Seconds ☐ Milliseconds ☐ Timestamp |
+| Multiple scopes? (api/model/namespace) | |
+| Sample rate limit response | |
+
+### Batch Semantics
+
+| Question | Answer |
+|----------|--------|
+| Does batch API return per-item status? | ☐ Yes ☐ No |
+| Can you get 98 successes + 2 errors? | ☐ Yes ☐ No |
+| What happens on validation error? | ☐ Whole batch fails ☐ Per-item errors |
+| Does order matter? | ☐ Yes ☐ No |
+
+### Tenant Handling
+
+| Question | Answer |
+|----------|--------|
+| How is tenant identified in requests? | |
+| Does provider need raw tenant ID? | ☐ Yes ☐ No |
+| Any PII concerns with tenant IDs? | ☐ Yes ☐ No |
+| Default tenant for anonymous requests? | |
+
+### Deadline Support
+
+| Question | Answer |
+|----------|--------|
+| Does SDK support timeouts? | ☐ Yes ☐ No |
+| Timeout format | ☐ Seconds ☐ Milliseconds ☐ Deadline |
+| Connection timeout separate? | ☐ Yes ☐ No |
+
+### Idempotency Decision
+
+| Question | Answer |
+|----------|--------|
+| Does provider support idempotency keys? | ☐ Yes ☐ No |
+| Will you implement idempotency? | ☐ Yes ☐ No |
+| If yes, storage backend | ☐ Redis ☐ DynamoDB ☐ In-memory (dev only) |
+
+### Completed By
+
+| Field | |
+|-------|-|
+| Name | |
+| Date | |
+| Adapter Type | ☐ LLM ☐ Embedding ☐ Vector ☐ Graph |
+
+---
+
+**Maintainers:** Corpus SDK Team  
+**See also:** [Quick Start](/docs/guides/quick_start.md) | [Implementation Guide](/docs/guides/implementation.md)
