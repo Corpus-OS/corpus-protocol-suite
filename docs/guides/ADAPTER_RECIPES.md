@@ -1,3 +1,5 @@
+Here's the corrected document with all hyperlinks properly mapped to the Implementation Guide's actual anchors:
+
 # Corpus OS Adapters Guide
 
 ### From Implementation to Production: Adapter Patterns & Decisions
@@ -165,7 +167,9 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     """
 ```
 
-**See also:** [Implementation Guide §8.3 - Batch Failure Mode (CHOOSE ONE)](./IMPLEMENTATION.md#83-batch-failure-mode-choose-one-mandatory), [§12 - Batch Failure Mode Decision Matrix](./IMPLEMENTATION.md#12-batch-failure-mode-decision-matrix)
+**See also:** 
+- [Implementation Guide §8.3 - Batch Failure Mode (CHOOSE ONE)](./IMPLEMENTATION.md#83-batch-failure-mode-choose-one-mandatory)
+- [Implementation Guide §12 - Batch Failure Mode Decision Matrix](./IMPLEMENTATION.md#12-batch-failure-mode-decision-matrix)
 
 ---
 
@@ -375,7 +379,9 @@ corpus_filter = {"genre": {"$in": ["doc", "article"]}}
 # Must raise BadRequest with supported list
 ```
 
-**See also:** [Implementation Guide §9.4 - Filter Dialect Validation](./IMPLEMENTATION.md#94-filter-dialect-validation-strict-no-silent-ignore-mandatory), [§9.5 - Filter Operator Error Details](./IMPLEMENTATION.md#95-filter-operator-error-details-canonical-shape-mandatory)
+**See also:** 
+- [Implementation Guide §9.4 - Filter Dialect Validation](./IMPLEMENTATION.md#94-filter-dialect-validation-strict-no-silent-ignore-mandatory)
+- [Implementation Guide §9.5 - Filter Operator Error Details](./IMPLEMENTATION.md#95-filter-operator-error-details-canonical-shape-mandatory)
 
 ### 5.3 Coming from Neo4j
 
@@ -408,7 +414,9 @@ results.append({
 })
 ```
 
-**See also:** [Implementation Guide §10.2 - Batch/Transaction Result Envelope](./IMPLEMENTATION.md#102-batchtransaction-result-envelope-ok-result-mandatory), [§10.4 - Dialect Validation](./IMPLEMENTATION.md#104-dialect-validation-two-layers-mandatory)
+**See also:** 
+- [Implementation Guide §10.2 - Batch/Transaction Result Envelope](./IMPLEMENTATION.md#102-batchtransaction-result-envelope-ok-result-mandatory)
+- [Implementation Guide §10.4 - Dialect Validation](./IMPLEMENTATION.md#104-dialect-validation-two-layers-mandatory)
 
 ---
 
@@ -611,7 +619,9 @@ async def _do_embed(self, spec, *, ctx=None):
 
 **Why:** If you don't propagate deadlines, requests can hang forever, exhausting resources and violating SLOs.
 
-**See also:** [Implementation Guide §3.2 - Deadline Propagation (MANDATORY)](./IMPLEMENTATION.md#32-deadline-propagation-mandatory), [§6 - Deadlines & Cancellation](./IMPLEMENTATION.md#6-deadlines--cancellation)
+**See also:** 
+- [Implementation Guide §3.2 - Deadline Propagation (MANDATORY)](./IMPLEMENTATION.md#32-deadline-propagation-mandatory)
+- [Implementation Guide §6 - Deadlines & Cancellation](./IMPLEMENTATION.md#6-deadlines--cancellation)
 
 ---
 
@@ -711,7 +721,9 @@ await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
 # In thin mode, cache is a no-op. Your adapter should work either way.
 ```
 
-**See also:** [Implementation Guide §8.6 - Cache Stats Ownership (CRITICAL BOUNDARY)](./IMPLEMENTATION.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11 - Cache Ownership Boundary (CRITICAL)](./IMPLEMENTATION.md#11-cache-ownership-boundary-critical)
+**See also:** 
+- [Implementation Guide §8.6 - Cache Stats Ownership (CRITICAL BOUNDARY)](./IMPLEMENTATION.md#86-cache-stats-ownership-critical-boundary-mandatory)
+- [Implementation Guide §11 - Cache Ownership Boundary (CRITICAL)](./IMPLEMENTATION.md#11-cache-ownership-boundary-critical)
 
 ---
 
@@ -831,7 +843,9 @@ await self._redis.setex(key, 3600, data)   # ❌ Too short
 # 4. Cache MUST survive adapter restarts in production
 ```
 
-**See also:** [Quick Start §7.1 - Embedding Protocol](./QUICK_START.md#71-embedding-protocol), [Implementation Guide §8 - Embedding Adapter Implementation Requirements](./IMPLEMENTATION.md#8-embedding-adapter-implementation-requirements)
+**See also:** 
+- [Quick Start §7.1 - Embedding Protocol](./QUICK_START.md#71-embedding-protocol)
+- [Implementation Guide §8 - Embedding Adapter Implementation Requirements](./IMPLEMENTATION.md#8-embedding-adapter-implementation-requirements)
 
 ---
 
