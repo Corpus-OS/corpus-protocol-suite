@@ -68,16 +68,55 @@ Copy this table and fill it out for your provider:
 | **Timeouts** | Does the SDK/client support timeouts? | Deadline propagation |
 | **Tenancy** | Multi-tenant? How is tenant identified? | Tenant hashing requirements |
 
-### 1.2 Error Taxonomy Mapping Worksheet
+# Complete Error Taxonomy Reference
 
-Before implementing error mapping, map your provider's errors:
+## 1.2 Error Taxonomy Mapping Worksheet
 
-| Provider Error | HTTP Status | Corpus Error | Required Details |
-|----------------|-------------|--------------|------------------|
-| rate_limit_exceeded | 429 | ResourceExhausted | `retry_after_ms`, `resource_scope` |
-| invalid_api_key | 401 | AuthError | none |
-| model_not_found | 404 | ModelNotAvailable | `requested_model`, `supported_models` |
-| ... | ... | ... | ... |
+Before implementing error mapping, map your provider's errors using this complete reference:
+
+| Provider Error (Example) | HTTP Status | Corpus Error | Required Details | Defined In |
+|--------------------------|-------------|--------------|------------------|------------|
+| `rate_limit_exceeded` | 429 | **ResourceExhausted** | `retry_after_ms`, `resource_scope` | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
+| `invalid_api_key` | 401 | **AuthError** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
+| `model_not_found` | 404 | **ModelNotAvailable** | `requested_model`, `supported_models` | [Impl Guide §4.3](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory) |
+| `text_too_long` | 400 | **TextTooLong** | `max_length`, `actual_length` | [Impl Guide §4.3](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory) |
+| `dimension_mismatch` | 400 | **DimensionMismatch** | `expected`, `actual`, `namespace`, `vector_id`, `index` | [Impl Guide §4.3](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory) |
+| `index_not_ready` | 503 | **IndexNotReady** | `retry_after_ms`, `namespace` | [Impl Guide §4.3](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory) |
+| `namespace_mismatch` | 400 | **BadRequest** | `spec_namespace`, `vector_namespace`, `vector_id`, `index` | [Impl Guide §9.12](./IMPLEMENTATION.md#912-namespace-mismatch-error-details-canonical-shape-mandatory) |
+| `filter_validation` | 400 | **BadRequest** | `operator`, `field`, `supported`, `namespace` | [Impl Guide §9.5](./IMPLEMENTATION.md#95-filter-operator-error-details-canonical-shape-mandatory) |
+| `unsupported_operation` | 400 | **NotSupported** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
+| `timeout` | 504 | **TransientNetwork** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
+| `service_unavailable` | 503 | **Unavailable** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
+| `deadline_exceeded` | 408 | **DeadlineExceeded** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
+
+## Domain-Specific Errors
+
+### LLM-Only Errors
+| Provider Error | Corpus Error | Required Details |
+|----------------|--------------|------------------|
+| `model_overloaded` | **ModelOverloaded** | `retry_after_ms` (optional) |
+
+### Embedding-Only Errors
+| Provider Error | Corpus Error | Required Details |
+|----------------|--------------|------------------|
+| `text_too_long` | **TextTooLong** | `max_length`, `actual_length` |
+| `model_not_available` | **ModelNotAvailable** | `requested_model`, `supported_models` |
+
+### Vector-Only Errors
+| Provider Error | Corpus Error | Required Details |
+|----------------|--------------|------------------|
+| `dimension_mismatch` | **DimensionMismatch** | `expected`, `actual`, `namespace`, `vector_id`, `index` |
+| `index_not_ready` | **IndexNotReady** | `retry_after_ms`, `namespace` |
+
+## Canonical Error Hierarchy
+
+All errors inherit from domain-specific base classes:
+- **LLM**: `LLMAdapterError` (import from `llm_base`)
+- **Embedding**: `EmbeddingAdapterError` (import from `embedding_base`)
+- **Vector**: `VectorAdapterError` (import from `vector_base`)
+- **Graph**: `GraphAdapterError` (import from `graph_base`)
+
+**See also:** [Implementation Guide §4.1 - Canonical Error Hierarchy](./IMPLEMENTATION.md#41-canonical-error-hierarchy)
 
 ### 1.3 Batch Operation Semantics
 
