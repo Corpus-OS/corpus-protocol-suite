@@ -161,7 +161,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     """
 ```
 
-**See also:** [Implementation Guide §8.3](./IMPLEMENTATION.md#83-batch-failure-mode-choose-one-mandatory), [§12](./IMPLEMENTATION.md#12-batch-failure-mode-decision-matrix)
+**See also:** [Implementation Guide §8.3 - Batch Failure Mode (CHOOSE ONE)](./IMPLEMENTATION.md#83-batch-failure-mode-choose-one-mandatory), [§12 - Batch Failure Mode Decision Matrix](./IMPLEMENTATION.md#12-batch-failure-mode-decision-matrix)
 
 ---
 
@@ -235,7 +235,7 @@ if tool_calls:
     )
 ```
 
-**See also:** [Implementation Guide §7.6](./IMPLEMENTATION.md#76-streaming-rules-tool-calls-mandatory)
+**See also:** [Implementation Guide §7.6 - Streaming Rules (Tool Calls)](./IMPLEMENTATION.md#76-streaming-rules-tool-calls-mandatory)
 
 ### 3.6 Documenting Your Choice
 
@@ -315,7 +315,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 | **TextTooLong** | `max_length`, `actual_length` | `{"max_length": 8192, "actual_length": 15000}` |
 | **ResourceExhausted** | `resource_scope` | `{"resource_scope": "rate_limit"}` or `"quota"` or `"concurrency"` |
 
-**See also:** [Implementation Guide §4.3](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory)
+**See also:** [Implementation Guide §4.3 - Error Detail Schemas (PER ERROR TYPE)](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory)
 
 ---
 
@@ -371,6 +371,8 @@ corpus_filter = {"genre": {"$in": ["doc", "article"]}}
 # Must raise BadRequest with supported list
 ```
 
+**See also:** [Implementation Guide §9.4 - Filter Dialect Validation](./IMPLEMENTATION.md#94-filter-dialect-validation-strict-no-silent-ignore-mandatory), [§9.5 - Filter Operator Error Details](./IMPLEMENTATION.md#95-filter-operator-error-details-canonical-shape-mandatory)
+
 ### 5.3 Coming from Neo4j
 
 **What changes when you move from Neo4j driver to Corpus adapter?**
@@ -401,6 +403,8 @@ results.append({
     "properties_set": 3
 })
 ```
+
+**See also:** [Implementation Guide §10.2 - Batch/Transaction Result Envelope](./IMPLEMENTATION.md#102-batchtransaction-result-envelope-ok-result-mandatory), [§10.4 - Dialect Validation](./IMPLEMENTATION.md#104-dialect-validation-two-layers-mandatory)
 
 ---
 
@@ -494,7 +498,7 @@ def _map_provider_error(self, e):
         )
 ```
 
-**See also:** [Implementation Guide §3.3](./IMPLEMENTATION.md#33-tenant-hashing-mandatory)
+**See also:** [Implementation Guide §3.3 - Tenant Hashing (MANDATORY)](./IMPLEMENTATION.md#33-tenant-hashing-mandatory)
 
 ---
 
@@ -603,7 +607,7 @@ async def _do_embed(self, spec, *, ctx=None):
 
 **Why:** If you don't propagate deadlines, requests can hang forever, exhausting resources and violating SLOs.
 
-**See also:** [Implementation Guide §3.2](./IMPLEMENTATION.md#32-deadline-propagation-mandatory), [§6](./IMPLEMENTATION.md#6-deadlines--cancellation)
+**See also:** [Implementation Guide §3.2 - Deadline Propagation (MANDATORY)](./IMPLEMENTATION.md#32-deadline-propagation-mandatory), [§6 - Deadlines & Cancellation](./IMPLEMENTATION.md#6-deadlines--cancellation)
 
 ---
 
@@ -703,7 +707,7 @@ await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
 # In thin mode, cache is a no-op. Your adapter should work either way.
 ```
 
-**See also:** [Implementation Guide §8.6](./IMPLEMENTATION.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11](./IMPLEMENTATION.md#11-cache-ownership-boundary-critical)
+**See also:** [Implementation Guide §8.6 - Cache Stats Ownership (CRITICAL BOUNDARY)](./IMPLEMENTATION.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11 - Cache Ownership Boundary (CRITICAL)](./IMPLEMENTATION.md#11-cache-ownership-boundary-critical)
 
 ---
 
@@ -823,7 +827,7 @@ await self._redis.setex(key, 3600, data)   # ❌ Too short
 # 4. Cache MUST survive adapter restarts in production
 ```
 
-**See also:** [Quick Start §7.1](./QUICK_START.md#71-embedding-protocol), [Implementation Guide §8](./IMPLEMENTATION.md#8-embedding-adapter-implementation-requirements)
+**See also:** [Quick Start §7.1 - Embedding Protocol](./QUICK_START.md#71-embedding-protocol), [Implementation Guide §8 - Embedding Adapter Implementation Requirements](./IMPLEMENTATION.md#8-embedding-adapter-implementation-requirements)
 
 ---
 
@@ -1093,7 +1097,7 @@ async def _call_with_retry(self, fn, ctx=None):
             await asyncio.sleep(delay_ms / 1000)
 ```
 
-**See also:** [Implementation Guide §4.4](./IMPLEMENTATION.md#44-retry-semantics-mandatory)
+**See also:** [Implementation Guide §4.4 - Retry Semantics (MANDATORY)](./IMPLEMENTATION.md#44-retry-semantics-mandatory)
 
 ---
 
