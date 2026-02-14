@@ -1,3 +1,4 @@
+# tests/llm/mock_llm_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Mock LLM adapter used in Corpus SDK example scripts and conformance tests.
