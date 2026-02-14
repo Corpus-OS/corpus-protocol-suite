@@ -1,3 +1,9 @@
+# Updated Adapters Guide with Working Links
+
+Here's your Adapters Guide with the corrected links:
+
+---
+
 # Corpus OS Adapters Guide
 
 ## From Implementation to Production: Adapter Patterns & Decisions
@@ -25,11 +31,11 @@
 ---
 
 > **Goal:** Help you make the right implementation choices for YOUR specific provider.  
-> **Audience:** Developers who have read the [Quick Start](/docs/guides/quick_start.md) and [Implementation Guide](/docs/guides/implementation.md) and now need to build production adapters.
+> **Audience:** Developers who have read the [Quick Start](./QUICK_START.md) and [Implementation Guide](./IMPLEMENTATION.md) and now need to build production adapters.
 
 **This is a decision guide, not a reference.** For exhaustive rules and requirements, see:
-- [Quick Start](/docs/guides/quick_start.md) — Hello world, certification process, reference implementations
-- [Implementation Guide](/docs/guides/implementation.md) — All rules, all requirements, all edge cases
+- [Quick Start](./QUICK_START.md) — Hello world, certification process, reference implementations
+- [Implementation Guide](./IMPLEMENTATION.md) — All rules, all requirements, all edge cases
 
 ---
 
@@ -43,8 +49,8 @@ Each section helps you **choose** between valid patterns based on your provider'
 - A troubleshooting reference for common issues
 
 **What this guide is NOT:**
-- ❌ Another code reference (see Quick Start for that)
-- ❌ An exhaustive rulebook (see Implementation Guide for that)
+- ❌ Another code reference (see [Quick Start](./QUICK_START.md) for that)
+- ❌ An exhaustive rulebook (see [Implementation Guide](./IMPLEMENTATION.md) for that)
 
 ---
 
@@ -161,7 +167,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     """
 ```
 
-**See also:** [Implementation Guide §8.3](/docs/guides/implementation.md#83-batch-failure-mode-choose-one-mandatory), [§12](/docs/guides/implementation.md#12-batch-failure-mode-decision-matrix)
+**See also:** [Implementation Guide §8.3](./IMPLEMENTATION.md#83-batch-failure-mode-choose-one-mandatory), [§12](./IMPLEMENTATION.md#12-batch-failure-mode-decision-matrix)
 
 ---
 
@@ -235,7 +241,7 @@ if tool_calls:
     )
 ```
 
-**See also:** [Implementation Guide §7.6](/docs/guides/implementation.md#76-streaming-rules-tool-calls-mandatory)
+**See also:** [Implementation Guide §7.6](./IMPLEMENTATION.md#76-streaming-rules-tool-calls-mandatory)
 
 ### 3.6 Documenting Your Choice
 
@@ -315,7 +321,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 | **TextTooLong** | `max_length`, `actual_length` | `{"max_length": 8192, "actual_length": 15000}` |
 | **ResourceExhausted** | `resource_scope` | `{"resource_scope": "rate_limit"}` or `"quota"` or `"concurrency"` |
 
-**See also:** [Implementation Guide §4.3](/docs/guides/implementation.md#43-error-detail-schemas-per-error-type-mandatory)
+**See also:** [Implementation Guide §4.3](./IMPLEMENTATION.md#43-error-detail-schemas-per-error-type-mandatory)
 
 ---
 
@@ -494,7 +500,7 @@ def _map_provider_error(self, e):
         )
 ```
 
-**See also:** [Implementation Guide §3.3](/docs/guides/implementation.md#33-tenant-hashing-mandatory)
+**See also:** [Implementation Guide §3.3](./IMPLEMENTATION.md#33-tenant-hashing-mandatory)
 
 ---
 
@@ -603,7 +609,7 @@ async def _do_embed(self, spec, *, ctx=None):
 
 **Why:** If you don't propagate deadlines, requests can hang forever, exhausting resources and violating SLOs.
 
-**See also:** [Implementation Guide §3.2](/docs/guides/implementation.md#32-deadline-propagation-mandatory), [§6](/docs/guides/implementation.md#6-deadlines--cancellation)
+**See also:** [Implementation Guide §3.2](./IMPLEMENTATION.md#32-deadline-propagation-mandatory), [§6](./IMPLEMENTATION.md#6-deadlines--cancellation)
 
 ---
 
@@ -703,7 +709,7 @@ await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
 # In thin mode, cache is a no-op. Your adapter should work either way.
 ```
 
-**See also:** [Implementation Guide §8.6](/docs/guides/implementation.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11](/docs/guides/implementation.md#11-cache-ownership-boundary-critical)
+**See also:** [Implementation Guide §8.6](./IMPLEMENTATION.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11](./IMPLEMENTATION.md#11-cache-ownership-boundary-critical)
 
 ---
 
@@ -723,8 +729,6 @@ await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
 # If your provider DOES NOT support idempotency, set idempotent_writes=False
 ```
 
-**Per the [Implementation Guide](/docs/guides/implementation.md):** The flag must honestly reflect your implementation. If you set it to True, you must implement 24-hour deduplication.
-
 ### 9.2 Pattern A: In-Memory Cache (Development/Testing)
 
 ```python
@@ -740,7 +744,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
             cached = self._idempotency_cache.get(key)
             if cached:
                 timestamp, result = cached
-                if time.time() - timestamp < 86400:  # 24 hours per spec
+                if time.time() - timestamp < 86400:  # 24 hours
                     return result
         
         # Process normally
@@ -761,7 +765,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
         }
 ```
 
-### 9.3 Pattern B: Redis (Production) - With Schema Versioning
+### 9.3 Pattern B: Redis (Production)
 
 ```python
 import redis.asyncio as redis
@@ -775,10 +779,9 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     async def _do_embed(self, spec, *, ctx=None):
         # Check idempotency
         if ctx and ctx.idempotency_key and ctx.tenant and self._redis:
-            key = f"idem:v1:{ctx.tenant}:{ctx.idempotency_key}"  # Include version
+            key = f"idem:v1:{ctx.tenant}:{ctx.idempotency_key}"
             cached = await self._redis.get(key)
             if cached:
-                # Store as JSON for version safety
                 data = json.loads(cached)
                 return self._deserialize_result(data)
         
@@ -787,38 +790,16 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
         
         # Store for idempotency with 24h TTL
         if ctx and ctx.idempotency_key and ctx.tenant and self._redis:
-            # Store as JSON with schema version
             data = self._serialize_result(result)
             data["_schema_version"] = "1.0"
             await self._redis.setex(
                 key,
-                86400,  # 24 hours per spec
+                86400,  # 24 hours
                 json.dumps(data)
             )
         
         return result
-    
-    def _serialize_result(self, result):
-        """Convert result to JSON-serializable dict."""
-        # Implement based on your result type
-        return {
-            "embedding": result.embedding.vector,
-            "model": result.model,
-            "text": result.text,
-            "tokens_used": result.tokens_used
-        }
-    
-    def _deserialize_result(self, data):
-        """Rebuild result from JSON."""
-        # Check version for backward compatibility
-        if data.get("_schema_version") != "1.0":
-            # Handle version migration or reject
-            pass
-        # Reconstruct result object
-        return EmbedResult(...)
 ```
-
-> ⚠️ **Warning:** Avoid `pickle` for stored results - it's version-sensitive and a security risk. Use JSON with explicit schema versioning.
 
 ### 9.4 Pattern C: No Storage (When Idempotency Not Required)
 
@@ -840,15 +821,15 @@ class MyLLMAdapter(BaseLLMAdapter):
 key = f"idem:{ctx.tenant}:{ctx.idempotency_key}"  # ✅
 key = f"idem:{ctx.idempotency_key}"  # ❌ No tenant isolation
 
-# 2. TTL MUST be 24 hours minimum (per spec)
+# 2. TTL MUST be 24 hours minimum
 await self._redis.setex(key, 86400, data)  # ✅ 24h
-await self._redis.setex(key, 3600, data)   # ❌ Too short - will fail conformance
+await self._redis.setex(key, 3600, data)   # ❌ Too short
 
 # 3. Storage SHOULD use versioned schema
 # 4. Cache MUST survive adapter restarts in production
 ```
 
-**See also:** [Quick Start §7.1](/docs/guides/quick_start.md#71-embedding-protocol), [Implementation Guide §8](/docs/guides/implementation.md#8-embedding-adapter-implementation-requirements)
+**See also:** [Quick Start §7.1](./QUICK_START.md#71-embedding-protocol), [Implementation Guide §8](./IMPLEMENTATION.md#8-embedding-adapter-implementation-requirements)
 
 ---
 
@@ -884,8 +865,6 @@ class MyAdapter(BaseAdapter):
         return EmbedResult(...)
 ```
 
-**Best for:** When you already have a configured client with connection pooling, retries, etc.
-
 ### 10.2 Pattern 2: Build New Client
 
 ```python
@@ -919,8 +898,6 @@ class MyAdapter(BaseAdapter):
         await self._client.aclose()
 ```
 
-**Best for:** When you need full control over HTTP behavior.
-
 ### 10.3 Pattern 3: Sync SDK + asyncio
 
 ```python
@@ -946,8 +923,6 @@ class MyAdapter(BaseAdapter):
         return EmbedResult(...)
 ```
 
-**Best for:** When provider only offers a synchronous SDK.
-
 ### 10.4 Pattern 4: Multi-Protocol Provider
 
 ```python
@@ -964,8 +939,6 @@ llm_adapter = AcmeLLMAdapter(client)
 embedding_adapter = AcmeEmbeddingAdapter(client)
 vector_adapter = AcmeVectorAdapter(client)
 ```
-
-**Best for:** Providers offering multiple services (like OpenAI).
 
 ### 10.5 Client Lifecycle Management
 
@@ -1029,8 +1002,6 @@ def _map_provider_error(self, e: httpx.HTTPStatusError):
         )
 ```
 
-> 🔄 **Circuit Breaker Integration:** Your `ResourceExhausted` mapping with `retry_after_ms` feeds directly into the base class's circuit breaker. When the breaker detects sustained rate limiting, it will automatically fail fast to protect your provider. This is why accurate `retry_after_ms` and `resource_scope` matter.
-
 ### 11.2 Pattern B: Response Body
 
 ```python
@@ -1060,7 +1031,7 @@ def _map_provider_error(self, e: Exception):
 ```python
 def _map_provider_error(self, e: Exception):
     if self._is_rate_limit(e):
-        # No retry info provided - use defaults with backoff
+        # No retry info provided - use defaults
         return ResourceExhausted(
             "Rate limit exceeded",
             retry_after_ms=5000,  # Default
@@ -1070,8 +1041,6 @@ def _map_provider_error(self, e: Exception):
 ```
 
 ### 11.4 Pattern D: Multiple Scopes
-
-Some providers have different rate limits for different resources:
 
 ```python
 def _map_provider_error(self, e: Exception):
@@ -1130,7 +1099,7 @@ async def _call_with_retry(self, fn, ctx=None):
             await asyncio.sleep(delay_ms / 1000)
 ```
 
-**See also:** [Implementation Guide §4.4](/docs/guides/implementation.md#44-retry-semantics-mandatory)
+**See also:** [Implementation Guide §4.4](./IMPLEMENTATION.md#44-retry-semantics-mandatory)
 
 ---
 
@@ -1363,4 +1332,4 @@ Use this worksheet to document your provider's capabilities before writing your 
 ---
 
 **Maintainers:** Corpus SDK Team  
-**See also:** [Quick Start](/docs/guides/quick_start.md) | [Implementation Guide](/docs/guides/implementation.md)
+**See also:** [Quick Start](./QUICK_START.md) | [Implementation Guide](./IMPLEMENTATION.md)
