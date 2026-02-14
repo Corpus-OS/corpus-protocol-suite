@@ -2,6 +2,20 @@
 
 **Take Your Gold-Certified Adapter to Production**
 
+---
+
+> **📋 Document Status**
+>
+> This guide provides **practical deployment examples** (informative). For normative specifications:
+>
+> - **Wire Protocol** → [SCHEMA.md](SCHEMA.md) - Envelope format, fields, error codes
+> - **Protocol Semantics** → [PROTOCOL.md](PROTOCOL.md) - Operation contracts, versioning
+>
+> **Validation:** Wire conformance tests in `tests/live/` validate against specs.  
+> **Conflicts:** When this guide differs from SCHEMA.md or PROTOCOL.md, **the specs are correct**.
+
+---
+
 **Table of Contents**
 - [0. Mental Model: Adapter → Service](#0-mental-model-adapter--service)
 - [1. Prerequisites](#1-prerequisites)
@@ -1094,7 +1108,7 @@ if __name__ == '__main__':
 
 ### 4.3 Quart (Async Flask)
 
-`services/quart_embedding.py` (similar to FastAPI but with Flask-like syntax):
+`services/quart_embedding.py`:
 
 ```python
 from quart import Quart, request, jsonify
