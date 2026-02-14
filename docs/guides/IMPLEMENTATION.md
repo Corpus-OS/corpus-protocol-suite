@@ -43,7 +43,7 @@
 
 ---
 
-# Rule Cross-Reference Index
+## Rule Cross-Reference Index
 
 | Rule | Applies To | Key Sections |
 |------|------------|--------------|
