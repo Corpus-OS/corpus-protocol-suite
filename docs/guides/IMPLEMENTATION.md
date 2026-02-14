@@ -43,25 +43,6 @@
 
 ---
 
-## Anti-Pattern Quick Reference
-
-| Anti-Pattern | Forbidden In | Key Warning Sections |
-|--------------|--------------|----------------------|
-| `ctx.attrs` for operational logic | All domains | 3.4, 14.1 |
-| RNG / probabilistic failures | All domains | 3.4, 14.1 |
-| Configurable capabilities | All domains | 8.8, 9.9, 10.9 |
-| Cache stats in `_do_get_stats` | Embedding | 8.6, 11.1 |
-| Token counting approximations | LLM, Embedding | 7.4, 8.9 |
-| Silent filter operator ignore | Vector | 9.4 |
-| Delete errors on missing | Vector, Graph | 9.7, 10.5 |
-| Null instead of `[]` for vectors | Vector | 9.3 |
-| Mismatched complete/stream output | LLM | 7.2 |
-| Tool calls in non-final chunks | LLM | 7.6 |
-| Zero completion tokens for tool calls | LLM | 7.4 |
-| Double normalization | Vector | 9.16.2 |
-| Zero vector division | Vector | 9.16.8 |
-
----
 **TABLE OF CONTENTS**
 
 [1. PURPOSE & SCOPE](#1-purpose--scope)
