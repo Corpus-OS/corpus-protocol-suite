@@ -8,8 +8,8 @@
 >
 > This guide provides **practical deployment examples** (informative). For normative specifications:
 >
-> - **Wire Protocol** → [SCHEMA.md](SCHEMA.md) - Envelope format, fields, error codes
-> - **Protocol Semantics** → [PROTOCOL.md](PROTOCOL.md) - Operation contracts, versioning
+> - **Wire Protocol** → [SCHEMA.md](../spec/SCHEMA.md) - Envelope format, fields, error codes
+> - **Protocol Semantics** → [PROTOCOL.md](../spec/PROTOCOL.md) - Operation contracts, versioning
 >
 > **Validation:** Wire conformance tests in `tests/live/` validate against specs.  
 > **Conflicts:** When this guide differs from SCHEMA.md or PROTOCOL.md, **the specs are correct**.
