@@ -68,8 +68,6 @@ Copy this table and fill it out for your provider:
 | **Timeouts** | Does the SDK/client support timeouts? | Deadline propagation |
 | **Tenancy** | Multi-tenant? How is tenant identified? | Tenant hashing requirements |
 
-## Complete Error Taxonomy Reference
-
 ### 1.2 Error Taxonomy Mapping Worksheet
 
 Before implementing error mapping, map your provider's errors using this complete reference:
@@ -88,35 +86,6 @@ Before implementing error mapping, map your provider's errors using this complet
 | `timeout` | 504 | **TransientNetwork** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
 | `service_unavailable` | 503 | **Unavailable** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
 | `deadline_exceeded` | 408 | **DeadlineExceeded** | none | [Impl Guide §4.2](./IMPLEMENTATION.md#42-provider-error-mapping-mandatory) |
-
-## Domain-Specific Errors
-
-### LLM-Only Errors
-| Provider Error | Corpus Error | Required Details |
-|----------------|--------------|------------------|
-| `model_overloaded` | **ModelOverloaded** | `retry_after_ms` (optional) |
-
-### Embedding-Only Errors
-| Provider Error | Corpus Error | Required Details |
-|----------------|--------------|------------------|
-| `text_too_long` | **TextTooLong** | `max_length`, `actual_length` |
-| `model_not_available` | **ModelNotAvailable** | `requested_model`, `supported_models` |
-
-### Vector-Only Errors
-| Provider Error | Corpus Error | Required Details |
-|----------------|--------------|------------------|
-| `dimension_mismatch` | **DimensionMismatch** | `expected`, `actual`, `namespace`, `vector_id`, `index` |
-| `index_not_ready` | **IndexNotReady** | `retry_after_ms`, `namespace` |
-
-## Canonical Error Hierarchy
-
-All errors inherit from domain-specific base classes:
-- **LLM**: `LLMAdapterError` (import from `llm_base`)
-- **Embedding**: `EmbeddingAdapterError` (import from `embedding_base`)
-- **Vector**: `VectorAdapterError` (import from `vector_base`)
-- **Graph**: `GraphAdapterError` (import from `graph_base`)
-
-**See also:** [Implementation Guide §4.1 - Canonical Error Hierarchy](./IMPLEMENTATION.md#41-canonical-error-hierarchy)
 
 ### 1.3 Batch Operation Semantics
 
