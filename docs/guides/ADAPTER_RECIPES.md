@@ -42,10 +42,6 @@ Each section helps you **choose** between valid patterns based on your provider'
 - Operational patterns for running in production
 - A troubleshooting reference for common issues
 
-**What this guide is NOT:**
-- ❌ Another code reference (see [Quick Start](./QUICK_START.md) for that)
-- ❌ An exhaustive rulebook (see [Implementation Guide](./IMPLEMENTATION.md) for that)
-
 ---
 
 ## 1. Before You Write Code: Provider Assessment
