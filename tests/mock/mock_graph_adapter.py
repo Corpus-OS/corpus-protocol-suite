@@ -1,4 +1,4 @@
-# examples/graph/mock_graph_adapter.py
+# tests/graph/mock_graph_adapter.py
 # SPDX-License-Identifier: Apache-2.0
 """
 Mock Graph adapter used in Corpus SDK example scripts and conformance tests.
