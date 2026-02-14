@@ -25,11 +25,11 @@
 ---
 
 > **Goal:** Help you make the right implementation choices for YOUR specific provider.  
-> **Audience:** Developers who have read the [Quick Start](./quick_start.md) and [Implementation Guide](./implementation.md) and now need to build production adapters.
+> **Audience:** Developers who have read the [Quick Start](/docs/guides/quick_start.md) and [Implementation Guide](/docs/guides/implementation.md) and now need to build production adapters.
 
 **This is a decision guide, not a reference.** For exhaustive rules and requirements, see:
-- [Quick Start](./quick_start.md) — Hello world, certification process, reference implementations
-- [Implementation Guide](./implementation.md) — All rules, all requirements, all edge cases
+- [Quick Start](/docs/guides/quick_start.md) — Hello world, certification process, reference implementations
+- [Implementation Guide](/docs/guides/implementation.md) — All rules, all requirements, all edge cases
 
 ---
 
@@ -161,7 +161,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
     """
 ```
 
-**See also:** [Implementation Guide §8.3](./implementation.md#83-batch-failure-mode-choose-one-mandatory), [§12](./implementation.md#12-batch-failure-mode-decision-matrix)
+**See also:** [Implementation Guide §8.3](/docs/guides/implementation.md#83-batch-failure-mode-choose-one-mandatory), [§12](/docs/guides/implementation.md#12-batch-failure-mode-decision-matrix)
 
 ---
 
@@ -235,7 +235,7 @@ if tool_calls:
     )
 ```
 
-**See also:** [Implementation Guide §7.6](./implementation.md#76-streaming-rules-tool-calls-mandatory)
+**See also:** [Implementation Guide §7.6](/docs/guides/implementation.md#76-streaming-rules-tool-calls-mandatory)
 
 ### 3.6 Documenting Your Choice
 
@@ -315,7 +315,7 @@ class MyEmbeddingAdapter(BaseEmbeddingAdapter):
 | **TextTooLong** | `max_length`, `actual_length` | `{"max_length": 8192, "actual_length": 15000}` |
 | **ResourceExhausted** | `resource_scope` | `{"resource_scope": "rate_limit"}` or `"quota"` or `"concurrency"` |
 
-**See also:** [Implementation Guide §4.3](./implementation.md#43-error-detail-schemas-per-error-type-mandatory)
+**See also:** [Implementation Guide §4.3](/docs/guides/implementation.md#43-error-detail-schemas-per-error-type-mandatory)
 
 ---
 
@@ -494,7 +494,7 @@ def _map_provider_error(self, e):
         )
 ```
 
-**See also:** [Implementation Guide §3.3](./implementation.md#33-tenant-hashing-mandatory)
+**See also:** [Implementation Guide §3.3](/docs/guides/implementation.md#33-tenant-hashing-mandatory)
 
 ---
 
@@ -603,7 +603,7 @@ async def _do_embed(self, spec, *, ctx=None):
 
 **Why:** If you don't propagate deadlines, requests can hang forever, exhausting resources and violating SLOs.
 
-**See also:** [Implementation Guide §3.2](./implementation.md#32-deadline-propagation-mandatory), [§6](./implementation.md#6-deadlines--cancellation)
+**See also:** [Implementation Guide §3.2](/docs/guides/implementation.md#32-deadline-propagation-mandatory), [§6](/docs/guides/implementation.md#6-deadlines--cancellation)
 
 ---
 
@@ -703,7 +703,7 @@ await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
 # In thin mode, cache is a no-op. Your adapter should work either way.
 ```
 
-**See also:** [Implementation Guide §8.6](./implementation.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11](./implementation.md#11-cache-ownership-boundary-critical)
+**See also:** [Implementation Guide §8.6](/docs/guides/implementation.md#86-cache-stats-ownership-critical-boundary-mandatory), [§11](/docs/guides/implementation.md#11-cache-ownership-boundary-critical)
 
 ---
 
@@ -723,7 +723,7 @@ await self._invalidate_namespace_cache(ns)  # ❌ Base handles it
 # If your provider DOES NOT support idempotency, set idempotent_writes=False
 ```
 
-**Per the [Implementation Guide](./implementation.md):** The flag must honestly reflect your implementation. If you set it to True, you must implement 24-hour deduplication.
+**Per the [Implementation Guide](/docs/guides/implementation.md):** The flag must honestly reflect your implementation. If you set it to True, you must implement 24-hour deduplication.
 
 ### 9.2 Pattern A: In-Memory Cache (Development/Testing)
 
@@ -848,7 +848,7 @@ await self._redis.setex(key, 3600, data)   # ❌ Too short - will fail conforman
 # 4. Cache MUST survive adapter restarts in production
 ```
 
-**See also:** [Quick Start §7.1](./quick_start.md#71-embedding-protocol), [Implementation Guide §8](./implementation.md#8-embedding-adapter-implementation-requirements)
+**See also:** [Quick Start §7.1](/docs/guides/quick_start.md#71-embedding-protocol), [Implementation Guide §8](/docs/guides/implementation.md#8-embedding-adapter-implementation-requirements)
 
 ---
 
@@ -1130,7 +1130,7 @@ async def _call_with_retry(self, fn, ctx=None):
             await asyncio.sleep(delay_ms / 1000)
 ```
 
-**See also:** [Implementation Guide §4.4](./implementation.md#44-retry-semantics-mandatory)
+**See also:** [Implementation Guide §4.4](/docs/guides/implementation.md#44-retry-semantics-mandatory)
 
 ---
 
@@ -1363,4 +1363,4 @@ Use this worksheet to document your provider's capabilities before writing your 
 ---
 
 **Maintainers:** Corpus SDK Team  
-**See also:** [Quick Start](./quick_start.md) | [Implementation Guide](./implementation.md)
+**See also:** [Quick Start](/docs/guides/quick_start.md) | [Implementation Guide](/docs/guides/implementation.md)
