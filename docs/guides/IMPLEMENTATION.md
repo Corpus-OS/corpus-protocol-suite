@@ -41,6 +41,8 @@
 ### Consistency rule
 - Do not duplicate or reinterpret protocol rules here; when unsure, defer to the canonical docs
 
+---
+
 # Rule Cross-Reference Index
 
 | Rule | Applies To | Key Sections |
