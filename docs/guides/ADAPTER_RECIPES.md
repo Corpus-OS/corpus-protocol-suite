@@ -1,9 +1,3 @@
-# Updated Adapters Guide with Working Links
-
-Here's your Adapters Guide with the corrected links:
-
----
-
 # Corpus OS Adapters Guide
 
 ## From Implementation to Production: Adapter Patterns & Decisions
